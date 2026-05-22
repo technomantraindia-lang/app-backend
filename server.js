@@ -26,6 +26,17 @@ function publicUser(row) {
   return safe;
 }
 
+const accountRoles = ["Front Desk", "Dispatch", "Dealer", "Technician", "Customer"];
+const accountCreatorRoles = ["Admin", "Front Desk"];
+
+function normalizeEmail(email) {
+  return typeof email === "string" ? email.trim().toLowerCase() : "";
+}
+
+function normalizeMobileValue(mobile) {
+  return typeof mobile === "string" ? mobile.replace(/\D/g, "") : "";
+}
+
 /** Express 4: async route errors must be passed to next() or the process can crash (no DB = dead server). */
 function asyncRoute(handler) {
   return (req, res, next) => {
@@ -156,6 +167,112 @@ app.post("/auth/change-password", asyncRoute(async (req, res) => {
   await query("UPDATE users SET password_hash = ? WHERE id = ?", [hashPassword(String(newPassword)), userId]);
 
   res.json({ ok: true });
+}));
+
+app.get("/accounts", asyncRoute(async (_req, res) => {
+  const result = await query(
+    "SELECT id, role, name, mobile, email, status, created_at FROM users ORDER BY created_at DESC LIMIT 500"
+  );
+  res.json({ accounts: result.rows });
+}));
+
+app.post("/accounts", asyncRoute(async (req, res) => {
+  const {
+    role,
+    name,
+    mobile,
+    email,
+    password,
+    status,
+    createdByRole,
+    city,
+    state,
+    address,
+    pincode,
+    serviceAreas,
+    dealerNo,
+    contactPerson
+  } = req.body;
+
+  const cleanRole = typeof role === "string" ? role.trim() : "";
+  const cleanName = typeof name === "string" ? name.trim() : "";
+  const cleanMobile = normalizeMobileValue(mobile);
+  const cleanEmail = normalizeEmail(email);
+  const cleanCreatedByRole = typeof createdByRole === "string" ? createdByRole.trim() : "";
+  const cleanPassword = typeof password === "string" ? password : "";
+
+  if (!accountCreatorRoles.includes(cleanCreatedByRole)) {
+    return res.status(403).json({ error: "Only Admin or Front Desk can create login accounts." });
+  }
+  if (!accountRoles.includes(cleanRole)) {
+    return res.status(400).json({ error: "Select a valid role." });
+  }
+  if (!cleanName || !cleanMobile || !cleanEmail || !cleanPassword) {
+    return res.status(400).json({ error: "name, mobile, email, and password are required." });
+  }
+  if (cleanMobile.length < 10) {
+    return res.status(400).json({ error: "Enter a valid mobile number." });
+  }
+  if (cleanPassword.length < 8) {
+    return res.status(400).json({ error: "Password must be at least 8 characters." });
+  }
+
+  const existingMobile = await query("SELECT id FROM users WHERE mobile = ? LIMIT 1", [cleanMobile]);
+  if (existingMobile.rowCount) {
+    return res.status(409).json({ error: "This mobile number already has a login account." });
+  }
+  const existingEmail = await query(
+    "SELECT id FROM users WHERE LOWER(TRIM(COALESCE(email,''))) = ? AND role = ? LIMIT 1",
+    [cleanEmail, cleanRole]
+  );
+  if (existingEmail.rowCount) {
+    return res.status(409).json({ error: "This login ID already exists for the selected role." });
+  }
+
+  await query(
+    "INSERT INTO users (role, name, mobile, email, password_hash, status) VALUES (?, ?, ?, ?, ?, ?)",
+    [cleanRole, cleanName, cleanMobile, cleanEmail, hashPassword(cleanPassword), status || "Active"]
+  );
+  const user = await query("SELECT * FROM users WHERE mobile = ? AND role = ? LIMIT 1", [cleanMobile, cleanRole]);
+  const userId = user.rows[0].id;
+
+  let customer = null;
+  let technician = null;
+  let dealer = null;
+
+  if (cleanRole === "Customer") {
+    await query(
+      "INSERT INTO customers (user_id, name, mobile, address, city, state, pincode) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      [userId, cleanName, cleanMobile, address || null, city || null, state || null, pincode || null]
+    );
+    const result = await query("SELECT * FROM customers WHERE user_id = ? LIMIT 1", [userId]);
+    customer = result.rows[0] || null;
+  }
+
+  if (cleanRole === "Technician") {
+    await query(
+      "INSERT INTO technicians (user_id, name, mobile, city, service_areas, approval_status) VALUES (?, ?, ?, ?, ?, 'Pending')",
+      [userId, cleanName, cleanMobile, city || null, serviceAreas || null]
+    );
+    const result = await query("SELECT * FROM technicians WHERE user_id = ? LIMIT 1", [userId]);
+    technician = result.rows[0] || null;
+  }
+
+  if (cleanRole === "Dealer" && dealerNo) {
+    await query(
+      "INSERT INTO dealers (dealer_no, name, contact_person, mobile, address, city, state) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      [dealerNo, cleanName, contactPerson || null, cleanMobile, address || null, city || null, state || null]
+    );
+    const result = await query("SELECT * FROM dealers WHERE dealer_no = ? LIMIT 1", [dealerNo]);
+    dealer = result.rows[0] || null;
+  }
+
+  res.status(201).json({
+    user: publicUser(user.rows[0]),
+    customer,
+    technician,
+    dealer
+  });
 }));
 
 app.post("/customers", asyncRoute(async (req, res) => {
