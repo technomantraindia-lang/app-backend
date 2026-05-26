@@ -56,6 +56,36 @@ CREATE TABLE IF NOT EXISTS products (
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS service_areas (
+  id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
+  state VARCHAR(120),
+  city VARCHAR(120) NOT NULL,
+  area VARCHAR(160) NOT NULL,
+  pincode VARCHAR(20),
+  front_desk_user_id CHAR(36),
+  status VARCHAR(40) NOT NULL DEFAULT 'Active',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_service_areas_area (area),
+  INDEX idx_service_areas_pincode (pincode),
+  CONSTRAINT fk_service_areas_front_desk FOREIGN KEY (front_desk_user_id) REFERENCES users(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS work_type_costs (
+  id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
+  work_type VARCHAR(120) NOT NULL,
+  product_category VARCHAR(120),
+  model_no VARCHAR(120),
+  city VARCHAR(120),
+  technician_id CHAR(36),
+  payable_amount DECIMAL(10, 2) NOT NULL DEFAULT 0,
+  default_timeframe_hours INT NOT NULL DEFAULT 24,
+  effective_date DATE,
+  status VARCHAR(40) NOT NULL DEFAULT 'Active',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_work_type_costs_work_type (work_type),
+  CONSTRAINT fk_work_type_costs_technician FOREIGN KEY (technician_id) REFERENCES technicians(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS serial_numbers (
   id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
   product_id CHAR(36),

@@ -30,3 +30,28 @@ export async function rawQuery(sql, params = []) {
   const [rows] = await pool.query(sql, params);
   return rows;
 }
+
+export async function withTransaction(work) {
+  const connection = await pool.getConnection();
+  const run = async (sql, params = []) => {
+    const [rows] = await connection.execute(sql, params);
+    return {
+      rows: Array.isArray(rows) ? rows : [],
+      rowCount: Array.isArray(rows) ? rows.length : rows.affectedRows || 0,
+      insertId: rows?.insertId,
+      affectedRows: rows?.affectedRows || 0
+    };
+  };
+
+  try {
+    await connection.beginTransaction();
+    const result = await work(run);
+    await connection.commit();
+    return result;
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
