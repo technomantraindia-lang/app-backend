@@ -41,6 +41,19 @@ function cleanString(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+async function getNextDealerNo(runQuery = query) {
+  const result = await runQuery(
+    `SELECT dealer_no
+     FROM dealers
+     WHERE dealer_no REGEXP '^DLR[0-9]+$'
+     ORDER BY CAST(SUBSTRING(dealer_no, 4) AS UNSIGNED) DESC
+     LIMIT 1`
+  );
+  const lastNo = result.rows?.[0]?.dealer_no || "";
+  const lastNumber = Number(String(lastNo).replace(/^DLR/i, "")) || 0;
+  return `DLR${String(lastNumber + 1).padStart(6, "0")}`;
+}
+
 /** Express 4: async route errors must be passed to next() or the process can crash (no DB = dead server). */
 function asyncRoute(handler) {
   return (req, res, next) => {
@@ -178,6 +191,10 @@ app.get("/accounts", asyncRoute(async (_req, res) => {
     "SELECT id, role, name, mobile, email, status, created_at FROM users ORDER BY created_at DESC LIMIT 500"
   );
   res.json({ accounts: result.rows });
+}));
+
+app.get("/dealers/next-number", asyncRoute(async (_req, res) => {
+  res.json({ dealerNo: await getNextDealerNo() });
 }));
 
 app.get("/admin/dashboard", asyncRoute(async (_req, res) => {
@@ -472,12 +489,13 @@ app.post("/accounts", asyncRoute(async (req, res) => {
     technician = result.rows[0] || null;
   }
 
-  if (cleanRole === "Dealer" && dealerNo) {
+  if (cleanRole === "Dealer") {
+    const finalDealerNo = cleanString(dealerNo) || await getNextDealerNo();
     await query(
       "INSERT INTO dealers (dealer_no, name, contact_person, mobile, address, city, state) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      [dealerNo, cleanName, contactPerson || null, cleanMobile, address || null, city || null, state || null]
+      [finalDealerNo, cleanName, contactPerson || null, cleanMobile, address || null, city || null, state || null]
     );
-    const result = await query("SELECT * FROM dealers WHERE dealer_no = ? LIMIT 1", [dealerNo]);
+    const result = await query("SELECT * FROM dealers WHERE dealer_no = ? LIMIT 1", [finalDealerNo]);
     dealer = result.rows[0] || null;
   }
 
@@ -591,21 +609,53 @@ app.patch("/technicians/:id/approval", asyncRoute(async (req, res) => {
 }));
 
 app.get("/dealers", asyncRoute(async (_req, res) => {
-  const result = await query("SELECT * FROM dealers ORDER BY created_at DESC");
+  const result = await query(
+    `SELECT
+       COALESCE(d.id, u.id) AS id,
+       COALESCE(d.dealer_no, 'Pending Dealer No') AS dealer_no,
+       COALESCE(d.name, u.name) AS name,
+       COALESCE(d.contact_person, u.name) AS contact_person,
+       COALESCE(d.mobile, u.mobile) AS mobile,
+       d.address,
+       d.city,
+       d.state,
+       COALESCE(d.status, u.status, 'Active') AS status,
+       COALESCE(d.created_at, u.created_at) AS created_at
+     FROM users u
+     LEFT JOIN dealers d ON d.mobile = u.mobile
+     WHERE u.role = 'Dealer'
+     UNION
+     SELECT
+       d.id,
+       d.dealer_no,
+       d.name,
+       d.contact_person,
+       d.mobile,
+       d.address,
+       d.city,
+       d.state,
+       d.status,
+       d.created_at
+     FROM dealers d
+     LEFT JOIN users u ON u.mobile = d.mobile AND u.role = 'Dealer'
+     WHERE u.id IS NULL
+     ORDER BY created_at DESC`
+  );
   res.json({ dealers: result.rows });
 }));
 
 app.post("/dealers", asyncRoute(async (req, res) => {
   const { dealerNo, name, contactPerson, mobile, address, city, state } = req.body;
-  if (!dealerNo || !name || !mobile) {
-    return res.status(400).json({ error: "dealerNo, name, and mobile are required" });
+  if (!name || !mobile) {
+    return res.status(400).json({ error: "name and mobile are required" });
   }
 
+  const finalDealerNo = cleanString(dealerNo) || await getNextDealerNo();
   await query(
     "INSERT INTO dealers (dealer_no, name, contact_person, mobile, address, city, state) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    [dealerNo, name, contactPerson || null, mobile, address || null, city || null, state || null]
+    [finalDealerNo, name, contactPerson || null, mobile, address || null, city || null, state || null]
   );
-  const result = await query("SELECT * FROM dealers WHERE dealer_no = ? LIMIT 1", [dealerNo]);
+  const result = await query("SELECT * FROM dealers WHERE dealer_no = ? LIMIT 1", [finalDealerNo]);
   res.status(201).json({ dealer: result.rows[0] });
 }));
 
