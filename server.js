@@ -829,6 +829,29 @@ app.post("/serial-numbers", asyncRoute(async (req, res) => {
   res.status(201).json({ serial: result.rows[0] });
 }));
 
+app.post("/serial-numbers/generate-qr", asyncRoute(async (req, res) => {
+  const serialNumbers = Array.isArray(req.body?.serialNumbers)
+    ? req.body.serialNumbers.map(cleanString).filter(Boolean)
+    : [];
+
+  const result = serialNumbers.length
+    ? await query(
+        `UPDATE serial_numbers
+         SET qr_status = 'Printed'
+         WHERE serial_no IN (${serialNumbers.map(() => "?").join(",")})`,
+        serialNumbers
+      )
+    : await query("UPDATE serial_numbers SET qr_status = 'Printed' WHERE qr_status = 'Not Printed'");
+
+  res.json({
+    ok: true,
+    generated: result.affectedRows,
+    message: result.affectedRows
+      ? `${result.affectedRows} QR code(s) generated.`
+      : "No pending serials found for QR generation."
+  });
+}));
+
 app.get("/serial-numbers/:serialNo", asyncRoute(async (req, res) => {
   const serialNo = typeof req.params.serialNo === "string" ? req.params.serialNo.trim() : "";
   if (!serialNo) {
