@@ -176,6 +176,43 @@ app.get("/accounts", asyncRoute(async (_req, res) => {
   res.json({ accounts: result.rows });
 }));
 
+app.get("/admin/dashboard", asyncRoute(async (_req, res) => {
+  const [
+    warrantiesToday,
+    openTasks,
+    activeDealers,
+    overdueComplaints,
+    pendingTechnicians,
+    pendingSerials
+  ] = await Promise.all([
+    query("SELECT COUNT(*) AS total FROM warranties WHERE DATE(created_at) = CURDATE()"),
+    query("SELECT COUNT(*) AS total FROM tasks WHERE status NOT IN ('Closed', 'Completed', 'Cancelled')"),
+    query("SELECT COUNT(*) AS total FROM dealers WHERE status = 'Active'"),
+    query(
+      `SELECT COUNT(DISTINCT c.id) AS total
+       FROM complaints c
+       LEFT JOIN tasks t ON t.complaint_id = c.id
+       WHERE c.status NOT IN ('Closed', 'Completed', 'Cancelled')
+         AND t.due_at IS NOT NULL
+         AND t.due_at < NOW()`
+    ),
+    query("SELECT COUNT(*) AS total FROM technicians WHERE approval_status = 'Pending'"),
+    query("SELECT COUNT(*) AS total FROM serial_numbers WHERE qr_status = 'Not Printed' OR dispatch_status = 'Pending'")
+  ]);
+
+  const count = (result) => Number(result.rows?.[0]?.total || 0);
+  res.json({
+    summary: {
+      warrantiesToday: count(warrantiesToday),
+      openTasks: count(openTasks),
+      activeDealers: count(activeDealers),
+      overdueComplaints: count(overdueComplaints),
+      pendingTechnicians: count(pendingTechnicians),
+      pendingSerials: count(pendingSerials)
+    }
+  });
+}));
+
 app.delete("/accounts/:id", asyncRoute(async (req, res) => {
   const requesterRole = typeof req.body?.requesterRole === "string" ? req.body.requesterRole.trim() : "";
   const accountId = typeof req.params.id === "string" ? req.params.id.trim() : "";
@@ -415,6 +452,44 @@ app.get("/serial-numbers", asyncRoute(async (_req, res) => {
      LIMIT 800`
   );
   res.json({ serials: result.rows });
+}));
+
+app.get("/serial-numbers/:serialNo", asyncRoute(async (req, res) => {
+  const serialNo = typeof req.params.serialNo === "string" ? req.params.serialNo.trim() : "";
+  if (!serialNo) {
+    return res.status(400).json({ error: "Serial number is required." });
+  }
+
+  const result = await query(
+    `SELECT
+       s.*,
+       p.name AS product_name,
+       p.model_no,
+       p.category,
+       p.warranty_months,
+       d.dealer_no,
+       d.name AS dealer_name,
+       d.mobile AS dealer_mobile,
+       w.warranty_no,
+       w.status AS warranty_status,
+       w.installation_status,
+       w.start_date,
+       w.expiry_date
+     FROM serial_numbers s
+     LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN dealers d ON d.id = s.dealer_id
+     LEFT JOIN warranties w ON w.serial_id = s.id
+     WHERE LOWER(TRIM(s.serial_no)) = LOWER(TRIM(?))
+     ORDER BY w.created_at DESC
+     LIMIT 1`,
+    [serialNo]
+  );
+
+  if (!result.rowCount) {
+    return res.status(404).json({ error: "Serial number not found." });
+  }
+
+  res.json({ serial: result.rows[0] });
 }));
 
 app.get("/complaints/customer/:customerId", asyncRoute(async (req, res) => {
