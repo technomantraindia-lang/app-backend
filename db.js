@@ -17,7 +17,7 @@ export const pool = mysql.createPool({
 });
 
 export async function query(sql, params = []) {
-  const [rows] = await pool.execute(sql, params);
+  const [rows] = await pool.query(sql, params);
   return {
     rows: Array.isArray(rows) ? rows : [],
     rowCount: Array.isArray(rows) ? rows.length : rows.affectedRows || 0,
@@ -34,7 +34,7 @@ export async function rawQuery(sql, params = []) {
 export async function withTransaction(work) {
   const connection = await pool.getConnection();
   const run = async (sql, params = []) => {
-    const [rows] = await connection.execute(sql, params);
+    const [rows] = await connection.query(sql, params);
     return {
       rows: Array.isArray(rows) ? rows : [],
       rowCount: Array.isArray(rows) ? rows.length : rows.affectedRows || 0,
