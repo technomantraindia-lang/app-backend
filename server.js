@@ -176,6 +176,55 @@ app.get("/accounts", asyncRoute(async (_req, res) => {
   res.json({ accounts: result.rows });
 }));
 
+app.delete("/accounts/:id", asyncRoute(async (req, res) => {
+  const requesterRole = typeof req.body?.requesterRole === "string" ? req.body.requesterRole.trim() : "";
+  const accountId = typeof req.params.id === "string" ? req.params.id.trim() : "";
+
+  if (requesterRole !== "Admin") {
+    return res.status(403).json({ error: "Only Admin can delete login accounts." });
+  }
+  if (!accountId) {
+    return res.status(400).json({ error: "Account id is required." });
+  }
+
+  const existing = await query("SELECT id, role, name, mobile, email FROM users WHERE id = ? LIMIT 1", [accountId]);
+  if (!existing.rowCount) {
+    return res.status(404).json({ error: "Account not found." });
+  }
+
+  const account = existing.rows[0];
+  if (account.role === "Admin") {
+    return res.status(400).json({ error: "Admin account cannot be deleted from this screen." });
+  }
+
+  const deleted = {
+    customers: 0,
+    technicians: 0,
+    dealers: 0,
+    users: 0
+  };
+
+  if (account.role === "Customer") {
+    const result = await query("DELETE FROM customers WHERE user_id = ? OR mobile = ?", [account.id, account.mobile]);
+    deleted.customers = result.affectedRows;
+  }
+
+  if (account.role === "Technician") {
+    const result = await query("DELETE FROM technicians WHERE user_id = ? OR mobile = ?", [account.id, account.mobile]);
+    deleted.technicians = result.affectedRows;
+  }
+
+  if (account.role === "Dealer") {
+    const result = await query("DELETE FROM dealers WHERE mobile = ?", [account.mobile]);
+    deleted.dealers = result.affectedRows;
+  }
+
+  const userDelete = await query("DELETE FROM users WHERE id = ?", [account.id]);
+  deleted.users = userDelete.affectedRows;
+
+  res.json({ ok: true, deletedAccount: publicUser(account), deleted });
+}));
+
 app.post("/accounts", asyncRoute(async (req, res) => {
   const {
     role,
