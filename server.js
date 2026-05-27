@@ -2,9 +2,14 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import crypto from "crypto";
+import { createRequire } from "module";
 import { query, withTransaction } from "./db.js";
 
 dotenv.config();
+
+const require = createRequire(import.meta.url);
+const QRCode = require("qrcode-terminal/vendor/QRCode");
+const QRErrorCorrectLevel = require("qrcode-terminal/vendor/QRCode/QRErrorCorrectLevel");
 
 const app = express();
 const port = process.env.PORT || 4000;
@@ -60,6 +65,79 @@ function cleanDate(value) {
 
 function serialQrPayload(serialNo) {
   return `hitaishi://serial?serial=${encodeURIComponent(serialNo)}`;
+}
+
+function qrSvg(payload, size = 220) {
+  const qr = new QRCode(-1, QRErrorCorrectLevel.M);
+  qr.addData(payload);
+  qr.make();
+  const count = qr.getModuleCount();
+  const quiet = 4;
+  const cell = size / (count + quiet * 2);
+  const total = (count + quiet * 2) * cell;
+  const rects = [];
+  for (let row = 0; row < count; row += 1) {
+    for (let col = 0; col < count; col += 1) {
+      if (qr.isDark(row, col)) {
+        rects.push(`<rect x="${(col + quiet) * cell}" y="${(row + quiet) * cell}" width="${cell}" height="${cell}"/>`);
+      }
+    }
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${total} ${total}" width="${size}" height="${size}" role="img"><rect width="100%" height="100%" fill="#fff"/><g fill="#000">${rects.join("")}</g></svg>`;
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function parseCsvLine(line) {
+  const cells = [];
+  let current = "";
+  let quoted = false;
+  for (let i = 0; i < line.length; i += 1) {
+    const char = line[i];
+    const next = line[i + 1];
+    if (char === "\"" && quoted && next === "\"") {
+      current += "\"";
+      i += 1;
+    } else if (char === "\"") {
+      quoted = !quoted;
+    } else if (char === "," && !quoted) {
+      cells.push(current.trim());
+      current = "";
+    } else {
+      current += char;
+    }
+  }
+  cells.push(current.trim());
+  return cells;
+}
+
+function parseSerialCsv(csv) {
+  const lines = String(csv || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (!lines.length) return [];
+  const headers = parseCsvLine(lines[0]).map((header) => header.trim().toLowerCase());
+  return lines.slice(1).map((line) => {
+    const cells = parseCsvLine(line);
+    const row = {};
+    headers.forEach((header, index) => {
+      row[header] = cells[index] || "";
+    });
+    return row;
+  });
+}
+
+function pickRowValue(row, names) {
+  for (const name of names) {
+    if (row?.[name] !== undefined && row?.[name] !== null && String(row[name]).trim()) {
+      return String(row[name]).trim();
+    }
+  }
+  return "";
 }
 
 async function ensureSerialNumbersSchema() {
@@ -1125,8 +1203,342 @@ app.post("/serial-numbers/generate-qr", asyncRoute(async (req, res) => {
     generated: result.affectedRows,
     message: result.affectedRows
       ? `${result.affectedRows} QR code(s) generated.`
-      : "No pending serials found for QR generation."
+      : "All selected serials already have QR codes."
   });
+}));
+
+app.post("/serial-numbers/bulk", asyncRoute(async (req, res) => {
+  const rows = Array.isArray(req.body?.rows)
+    ? req.body.rows
+    : parseSerialCsv(req.body?.csv);
+
+  if (!rows.length) {
+    return res.status(400).json({ error: "Upload at least one serial row." });
+  }
+
+  const summary = { total: rows.length, saved: 0, failed: 0, duplicates: 0 };
+  const errors = [];
+
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index] || {};
+    const serialNo = cleanSerialNo(pickRowValue(row, ["serial", "serialno", "serial_no", "serial number"]));
+    const modelNo = cleanString(pickRowValue(row, ["model", "modelno", "model_no", "model number"]));
+    const productName = cleanString(pickRowValue(row, ["product", "productname", "product_name", "product name"])) || (modelNo ? `Product ${modelNo}` : "");
+    const dealerNo = cleanString(pickRowValue(row, ["dealer", "dealerno", "dealer_no", "dealer number"]));
+    const invoiceNo = cleanString(pickRowValue(row, ["invoice", "invoiceno", "invoice_no", "invoice number"])) || null;
+    const challanNo = cleanString(pickRowValue(row, ["challan", "challanno", "challan_no", "challan number"])) || null;
+    const batchNo = cleanString(pickRowValue(row, ["batch", "batchno", "batch_no", "batch number"])) || null;
+    const dispatchDate = cleanDate(pickRowValue(row, ["dispatchdate", "dispatch_date", "dispatch date"]));
+
+    if (!serialNo) {
+      summary.failed += 1;
+      errors.push({ row: index + 2, serial: "", error: "Serial number is required." });
+      continue;
+    }
+
+    try {
+      const duplicate = await query("SELECT id FROM serial_numbers WHERE LOWER(TRIM(serial_no)) = LOWER(?) LIMIT 1", [serialNo]);
+      if (duplicate.rowCount) {
+        summary.duplicates += 1;
+        errors.push({ row: index + 2, serial: serialNo, error: "Duplicate serial." });
+        continue;
+      }
+
+      let product = null;
+      if (modelNo) {
+        const productResult = await query("SELECT id FROM products WHERE LOWER(TRIM(model_no)) = LOWER(?) LIMIT 1", [modelNo]);
+        product = productResult.rows[0] || null;
+        if (!product) {
+          await query(
+            "INSERT INTO products (name, model_no, category, warranty_months) VALUES (?, ?, ?, ?)",
+            [productName || `Product ${modelNo}`, modelNo, "General", 12]
+          );
+          const created = await query("SELECT id FROM products WHERE LOWER(TRIM(model_no)) = LOWER(?) LIMIT 1", [modelNo]);
+          product = created.rows[0] || null;
+        }
+      }
+
+      let dealer = null;
+      if (dealerNo) {
+        const dealerResult = await query("SELECT id FROM dealers WHERE LOWER(TRIM(dealer_no)) = LOWER(?) AND status = 'Active' LIMIT 1", [dealerNo]);
+        dealer = dealerResult.rows[0] || null;
+        if (!dealer) {
+          summary.failed += 1;
+          errors.push({ row: index + 2, serial: serialNo, error: "Active dealer not found." });
+          continue;
+        }
+      }
+
+      await query(
+        `INSERT INTO serial_numbers
+         (product_id, dealer_id, serial_no, invoice_no, challan_no, batch_no, dispatch_date, qr_status, qr_payload, qr_printed_at, dispatch_status, dispatched_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'Printed', ?, NOW(), ?, ?)`,
+        [
+          product?.id || null,
+          dealer?.id || null,
+          serialNo,
+          invoiceNo,
+          challanNo,
+          batchNo,
+          dispatchDate,
+          serialQrPayload(serialNo),
+          dealer ? "Dispatched" : "Pending",
+          dealer ? new Date() : null
+        ]
+      );
+      summary.saved += 1;
+    } catch (error) {
+      summary.failed += 1;
+      errors.push({ row: index + 2, serial: serialNo, error: error?.message || "Save failed." });
+    }
+  }
+
+  res.json({ ok: true, summary, errors });
+}));
+
+app.get("/serial-numbers/print-stickers", asyncRoute(async (req, res) => {
+  const requested = cleanString(req.query.serials)
+    .split(",")
+    .map(cleanSerialNo)
+    .filter(Boolean);
+  const where = requested.length
+    ? `WHERE s.serial_no IN (${requested.map(() => "?").join(",")})`
+    : "WHERE s.qr_status = 'Printed'";
+  const result = await query(
+    `SELECT s.*, p.name AS product_name, p.model_no, d.dealer_no, d.name AS dealer_name
+     FROM serial_numbers s
+     LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN dealers d ON d.id = s.dealer_id
+     ${where}
+     ORDER BY s.created_at DESC
+     LIMIT 300`,
+    requested
+  );
+
+  const cards = result.rows.map((serial) => {
+    const payload = serial.qr_payload || serialQrPayload(serial.serial_no);
+    const qrUrl = `/serial-numbers/${encodeURIComponent(serial.serial_no)}/qr.svg?download=1`;
+    return `
+      <section class="label">
+        ${qrSvg(payload, 150)}
+        <div class="brand">Hitaishi CRM</div>
+        <div class="serial">${escapeHtml(serial.serial_no)}</div>
+        <div>${escapeHtml(serial.product_name || "Product")} ${escapeHtml(serial.model_no || "")}</div>
+        <div>${escapeHtml(serial.dealer_no || "")} ${escapeHtml(serial.dealer_name || "")}</div>
+        <a class="download" href="${qrUrl}">Download QR</a>
+      </section>`;
+  }).join("");
+
+  res.type("html").send(`<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Hitaishi QR Stickers</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 16px; color: #111827; }
+    .toolbar { margin-bottom: 16px; }
+    .sheet { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px; }
+    .label { border: 1px solid #111827; border-radius: 8px; padding: 10px; text-align: center; break-inside: avoid; }
+    .brand { font-weight: 700; margin-top: 4px; }
+    .serial { font-size: 18px; font-weight: 800; margin-top: 4px; }
+    .download { display: inline-block; margin-top: 6px; color: #0f3f6b; font-size: 12px; }
+    @media print { .toolbar, .download { display: none; } body { margin: 0; } .label { border-color: #000; } }
+  </style>
+</head>
+<body>
+  <div class="toolbar"><button onclick="window.print()">Print Stickers</button></div>
+  <main class="sheet">${cards || "<p>No printed QR serials found.</p>"}</main>
+</body>
+</html>`);
+}));
+
+app.get("/serial-numbers/:serialNo/qr.svg", asyncRoute(async (req, res) => {
+  const serialNo = cleanSerialNo(req.params.serialNo);
+  const result = await query("SELECT serial_no, qr_payload FROM serial_numbers WHERE serial_no = ? LIMIT 1", [serialNo]);
+  if (!result.rowCount) {
+    return res.status(404).send("Serial number not found.");
+  }
+  const payload = result.rows[0].qr_payload || serialQrPayload(result.rows[0].serial_no);
+  if (String(req.query.download || "") === "1") {
+    res.setHeader("Content-Disposition", `attachment; filename="${result.rows[0].serial_no}-qr.svg"`);
+  }
+  res.type("image/svg+xml").send(qrSvg(payload));
+}));
+
+app.get("/tasks", asyncRoute(async (req, res) => {
+  const status = cleanString(req.query.status);
+  const where = [];
+  const params = [];
+  if (status && status !== "All") {
+    where.push("LOWER(t.status) = LOWER(?)");
+    params.push(status);
+  }
+  const sqlWhere = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  const result = await query(
+    `SELECT
+       t.id,
+       t.task_no,
+       t.work_type,
+       t.due_at,
+       t.status,
+       t.payable_amount,
+       t.created_at,
+       c.complaint_no,
+       c.problem_type,
+       c.description,
+       c.priority,
+       c.status AS complaint_status,
+       tech.name AS technician_name,
+       tech.mobile AS technician_mobile,
+       cust.name AS customer_name,
+       cust.mobile AS customer_mobile,
+       cust.address AS customer_address,
+       cust.city AS customer_city,
+       p.name AS product_name,
+       p.model_no,
+       s.serial_no,
+       w.warranty_no,
+       w.status AS warranty_status,
+       pay.status AS payment_status,
+       pay.amount AS payment_amount
+     FROM tasks t
+     LEFT JOIN complaints c ON c.id = t.complaint_id
+     LEFT JOIN technicians tech ON tech.id = t.technician_id
+     LEFT JOIN warranties w ON w.id = c.warranty_id
+     LEFT JOIN customers cust ON cust.id = COALESCE(c.customer_id, w.customer_id)
+     LEFT JOIN serial_numbers s ON s.id = w.serial_id
+     LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN (
+       SELECT task_id, MAX(status) AS status, SUM(amount) AS amount
+       FROM payments
+       GROUP BY task_id
+     ) pay ON pay.task_id = t.id
+     ${sqlWhere}
+     ORDER BY t.created_at DESC
+     LIMIT 200`,
+    params
+  );
+  res.json({ tasks: result.rows });
+}));
+
+app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
+  const id = cleanString(req.params.id);
+  const status = cleanString(req.body?.status);
+  if (!id || !status) {
+    return res.status(400).json({ error: "Task id and status are required." });
+  }
+  const allowed = ["Assigned", "Accepted", "Rejected", "Scheduled", "Rescheduled", "Reached", "Inspection Started", "Completed"];
+  if (!allowed.includes(status)) {
+    return res.status(400).json({ error: "Invalid task status." });
+  }
+  const result = await query("UPDATE tasks SET status = ? WHERE id = ?", [status, id]);
+  if (!result.affectedRows) {
+    return res.status(404).json({ error: "Task not found." });
+  }
+  const task = await query("SELECT * FROM tasks WHERE id = ? LIMIT 1", [id]);
+  res.json({ task: task.rows[0] });
+}));
+
+async function dealerWarrantyReportRows(req) {
+  const dealerNo = cleanString(req.query.dealerNo);
+  const product = cleanString(req.query.product);
+  const city = cleanString(req.query.city);
+  const technician = cleanString(req.query.technician);
+  const status = cleanString(req.query.status);
+  const dateFrom = cleanDate(req.query.dateFrom);
+  const dateTo = cleanDate(req.query.dateTo);
+  const where = [];
+  const params = [];
+
+  if (dealerNo && dealerNo !== "All") {
+    where.push("d.dealer_no = ?");
+    params.push(dealerNo);
+  }
+  if (product && product !== "All") {
+    where.push("(p.name = ? OR p.model_no = ?)");
+    params.push(product, product);
+  }
+  if (city && city !== "All") {
+    where.push("(d.city = ? OR cust.city = ?)");
+    params.push(city, city);
+  }
+  if (technician && technician !== "All") {
+    where.push("tech.name = ?");
+    params.push(technician);
+  }
+  if (status && status !== "All") {
+    where.push("LOWER(w.status) = LOWER(?)");
+    params.push(status);
+  }
+  if (dateFrom) {
+    where.push("DATE(w.created_at) >= ?");
+    params.push(dateFrom);
+  }
+  if (dateTo) {
+    where.push("DATE(w.created_at) <= ?");
+    params.push(dateTo);
+  }
+
+  const sqlWhere = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  const result = await query(
+    `SELECT
+       COALESCE(d.dealer_no, 'Unmapped') AS dealer_no,
+       COALESCE(d.name, 'Unmapped Dealer') AS dealer_name,
+       COALESCE(d.city, cust.city, '') AS city,
+       COUNT(w.id) AS total_warranties,
+       SUM(CASE WHEN LOWER(w.status) = 'active' THEN 1 ELSE 0 END) AS active_warranties,
+       SUM(CASE WHEN LOWER(w.status) LIKE 'pending%' THEN 1 ELSE 0 END) AS pending_warranties,
+       SUM(CASE WHEN LOWER(w.status) = 'expired' THEN 1 ELSE 0 END) AS expired_warranties,
+       COUNT(DISTINCT c.id) AS complaints,
+       COUNT(DISTINCT t.id) AS tasks
+     FROM warranties w
+     LEFT JOIN dealers d ON d.id = w.dealer_id
+     LEFT JOIN customers cust ON cust.id = w.customer_id
+     LEFT JOIN serial_numbers s ON s.id = w.serial_id
+     LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN complaints c ON c.warranty_id = w.id
+     LEFT JOIN tasks t ON t.complaint_id = c.id
+     LEFT JOIN technicians tech ON tech.id = t.technician_id
+     ${sqlWhere}
+     GROUP BY dealer_no, dealer_name, city
+     ORDER BY total_warranties DESC, dealer_name ASC
+     LIMIT 500`,
+    params
+  );
+  return result.rows;
+}
+
+app.get("/reports/dealer-warranty", asyncRoute(async (req, res) => {
+  const rows = await dealerWarrantyReportRows(req);
+  const summary = rows.reduce((acc, row) => {
+    acc.total += Number(row.total_warranties || 0);
+    acc.active += Number(row.active_warranties || 0);
+    acc.pending += Number(row.pending_warranties || 0);
+    acc.expired += Number(row.expired_warranties || 0);
+    acc.complaints += Number(row.complaints || 0);
+    acc.tasks += Number(row.tasks || 0);
+    return acc;
+  }, { total: 0, active: 0, pending: 0, expired: 0, complaints: 0, tasks: 0 });
+  res.json({ summary, rows });
+}));
+
+app.get("/reports/dealer-warranty.csv", asyncRoute(async (req, res) => {
+  const rows = await dealerWarrantyReportRows(req);
+  const header = ["Dealer Number", "Dealer Name", "City", "Total Warranties", "Active", "Pending", "Expired", "Complaints", "Tasks"];
+  const escapeCsv = (value) => `"${String(value ?? "").replace(/"/g, '""')}"`;
+  const body = rows.map((row) => [
+    row.dealer_no,
+    row.dealer_name,
+    row.city,
+    row.total_warranties,
+    row.active_warranties,
+    row.pending_warranties,
+    row.expired_warranties,
+    row.complaints,
+    row.tasks
+  ].map(escapeCsv).join(","));
+  res.setHeader("Content-Disposition", "attachment; filename=\"dealer-warranty-report.csv\"");
+  res.type("text/csv").send([header.map(escapeCsv).join(","), ...body].join("\n"));
 }));
 
 app.get("/serial-numbers/:serialNo", asyncRoute(async (req, res) => {
