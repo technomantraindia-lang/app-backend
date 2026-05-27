@@ -50,6 +50,22 @@ function cleanSerialNo(value) {
   return cleanString(value).replace(/\s+/g, "").toUpperCase();
 }
 
+function serialFromPayload(value) {
+  const raw = cleanString(value);
+  if (!raw) return "";
+  try {
+    const url = new URL(raw);
+    const serial = url.searchParams.get("serial") || url.searchParams.get("serialNo") || url.searchParams.get("sn");
+    if (serial) return cleanSerialNo(serial);
+    const lastPath = url.pathname.split("/").filter(Boolean).pop();
+    if (lastPath) return cleanSerialNo(decodeURIComponent(lastPath));
+  } catch {
+    // Plain serials and simple key-value QR payloads are handled below.
+  }
+  const match = raw.match(/(?:serial|serialNo|sn)\s*[:=]\s*([A-Za-z0-9._/-]+)/i);
+  return cleanSerialNo(match?.[1] || raw);
+}
+
 function cleanDate(value) {
   const raw = cleanString(value);
   if (!raw) return null;
@@ -1047,10 +1063,118 @@ app.delete("/work-type-costs/:id", asyncRoute(async (req, res) => {
 
 app.get("/warranties/customer/:customerId", asyncRoute(async (req, res) => {
   const result = await query(
-    "SELECT * FROM warranties WHERE customer_id = ? ORDER BY created_at DESC",
+    `SELECT
+       w.*,
+       s.serial_no,
+       p.name AS product_name,
+       p.model_no,
+       p.warranty_months,
+       d.dealer_no,
+       d.name AS dealer_name
+     FROM warranties w
+     LEFT JOIN serial_numbers s ON s.id = w.serial_id
+     LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN dealers d ON d.id = COALESCE(w.dealer_id, s.dealer_id)
+     WHERE w.customer_id = ?
+     ORDER BY w.created_at DESC`,
     [req.params.customerId]
   );
   res.json({ warranties: result.rows });
+}));
+
+app.post("/warranties/activate-from-qr", asyncRoute(async (req, res) => {
+  const customerId = cleanString(req.body.customerId || req.body.customer_id);
+  const serialNo = serialFromPayload(req.body.serialNo || req.body.serial_no || req.body.qr || req.body.qrPayload);
+  const purchaseDate = cleanDate(req.body.purchaseDate || req.body.purchase_date) || new Date().toISOString().slice(0, 10);
+  const invoiceNo = cleanString(req.body.invoiceNo || req.body.invoice_no);
+
+  if (!customerId || !serialNo) {
+    return res.status(400).json({ error: "Customer and serial number are required." });
+  }
+
+  const customer = await query("SELECT id FROM customers WHERE id = ? LIMIT 1", [customerId]);
+  if (!customer.rowCount) {
+    return res.status(404).json({ error: "Customer account not found." });
+  }
+
+  const serial = await query(
+    `SELECT
+       s.id,
+       s.serial_no,
+       s.dealer_id,
+       s.qr_status,
+       p.id AS product_id,
+       p.name AS product_name,
+       p.model_no,
+       p.warranty_months
+     FROM serial_numbers s
+     LEFT JOIN products p ON p.id = s.product_id
+     WHERE LOWER(TRIM(s.serial_no)) = LOWER(TRIM(?))
+     LIMIT 1`,
+    [serialNo]
+  );
+  if (!serial.rowCount) {
+    return res.status(404).json({ error: "Serial number not found. Please scan admin generated QR." });
+  }
+  const row = serial.rows[0];
+  if (row.qr_status !== "Printed") {
+    return res.status(400).json({ error: "QR is not generated/printed for this serial yet." });
+  }
+
+  const existing = await query(
+    "SELECT * FROM warranties WHERE serial_id = ? ORDER BY created_at DESC LIMIT 1",
+    [row.id]
+  );
+  if (existing.rowCount && existing.rows[0].customer_id && existing.rows[0].customer_id !== customerId) {
+    return res.status(409).json({ error: "This product warranty is already activated by another customer." });
+  }
+
+  const months = Number(row.warranty_months || 12);
+  const warrantyNo = existing.rowCount ? existing.rows[0].warranty_no : `WAR-${Date.now()}`;
+
+  if (existing.rowCount) {
+    await query(
+      `UPDATE warranties
+       SET customer_id = ?,
+           dealer_id = COALESCE(dealer_id, ?),
+           start_date = COALESCE(start_date, ?),
+           expiry_date = COALESCE(expiry_date, DATE_ADD(?, INTERVAL ? MONTH)),
+           status = 'Active',
+           installation_status = CASE WHEN installation_status IS NULL OR installation_status = '' THEN 'Required' ELSE installation_status END
+       WHERE id = ?`,
+      [customerId, row.dealer_id || null, purchaseDate, purchaseDate, months, existing.rows[0].id]
+    );
+  } else {
+    await query(
+      `INSERT INTO warranties
+       (warranty_no, customer_id, dealer_id, serial_id, start_date, expiry_date, status, installation_status)
+       VALUES (?, ?, ?, ?, ?, DATE_ADD(?, INTERVAL ? MONTH), 'Active', 'Required')`,
+      [warrantyNo, customerId, row.dealer_id || null, row.id, purchaseDate, purchaseDate, months]
+    );
+  }
+
+  if (invoiceNo) {
+    await query("UPDATE serial_numbers SET invoice_no = COALESCE(NULLIF(invoice_no, ''), ?) WHERE id = ?", [invoiceNo, row.id]);
+  }
+
+  const warranty = await query(
+    `SELECT
+       w.*,
+       s.serial_no,
+       p.name AS product_name,
+       p.model_no,
+       p.warranty_months,
+       d.dealer_no,
+       d.name AS dealer_name
+     FROM warranties w
+     LEFT JOIN serial_numbers s ON s.id = w.serial_id
+     LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN dealers d ON d.id = COALESCE(w.dealer_id, s.dealer_id)
+     WHERE w.warranty_no = ?
+     LIMIT 1`,
+    [warrantyNo]
+  );
+  res.json({ warranty: warranty.rows[0] });
 }));
 
 /** List complaints (staff panels). Customers should use `/complaints/customer/:customerId`. */
