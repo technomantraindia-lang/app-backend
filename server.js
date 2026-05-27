@@ -42,6 +42,51 @@ function normalizeMobileValue(mobile) {
   return typeof mobile === "string" ? mobile.replace(/\D/g, "") : "";
 }
 
+/** Match dealers.mobile to users.mobile even when formatting differs (+91, spaces, etc.). */
+function sqlNormalizeMobileColumn(column) {
+  return `REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(${column}, ' ', ''), '-', ''), '+', ''), '(', ''), ')', ''), '.', '')`;
+}
+
+async function findDealerForUser(userRow) {
+  const dealerMobile = normalizeMobileValue(userRow?.mobile);
+  if (!dealerMobile) {
+    return null;
+  }
+  const result = await query(
+    `SELECT * FROM dealers WHERE ${sqlNormalizeMobileColumn("mobile")} = ? LIMIT 1`,
+    [dealerMobile]
+  );
+  return result.rowCount ? result.rows[0] : null;
+}
+
+/** Resolve technician profile for login — by user_id, then mobile (auto-links user_id when missing). */
+async function findTechnicianForUser(userRow) {
+  if (!userRow?.id) {
+    return null;
+  }
+  const byUser = await query("SELECT * FROM technicians WHERE user_id = ? LIMIT 1", [userRow.id]);
+  if (byUser.rowCount) {
+    return byUser.rows[0];
+  }
+  const techMobile = normalizeMobileValue(userRow.mobile);
+  if (!techMobile) {
+    return null;
+  }
+  const byMobile = await query(
+    `SELECT * FROM technicians WHERE ${sqlNormalizeMobileColumn("mobile")} = ? LIMIT 1`,
+    [techMobile]
+  );
+  if (!byMobile.rowCount) {
+    return null;
+  }
+  const technician = byMobile.rows[0];
+  if (!technician.user_id) {
+    await query("UPDATE technicians SET user_id = ? WHERE id = ?", [userRow.id, technician.id]);
+    technician.user_id = userRow.id;
+  }
+  return technician;
+}
+
 function cleanString(value) {
   return typeof value === "string" ? value.trim() : "";
 }
@@ -282,16 +327,10 @@ app.post("/auth/login", asyncRoute(async (req, res) => {
     if (cr.rowCount) customer = cr.rows[0];
   }
   if (role === "Technician") {
-    const tr = await query("SELECT * FROM technicians WHERE user_id = ? LIMIT 1", [userRow.id]);
-    if (tr.rowCount) technician = tr.rows[0];
+    technician = await findTechnicianForUser(userRow);
   }
   if (role === "Dealer") {
-    const dealerMobile = normalizeMobileValue(userRow.mobile);
-    const dr = await query(
-      "SELECT * FROM dealers WHERE mobile = ? OR REPLACE(REPLACE(REPLACE(REPLACE(mobile, ' ', ''), '-', ''), '+', ''), '(', '') = ? LIMIT 1",
-      [userRow.mobile, dealerMobile]
-    );
-    if (dr.rowCount) dealer = dr.rows[0];
+    dealer = await findDealerForUser(userRow);
   }
 
   res.json({
@@ -796,6 +835,44 @@ app.get("/dealers", asyncRoute(async (_req, res) => {
   res.json({ dealers: result.rows });
 }));
 
+app.get("/dealers/by-user/:userId", asyncRoute(async (req, res) => {
+  const userId = cleanString(req.params.userId);
+  if (!userId) {
+    return res.status(400).json({ error: "userId is required." });
+  }
+  const userResult = await query("SELECT * FROM users WHERE id = ? AND role = 'Dealer' LIMIT 1", [userId]);
+  if (!userResult.rowCount) {
+    return res.status(404).json({ error: "Dealer login not found." });
+  }
+  const dealer = await findDealerForUser(userResult.rows[0]);
+  if (!dealer) {
+    return res.status(404).json({
+      error:
+        "Dealer profile not linked. In Admin → Dealer Management, use the same mobile number as this login account.",
+    });
+  }
+  res.json({ dealer });
+}));
+
+app.get("/technicians/by-user/:userId", asyncRoute(async (req, res) => {
+  const userId = cleanString(req.params.userId);
+  if (!userId) {
+    return res.status(400).json({ error: "userId is required." });
+  }
+  const userResult = await query("SELECT * FROM users WHERE id = ? AND role = 'Technician' LIMIT 1", [userId]);
+  if (!userResult.rowCount) {
+    return res.status(404).json({ error: "Technician login not found." });
+  }
+  const technician = await findTechnicianForUser(userResult.rows[0]);
+  if (!technician) {
+    return res.status(404).json({
+      error:
+        "Technician profile not linked. Use the same mobile in Technician Management as this login, or sign up again.",
+    });
+  }
+  res.json({ technician });
+}));
+
 app.get("/dealers/:id/dashboard", asyncRoute(async (req, res) => {
   const dealerId = cleanString(req.params.id);
   if (!dealerId) {
@@ -1160,19 +1237,81 @@ app.get("/warranties/customer/:customerId", asyncRoute(async (req, res) => {
   res.json({ warranties: result.rows });
 }));
 
-app.post("/warranties/activate-from-qr", asyncRoute(async (req, res) => {
-  const customerId = cleanString(req.body.customerId || req.body.customer_id);
-  const serialNo = serialFromPayload(req.body.serialNo || req.body.serial_no || req.body.qr || req.body.qrPayload);
-  const purchaseDate = cleanDate(req.body.purchaseDate || req.body.purchase_date) || new Date().toISOString().slice(0, 10);
-  const invoiceNo = cleanString(req.body.invoiceNo || req.body.invoice_no);
+async function findOrCreateCustomer({ name, mobile, email, address, city, state, pincode }) {
+  const cleanName = cleanString(name);
+  const cleanMobile = normalizeMobileValue(mobile);
+  if (!cleanName || cleanMobile.length < 10) {
+    const err = new Error("Customer name and a valid 10-digit mobile number are required.");
+    err.statusCode = 400;
+    throw err;
+  }
 
-  if (!customerId || !serialNo) {
-    return res.status(400).json({ error: "Customer and serial number are required." });
+  let existing = await query(
+    `SELECT * FROM customers WHERE ${sqlNormalizeMobileColumn("mobile")} = ? LIMIT 1`,
+    [cleanMobile]
+  );
+  if (existing.rowCount) {
+    const row = existing.rows[0];
+    await query(
+      `UPDATE customers
+       SET name = ?, address = COALESCE(?, address), city = COALESCE(?, city), state = COALESCE(?, state), pincode = COALESCE(?, pincode)
+       WHERE id = ?`,
+      [cleanName, address || null, city || null, state || null, pincode || null, row.id]
+    );
+    const updated = await query("SELECT * FROM customers WHERE id = ? LIMIT 1", [row.id]);
+    return updated.rows[0];
+  }
+
+  const emailNorm = normalizeEmail(email);
+  const userCheck = await query("SELECT id, role FROM users WHERE mobile = ? LIMIT 1", [cleanMobile]);
+  if (userCheck.rowCount && userCheck.rows[0].role !== "Customer") {
+    const err = new Error("This mobile number is already used for another account type.");
+    err.statusCode = 409;
+    throw err;
+  }
+
+  let userId;
+  if (userCheck.rowCount) {
+    userId = userCheck.rows[0].id;
+    await query(
+      "UPDATE users SET name = ?, email = COALESCE(?, email) WHERE id = ?",
+      [cleanName, emailNorm || null, userId]
+    );
+    const orphan = await query("SELECT id FROM customers WHERE user_id = ? LIMIT 1", [userId]);
+    if (orphan.rowCount) {
+      const updated = await query("SELECT * FROM customers WHERE user_id = ? LIMIT 1", [userId]);
+      return updated.rows[0];
+    }
+  } else {
+    await query(
+      "INSERT INTO users (role, name, mobile, email, password_hash, status) VALUES ('Customer', ?, ?, ?, NULL, 'Active')",
+      [cleanName, cleanMobile, emailNorm || null]
+    );
+    const user = await query("SELECT id FROM users WHERE mobile = ? AND role = 'Customer' LIMIT 1", [cleanMobile]);
+    userId = user.rows[0].id;
+  }
+
+  await query(
+    "INSERT INTO customers (user_id, name, mobile, address, city, state, pincode) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    [userId, cleanName, cleanMobile, address || null, city || null, state || null, pincode || null]
+  );
+  const created = await query("SELECT * FROM customers WHERE user_id = ? LIMIT 1", [userId]);
+  return created.rows[0];
+}
+
+async function activateWarrantyFromSerial({ customerId, serialNo, purchaseDate, invoiceNo, actingDealerId }) {
+  const cleanSerial = serialFromPayload(serialNo);
+  if (!customerId || !cleanSerial) {
+    const err = new Error("Customer and serial number are required.");
+    err.statusCode = 400;
+    throw err;
   }
 
   const customer = await query("SELECT id FROM customers WHERE id = ? LIMIT 1", [customerId]);
   if (!customer.rowCount) {
-    return res.status(404).json({ error: "Customer account not found." });
+    const err = new Error("Customer account not found.");
+    err.statusCode = 404;
+    throw err;
   }
 
   const serial = await query(
@@ -1189,15 +1328,28 @@ app.post("/warranties/activate-from-qr", asyncRoute(async (req, res) => {
      LEFT JOIN products p ON p.id = s.product_id
      WHERE LOWER(TRIM(s.serial_no)) = LOWER(TRIM(?))
      LIMIT 1`,
-    [serialNo]
+    [cleanSerial]
   );
   if (!serial.rowCount) {
-    return res.status(404).json({ error: "Serial number not found. Please scan admin generated QR." });
+    const err = new Error("Serial number not found. Please scan admin generated QR.");
+    err.statusCode = 404;
+    throw err;
   }
+
   const row = serial.rows[0];
   if (row.qr_status !== "Printed") {
-    return res.status(400).json({ error: "QR is not generated/printed for this serial yet." });
+    const err = new Error("QR is not generated/printed for this serial yet.");
+    err.statusCode = 400;
+    throw err;
   }
+
+  if (actingDealerId && row.dealer_id && String(row.dealer_id) !== String(actingDealerId)) {
+    const err = new Error("This product QR is mapped to another dealer.");
+    err.statusCode = 403;
+    throw err;
+  }
+
+  const warrantyDealerId = row.dealer_id || actingDealerId || null;
 
   const existing = await query(
     "SELECT * FROM warranties WHERE serial_id = ? ORDER BY created_at DESC LIMIT 1",
@@ -1205,13 +1357,18 @@ app.post("/warranties/activate-from-qr", asyncRoute(async (req, res) => {
   );
   if (existing.rowCount && existing.rows[0].customer_id) {
     if (existing.rows[0].customer_id === customerId) {
-      return res.status(409).json({ error: "QR expired. This product warranty is already active in your account." });
+      const err = new Error("This product warranty is already active for this customer.");
+      err.statusCode = 409;
+      throw err;
     }
-    return res.status(409).json({ error: "QR expired. This product warranty is already activated by another customer." });
+    const err = new Error("QR expired. This product warranty is already activated for another customer.");
+    err.statusCode = 409;
+    throw err;
   }
 
   const months = Number(row.warranty_months || 12);
   const warrantyNo = existing.rowCount ? existing.rows[0].warranty_no : `WAR-${Date.now()}`;
+  const startDate = purchaseDate || new Date().toISOString().slice(0, 10);
 
   if (existing.rowCount) {
     await query(
@@ -1223,19 +1380,23 @@ app.post("/warranties/activate-from-qr", asyncRoute(async (req, res) => {
            status = 'Active',
            installation_status = CASE WHEN installation_status IS NULL OR installation_status = '' THEN 'Required' ELSE installation_status END
        WHERE id = ?`,
-      [customerId, row.dealer_id || null, purchaseDate, purchaseDate, months, existing.rows[0].id]
+      [customerId, warrantyDealerId, startDate, startDate, months, existing.rows[0].id]
     );
   } else {
     await query(
       `INSERT INTO warranties
        (warranty_no, customer_id, dealer_id, serial_id, start_date, expiry_date, status, installation_status)
        VALUES (?, ?, ?, ?, ?, DATE_ADD(?, INTERVAL ? MONTH), 'Active', 'Required')`,
-      [warrantyNo, customerId, row.dealer_id || null, row.id, purchaseDate, purchaseDate, months]
+      [warrantyNo, customerId, warrantyDealerId, row.id, startDate, startDate, months]
     );
   }
 
   if (invoiceNo) {
     await query("UPDATE serial_numbers SET invoice_no = COALESCE(NULLIF(invoice_no, ''), ?) WHERE id = ?", [invoiceNo, row.id]);
+  }
+
+  if (actingDealerId && !row.dealer_id) {
+    await query("UPDATE serial_numbers SET dealer_id = ? WHERE id = ?", [actingDealerId, row.id]);
   }
 
   const warranty = await query(
@@ -1246,16 +1407,62 @@ app.post("/warranties/activate-from-qr", asyncRoute(async (req, res) => {
        p.model_no,
        p.warranty_months,
        d.dealer_no,
-       d.name AS dealer_name
+       d.name AS dealer_name,
+       cust.name AS customer_name,
+       cust.mobile AS customer_mobile
      FROM warranties w
      LEFT JOIN serial_numbers s ON s.id = w.serial_id
      LEFT JOIN products p ON p.id = s.product_id
      LEFT JOIN dealers d ON d.id = COALESCE(w.dealer_id, s.dealer_id)
+     LEFT JOIN customers cust ON cust.id = w.customer_id
      WHERE w.warranty_no = ?
      LIMIT 1`,
     [warrantyNo]
   );
-  res.json({ warranty: warranty.rows[0] });
+  return warranty.rows[0];
+}
+
+app.post("/warranties/activate-from-qr", asyncRoute(async (req, res) => {
+  const customerId = cleanString(req.body.customerId || req.body.customer_id);
+  const serialNo = serialFromPayload(req.body.serialNo || req.body.serial_no || req.body.qr || req.body.qrPayload);
+  const purchaseDate = cleanDate(req.body.purchaseDate || req.body.purchase_date) || new Date().toISOString().slice(0, 10);
+  const invoiceNo = cleanString(req.body.invoiceNo || req.body.invoice_no);
+
+  const warranty = await activateWarrantyFromSerial({
+    customerId,
+    serialNo,
+    purchaseDate,
+    invoiceNo,
+    actingDealerId: null,
+  });
+  res.json({ warranty });
+}));
+
+/** Dealer scans QR and registers customer details to activate warranty. */
+app.post("/warranties/dealer/activate-from-qr", asyncRoute(async (req, res) => {
+  const dealerId = cleanString(req.body.dealerId || req.body.dealer_id);
+  const serialNo = serialFromPayload(req.body.serialNo || req.body.serial_no || req.body.qr || req.body.qrPayload);
+  const purchaseDate = cleanDate(req.body.purchaseDate || req.body.purchase_date) || new Date().toISOString().slice(0, 10);
+  const invoiceNo = cleanString(req.body.invoiceNo || req.body.invoice_no);
+  const { name, mobile, email, address, city, state, pincode } = req.body;
+
+  if (!dealerId) {
+    return res.status(400).json({ error: "Dealer id is required." });
+  }
+  const dealer = await query("SELECT id FROM dealers WHERE id = ? LIMIT 1", [dealerId]);
+  if (!dealer.rowCount) {
+    return res.status(404).json({ error: "Dealer not found." });
+  }
+
+  const customer = await findOrCreateCustomer({ name, mobile, email, address, city, state, pincode });
+  const warranty = await activateWarrantyFromSerial({
+    customerId: customer.id,
+    serialNo,
+    purchaseDate,
+    invoiceNo,
+    actingDealerId: dealerId,
+  });
+  res.status(201).json({ customer, warranty });
 }));
 
 /** List complaints (staff panels). Customers should use `/complaints/customer/:customerId`. */
@@ -1594,24 +1801,17 @@ app.get("/serial-numbers/:serialNo/qr.svg", asyncRoute(async (req, res) => {
   res.type("image/svg+xml").send(qrSvg(payload));
 }));
 
-app.get("/tasks", asyncRoute(async (req, res) => {
-  const status = cleanString(req.query.status);
-  const where = [];
-  const params = [];
-  if (status && status !== "All") {
-    where.push("LOWER(t.status) = LOWER(?)");
-    params.push(status);
-  }
-  const sqlWhere = where.length ? `WHERE ${where.join(" AND ")}` : "";
-  const result = await query(
-    `SELECT
+const TASK_DETAIL_SELECT = `
        t.id,
        t.task_no,
+       t.complaint_id,
+       t.technician_id,
        t.work_type,
        t.due_at,
        t.status,
        t.payable_amount,
        t.created_at,
+       c.id AS complaint_db_id,
        c.complaint_no,
        c.problem_type,
        c.description,
@@ -1623,13 +1823,22 @@ app.get("/tasks", asyncRoute(async (req, res) => {
        cust.mobile AS customer_mobile,
        cust.address AS customer_address,
        cust.city AS customer_city,
+       cust.state AS customer_state,
+       cust.pincode AS customer_pincode,
        p.name AS product_name,
        p.model_no,
        s.serial_no,
        w.warranty_no,
+       w.start_date AS warranty_start,
+       w.expiry_date AS warranty_expiry,
        w.status AS warranty_status,
+       w.installation_status,
+       d.dealer_no,
+       d.name AS dealer_name,
        pay.status AS payment_status,
-       pay.amount AS payment_amount
+       pay.amount AS payment_amount`;
+
+const TASK_DETAIL_JOINS = `
      FROM tasks t
      LEFT JOIN complaints c ON c.id = t.complaint_id
      LEFT JOIN technicians tech ON tech.id = t.technician_id
@@ -1637,11 +1846,30 @@ app.get("/tasks", asyncRoute(async (req, res) => {
      LEFT JOIN customers cust ON cust.id = COALESCE(c.customer_id, w.customer_id)
      LEFT JOIN serial_numbers s ON s.id = w.serial_id
      LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN dealers d ON d.id = COALESCE(w.dealer_id, s.dealer_id)
      LEFT JOIN (
        SELECT task_id, MAX(status) AS status, SUM(amount) AS amount
        FROM payments
        GROUP BY task_id
-     ) pay ON pay.task_id = t.id
+     ) pay ON pay.task_id = t.id`;
+
+app.get("/tasks", asyncRoute(async (req, res) => {
+  const status = cleanString(req.query.status);
+  const technicianId = cleanString(req.query.technicianId || req.query.technician_id);
+  const where = [];
+  const params = [];
+  if (status && status !== "All") {
+    where.push("LOWER(t.status) = LOWER(?)");
+    params.push(status);
+  }
+  if (technicianId) {
+    where.push("t.technician_id = ?");
+    params.push(technicianId);
+  }
+  const sqlWhere = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  const result = await query(
+    `SELECT ${TASK_DETAIL_SELECT}
+     ${TASK_DETAIL_JOINS}
      ${sqlWhere}
      ORDER BY t.created_at DESC
      LIMIT 200`,
@@ -1650,22 +1878,89 @@ app.get("/tasks", asyncRoute(async (req, res) => {
   res.json({ tasks: result.rows });
 }));
 
+app.get("/tasks/:id", asyncRoute(async (req, res) => {
+  const id = cleanString(req.params.id);
+  if (!id) {
+    return res.status(400).json({ error: "Task id is required." });
+  }
+  const result = await query(
+    `SELECT ${TASK_DETAIL_SELECT}
+     ${TASK_DETAIL_JOINS}
+     WHERE t.id = ?
+     LIMIT 1`,
+    [id]
+  );
+  if (!result.rowCount) {
+    return res.status(404).json({ error: "Task not found." });
+  }
+  res.json({ task: result.rows[0] });
+}));
+
 app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
   const id = cleanString(req.params.id);
   const status = cleanString(req.body?.status);
+  const dueAt = cleanString(req.body?.dueAt || req.body?.due_at) || null;
+  const technicianId = cleanString(req.body?.technicianId || req.body?.technician_id);
   if (!id || !status) {
     return res.status(400).json({ error: "Task id and status are required." });
   }
-  const allowed = ["Assigned", "Accepted", "Rejected", "Scheduled", "Rescheduled", "Reached", "Inspection Started", "Completed"];
+  const allowed = [
+    "Assigned",
+    "Accepted",
+    "Rejected",
+    "In Progress",
+    "Scheduled",
+    "Rescheduled",
+    "Reached",
+    "Inspection Started",
+    "Completed"
+  ];
   if (!allowed.includes(status)) {
     return res.status(400).json({ error: "Invalid task status." });
   }
-  const result = await query("UPDATE tasks SET status = ? WHERE id = ?", [status, id]);
-  if (!result.affectedRows) {
+  const existing = await query("SELECT id, complaint_id, technician_id, status FROM tasks WHERE id = ? LIMIT 1", [id]);
+  if (!existing.rowCount) {
     return res.status(404).json({ error: "Task not found." });
   }
-  const task = await query("SELECT * FROM tasks WHERE id = ? LIMIT 1", [id]);
-  res.json({ task: task.rows[0] });
+  const row = existing.rows[0];
+  if (technicianId && String(row.technician_id) !== technicianId) {
+    return res.status(403).json({ error: "This task is not assigned to you." });
+  }
+  const current = String(row.status || "");
+  if (status === "Accepted" && current !== "Assigned") {
+    return res.status(400).json({ error: "Only new assignments can be accepted." });
+  }
+  if (status === "Rejected" && current !== "Assigned") {
+    return res.status(400).json({ error: "Only new assignments can be rejected." });
+  }
+
+  await withTransaction(async (tx) => {
+    if (dueAt && (status === "Rescheduled" || status === "Scheduled")) {
+      await tx("UPDATE tasks SET status = ?, due_at = ? WHERE id = ?", [status, dueAt, id]);
+    } else {
+      await tx("UPDATE tasks SET status = ? WHERE id = ?", [status, id]);
+    }
+    const complaintId = row.complaint_id;
+    if (!complaintId) return;
+    if (status === "Accepted" || status === "In Progress") {
+      await tx("UPDATE complaints SET status = 'In Progress' WHERE id = ?", [complaintId]);
+    } else if (status === "Rejected") {
+      await tx("UPDATE complaints SET status = 'Open' WHERE id = ?", [complaintId]);
+    } else if (status === "Completed") {
+      await tx("UPDATE complaints SET status = 'Closed' WHERE id = ?", [complaintId]);
+    } else if (status === "Assigned") {
+      await tx("UPDATE complaints SET status = 'Awaiting Technician' WHERE id = ?", [complaintId]);
+    }
+  });
+
+  const taskResult = await query(
+    `SELECT ${TASK_DETAIL_SELECT}
+     ${TASK_DETAIL_JOINS}
+     WHERE t.id = ?
+     LIMIT 1`,
+    [id]
+  );
+  res.json({ task: taskResult.rowCount ? taskResult.rows[0] : null });
 }));
 
 async function dealerWarrantyReportRows(req) {
@@ -1986,14 +2281,20 @@ app.get("/complaints/dealer/:dealerId", asyncRoute(async (req, res) => {
        p.model_no,
        d.dealer_no,
        d.name AS dealer_name,
-       tech.name AS technician_name
+       tech.name AS technician_name,
+       tech.mobile AS technician_mobile,
+       t.task_no,
+       t.due_at,
+       t.status AS task_status
      FROM complaints c
      INNER JOIN warranties w ON w.id = c.warranty_id
      LEFT JOIN customers cust ON cust.id = c.customer_id
      LEFT JOIN serial_numbers s ON s.id = w.serial_id
      LEFT JOIN products p ON p.id = s.product_id
      LEFT JOIN dealers d ON d.id = COALESCE(w.dealer_id, s.dealer_id)
-     LEFT JOIN tasks t ON t.complaint_id = c.id
+     LEFT JOIN tasks t ON t.id = (
+       SELECT t2.id FROM tasks t2 WHERE t2.complaint_id = c.id ORDER BY t2.created_at DESC LIMIT 1
+     )
      LEFT JOIN technicians tech ON tech.id = t.technician_id
      WHERE COALESCE(w.dealer_id, s.dealer_id) = ?
      ORDER BY c.created_at DESC`,
@@ -2023,7 +2324,7 @@ app.post("/complaints/:id/assign-technician", asyncRoute(async (req, res) => {
 
   const existingTask = await query("SELECT id FROM tasks WHERE complaint_id = ? ORDER BY created_at DESC LIMIT 1", [complaintId]);
   await withTransaction(async (tx) => {
-    await tx("UPDATE complaints SET status = 'In Progress' WHERE id = ?", [complaintId]);
+    await tx("UPDATE complaints SET status = 'Awaiting Technician' WHERE id = ?", [complaintId]);
     if (existingTask.rowCount) {
       await tx(
         "UPDATE tasks SET technician_id = ?, work_type = ?, due_at = ?, status = 'Assigned', payable_amount = ? WHERE id = ?",
@@ -2037,17 +2338,19 @@ app.post("/complaints/:id/assign-technician", asyncRoute(async (req, res) => {
     }
   });
 
-  const result = await query(
-    `SELECT c.*, t.task_no, t.status AS task_status, tech.name AS technician_name
-     FROM complaints c
-     LEFT JOIN tasks t ON t.complaint_id = c.id
-     LEFT JOIN technicians tech ON tech.id = t.technician_id
-     WHERE c.id = ?
+  const taskResult = await query(
+    `SELECT ${TASK_DETAIL_SELECT}
+     ${TASK_DETAIL_JOINS}
+     WHERE t.complaint_id = ?
      ORDER BY t.created_at DESC
      LIMIT 1`,
     [complaintId]
   );
-  res.json({ complaint: result.rows[0] });
+  const complaintRow = await query("SELECT * FROM complaints WHERE id = ? LIMIT 1", [complaintId]);
+  res.json({
+    complaint: complaintRow.rows[0],
+    task: taskResult.rowCount ? taskResult.rows[0] : null,
+  });
 }));
 
 app.post("/complaints", asyncRoute(async (req, res) => {
@@ -2075,6 +2378,10 @@ app.use((error, _req, res, _next) => {
   }
   if (code === "ER_DUP_ENTRY") {
     return res.status(409).json({ error: "This record already exists." });
+  }
+  const status = Number(error?.statusCode);
+  if (status >= 400 && status < 600) {
+    return res.status(status).json({ error: error?.message || "Request failed" });
   }
   res.status(500).json({ error: error?.message || "Internal server error" });
 });
