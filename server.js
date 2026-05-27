@@ -286,7 +286,11 @@ app.post("/auth/login", asyncRoute(async (req, res) => {
     if (tr.rowCount) technician = tr.rows[0];
   }
   if (role === "Dealer") {
-    const dr = await query("SELECT * FROM dealers WHERE mobile = ? LIMIT 1", [userRow.mobile]);
+    const dealerMobile = normalizeMobileValue(userRow.mobile);
+    const dr = await query(
+      "SELECT * FROM dealers WHERE mobile = ? OR REPLACE(REPLACE(REPLACE(REPLACE(mobile, ' ', ''), '-', ''), '+', ''), '(', '') = ? LIMIT 1",
+      [userRow.mobile, dealerMobile]
+    );
     if (dr.rowCount) dealer = dr.rows[0];
   }
 
@@ -1257,7 +1261,31 @@ app.post("/warranties/activate-from-qr", asyncRoute(async (req, res) => {
 /** List complaints (staff panels). Customers should use `/complaints/customer/:customerId`. */
 app.get("/complaints", asyncRoute(async (_req, res) => {
   const result = await query(
-    "SELECT * FROM complaints ORDER BY created_at DESC LIMIT 800"
+    `SELECT
+       c.*,
+       w.warranty_no,
+       w.start_date,
+       w.expiry_date,
+       w.status AS warranty_status,
+       w.installation_status,
+       cust.name AS customer_name,
+       cust.mobile AS customer_mobile,
+       s.serial_no,
+       p.name AS product_name,
+       p.model_no,
+       d.dealer_no,
+       d.name AS dealer_name,
+       tech.name AS technician_name
+     FROM complaints c
+     LEFT JOIN warranties w ON w.id = c.warranty_id
+     LEFT JOIN customers cust ON cust.id = c.customer_id
+     LEFT JOIN serial_numbers s ON s.id = w.serial_id
+     LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN dealers d ON d.id = COALESCE(w.dealer_id, s.dealer_id)
+     LEFT JOIN tasks t ON t.complaint_id = c.id
+     LEFT JOIN technicians tech ON tech.id = t.technician_id
+     ORDER BY c.created_at DESC
+     LIMIT 800`
   );
   res.json({ complaints: result.rows });
 }));
