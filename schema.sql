@@ -91,10 +91,18 @@ CREATE TABLE IF NOT EXISTS serial_numbers (
   product_id CHAR(36),
   dealer_id CHAR(36),
   serial_no VARCHAR(120) NOT NULL UNIQUE,
+  invoice_no VARCHAR(120),
+  challan_no VARCHAR(120),
+  batch_no VARCHAR(120),
+  dispatch_date DATE,
   qr_status VARCHAR(40) NOT NULL DEFAULT 'Not Printed',
+  qr_payload VARCHAR(255),
+  qr_printed_at TIMESTAMP NULL,
   dispatch_status VARCHAR(40) NOT NULL DEFAULT 'Pending',
+  dispatched_at TIMESTAMP NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   INDEX idx_serial_numbers_serial_no (serial_no),
+  INDEX idx_serial_numbers_batch_no (batch_no),
   CONSTRAINT fk_serials_product FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
   CONSTRAINT fk_serials_dealer FOREIGN KEY (dealer_id) REFERENCES dealers(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

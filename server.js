@@ -41,6 +41,54 @@ function cleanString(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function cleanSerialNo(value) {
+  return cleanString(value).replace(/\s+/g, "").toUpperCase();
+}
+
+function cleanDate(value) {
+  const raw = cleanString(value);
+  if (!raw) return null;
+  const iso = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (iso) return raw;
+  const indian = raw.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/);
+  if (indian) {
+    const [, dd, mm, yyyy] = indian;
+    return `${yyyy}-${String(mm).padStart(2, "0")}-${String(dd).padStart(2, "0")}`;
+  }
+  return null;
+}
+
+function serialQrPayload(serialNo) {
+  return `hitaishi://serial?serial=${encodeURIComponent(serialNo)}`;
+}
+
+async function ensureSerialNumbersSchema() {
+  const columns = [
+    ["invoice_no", "ALTER TABLE serial_numbers ADD COLUMN invoice_no VARCHAR(120) NULL AFTER serial_no"],
+    ["challan_no", "ALTER TABLE serial_numbers ADD COLUMN challan_no VARCHAR(120) NULL AFTER invoice_no"],
+    ["batch_no", "ALTER TABLE serial_numbers ADD COLUMN batch_no VARCHAR(120) NULL AFTER challan_no"],
+    ["dispatch_date", "ALTER TABLE serial_numbers ADD COLUMN dispatch_date DATE NULL AFTER batch_no"],
+    ["qr_payload", "ALTER TABLE serial_numbers ADD COLUMN qr_payload VARCHAR(255) NULL AFTER qr_status"],
+    ["qr_printed_at", "ALTER TABLE serial_numbers ADD COLUMN qr_printed_at TIMESTAMP NULL AFTER qr_payload"],
+    ["dispatched_at", "ALTER TABLE serial_numbers ADD COLUMN dispatched_at TIMESTAMP NULL AFTER dispatch_status"]
+  ];
+
+  for (const [columnName, ddl] of columns) {
+    const found = await query(
+      `SELECT COLUMN_NAME
+       FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE()
+         AND TABLE_NAME = 'serial_numbers'
+         AND COLUMN_NAME = ?
+       LIMIT 1`,
+      [columnName]
+    );
+    if (!found.rowCount) {
+      await query(ddl);
+    }
+  }
+}
+
 async function getNextDealerNo(runQuery = query) {
   const result = await runQuery(
     `SELECT dealer_no
@@ -659,6 +707,48 @@ app.post("/dealers", asyncRoute(async (req, res) => {
   res.status(201).json({ dealer: result.rows[0] });
 }));
 
+app.patch("/dealers/:id", asyncRoute(async (req, res) => {
+  const id = cleanString(req.params.id);
+  const dealerNo = cleanString(req.body.dealerNo || req.body.dealer_no);
+  const name = cleanString(req.body.name);
+  const contactPerson = cleanString(req.body.contactPerson || req.body.contact_person) || null;
+  const mobile = normalizeMobileValue(req.body.mobile);
+  const address = cleanString(req.body.address) || null;
+  const city = cleanString(req.body.city) || null;
+  const state = cleanString(req.body.state) || null;
+  const status = cleanString(req.body.status) || "Active";
+
+  if (!id || !dealerNo || !name || !mobile) {
+    return res.status(400).json({ error: "Dealer id, dealer number, name, and mobile are required." });
+  }
+
+  const duplicate = await query("SELECT id FROM dealers WHERE LOWER(TRIM(dealer_no)) = LOWER(?) AND id <> ? LIMIT 1", [dealerNo, id]);
+  if (duplicate.rowCount) {
+    return res.status(409).json({ error: "This dealer number already exists." });
+  }
+
+  const result = await query(
+    `UPDATE dealers
+     SET dealer_no = ?, name = ?, contact_person = ?, mobile = ?, address = ?, city = ?, state = ?, status = ?
+     WHERE id = ?`,
+    [dealerNo, name, contactPerson, mobile, address, city, state, status, id]
+  );
+  if (!result.affectedRows) {
+    return res.status(404).json({ error: "Dealer not found." });
+  }
+  const row = await query("SELECT * FROM dealers WHERE id = ? LIMIT 1", [id]);
+  res.json({ dealer: row.rows[0] });
+}));
+
+app.delete("/dealers/:id", asyncRoute(async (req, res) => {
+  const id = cleanString(req.params.id);
+  const result = await query("DELETE FROM dealers WHERE id = ?", [id]);
+  if (!result.affectedRows) {
+    return res.status(404).json({ error: "Dealer not found." });
+  }
+  res.json({ ok: true });
+}));
+
 app.get("/products", asyncRoute(async (_req, res) => {
   const result = await query("SELECT * FROM products ORDER BY created_at DESC LIMIT 800");
   res.json({ products: result.rows });
@@ -687,6 +777,46 @@ app.post("/products", asyncRoute(async (req, res) => {
   res.status(201).json({ product: result.rows[0] });
 }));
 
+app.patch("/products/:id", asyncRoute(async (req, res) => {
+  const id = cleanString(req.params.id);
+  const name = cleanString(req.body.name);
+  const modelNo = cleanString(req.body.modelNo || req.body.model_no);
+  const category = cleanString(req.body.category) || null;
+  const warrantyMonths = Number(req.body.warrantyMonths || req.body.warranty_months || 12);
+
+  if (!id || !name || !modelNo) {
+    return res.status(400).json({ error: "Product id, name, and model number are required." });
+  }
+
+  const duplicate = await query("SELECT id FROM products WHERE LOWER(TRIM(model_no)) = LOWER(?) AND id <> ? LIMIT 1", [modelNo, id]);
+  if (duplicate.rowCount) {
+    return res.status(409).json({ error: "This product model already exists." });
+  }
+
+  const result = await query(
+    "UPDATE products SET name = ?, model_no = ?, category = ?, warranty_months = ? WHERE id = ?",
+    [name, modelNo, category, Number.isFinite(warrantyMonths) && warrantyMonths > 0 ? warrantyMonths : 12, id]
+  );
+  if (!result.affectedRows) {
+    return res.status(404).json({ error: "Product not found." });
+  }
+  const row = await query("SELECT * FROM products WHERE id = ? LIMIT 1", [id]);
+  res.json({ product: row.rows[0] });
+}));
+
+app.delete("/products/:id", asyncRoute(async (req, res) => {
+  const id = cleanString(req.params.id);
+  const linked = await query("SELECT id FROM serial_numbers WHERE product_id = ? LIMIT 1", [id]);
+  if (linked.rowCount) {
+    return res.status(409).json({ error: "Product is linked with serial numbers. Edit it instead of deleting." });
+  }
+  const result = await query("DELETE FROM products WHERE id = ?", [id]);
+  if (!result.affectedRows) {
+    return res.status(404).json({ error: "Product not found." });
+  }
+  res.json({ ok: true });
+}));
+
 app.get("/service-areas", asyncRoute(async (_req, res) => {
   const result = await query("SELECT * FROM service_areas ORDER BY created_at DESC LIMIT 800");
   res.json({ areas: result.rows });
@@ -712,6 +842,38 @@ app.post("/service-areas", asyncRoute(async (req, res) => {
     [city, area]
   );
   res.status(201).json({ area: result.rows[0] });
+}));
+
+app.patch("/service-areas/:id", asyncRoute(async (req, res) => {
+  const id = cleanString(req.params.id);
+  const state = cleanString(req.body.state) || null;
+  const city = cleanString(req.body.city);
+  const area = cleanString(req.body.area);
+  const pincode = cleanString(req.body.pincode) || null;
+  const status = cleanString(req.body.status) || "Active";
+
+  if (!id || !city || !area) {
+    return res.status(400).json({ error: "Area id, city, and area are required." });
+  }
+
+  const result = await query(
+    "UPDATE service_areas SET state = ?, city = ?, area = ?, pincode = ?, status = ? WHERE id = ?",
+    [state, city, area, pincode, status, id]
+  );
+  if (!result.affectedRows) {
+    return res.status(404).json({ error: "Service area not found." });
+  }
+  const row = await query("SELECT * FROM service_areas WHERE id = ? LIMIT 1", [id]);
+  res.json({ area: row.rows[0] });
+}));
+
+app.delete("/service-areas/:id", asyncRoute(async (req, res) => {
+  const id = cleanString(req.params.id);
+  const result = await query("DELETE FROM service_areas WHERE id = ?", [id]);
+  if (!result.affectedRows) {
+    return res.status(404).json({ error: "Service area not found." });
+  }
+  res.json({ ok: true });
 }));
 
 app.get("/work-type-costs", asyncRoute(async (_req, res) => {
@@ -758,6 +920,53 @@ app.post("/work-type-costs", asyncRoute(async (req, res) => {
   res.status(201).json({ cost: result.rows[0] });
 }));
 
+app.patch("/work-type-costs/:id", asyncRoute(async (req, res) => {
+  const id = cleanString(req.params.id);
+  const workType = cleanString(req.body.workType || req.body.work_type);
+  const productCategory = cleanString(req.body.productCategory || req.body.product_category) || null;
+  const modelNo = cleanString(req.body.modelNo || req.body.model_no) || null;
+  const city = cleanString(req.body.city) || null;
+  const payableAmount = Number(req.body.payableAmount || req.body.payable_amount || 0);
+  const defaultTimeframeHours = Number(req.body.defaultTimeframeHours || req.body.default_timeframe_hours || 24);
+  const effectiveDate = cleanString(req.body.effectiveDate || req.body.effective_date) || null;
+  const status = cleanString(req.body.status) || "Active";
+
+  if (!id || !workType) {
+    return res.status(400).json({ error: "Cost rule id and work type are required." });
+  }
+
+  const result = await query(
+    `UPDATE work_type_costs
+     SET work_type = ?, product_category = ?, model_no = ?, city = ?, payable_amount = ?, default_timeframe_hours = ?, effective_date = ?, status = ?
+     WHERE id = ?`,
+    [
+      workType,
+      productCategory,
+      modelNo,
+      city,
+      Number.isFinite(payableAmount) ? payableAmount : 0,
+      Number.isFinite(defaultTimeframeHours) && defaultTimeframeHours > 0 ? defaultTimeframeHours : 24,
+      effectiveDate,
+      status,
+      id
+    ]
+  );
+  if (!result.affectedRows) {
+    return res.status(404).json({ error: "Cost rule not found." });
+  }
+  const row = await query("SELECT * FROM work_type_costs WHERE id = ? LIMIT 1", [id]);
+  res.json({ cost: row.rows[0] });
+}));
+
+app.delete("/work-type-costs/:id", asyncRoute(async (req, res) => {
+  const id = cleanString(req.params.id);
+  const result = await query("DELETE FROM work_type_costs WHERE id = ?", [id]);
+  if (!result.affectedRows) {
+    return res.status(404).json({ error: "Cost rule not found." });
+  }
+  res.json({ ok: true });
+}));
+
 app.get("/warranties/customer/:customerId", asyncRoute(async (req, res) => {
   const result = await query(
     "SELECT * FROM warranties WHERE customer_id = ? ORDER BY created_at DESC",
@@ -777,9 +986,22 @@ app.get("/complaints", asyncRoute(async (_req, res) => {
 /** Serial inventory for dispatch/dealer tooling */
 app.get("/serial-numbers", asyncRoute(async (_req, res) => {
   const result = await query(
-    `SELECT s.*, p.name AS product_name, p.model_no
+    `SELECT
+       s.*,
+       p.name AS product_name,
+       p.model_no,
+       d.dealer_no,
+       d.name AS dealer_name,
+       COALESCE((
+         SELECT w.status
+         FROM warranties w
+         WHERE w.serial_id = s.id
+         ORDER BY w.created_at DESC
+         LIMIT 1
+       ), 'Pending') AS warranty_status
      FROM serial_numbers s
      LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN dealers d ON d.id = s.dealer_id
      ORDER BY s.created_at DESC
      LIMIT 800`
   );
@@ -790,10 +1012,17 @@ app.post("/serial-numbers", asyncRoute(async (req, res) => {
   const productId = cleanString(req.body.productId || req.body.product_id);
   const modelNo = cleanString(req.body.modelNo || req.body.model_no);
   const dealerNo = cleanString(req.body.dealerNo || req.body.dealer_no);
-  const serialNo = cleanString(req.body.serialNo || req.body.serial_no);
+  const serialNo = cleanSerialNo(req.body.serialNo || req.body.serial_no);
+  const invoiceNo = cleanString(req.body.invoiceNo || req.body.invoice_no);
+  const challanNo = cleanString(req.body.challanNo || req.body.challan_no);
+  const batchNo = cleanString(req.body.batchNo || req.body.batch_no);
+  const dispatchDate = cleanDate(req.body.dispatchDate || req.body.dispatch_date);
 
   if (!serialNo) {
     return res.status(400).json({ error: "Serial number is required." });
+  }
+  if (serialNo.length > 120) {
+    return res.status(400).json({ error: "Serial number must be 120 characters or less." });
   }
 
   let product = null;
@@ -803,6 +1032,14 @@ app.post("/serial-numbers", asyncRoute(async (req, res) => {
   } else if (modelNo) {
     const result = await query("SELECT id FROM products WHERE LOWER(TRIM(model_no)) = LOWER(?) LIMIT 1", [modelNo]);
     product = result.rows[0] || null;
+    if (!product) {
+      await query(
+        "INSERT INTO products (name, model_no, category, warranty_months) VALUES (?, ?, ?, ?)",
+        [`Product ${modelNo}`, modelNo, "General", 12]
+      );
+      const created = await query("SELECT id FROM products WHERE LOWER(TRIM(model_no)) = LOWER(?) LIMIT 1", [modelNo]);
+      product = created.rows[0] || null;
+    }
   }
 
   let dealer = null;
@@ -814,14 +1051,46 @@ app.post("/serial-numbers", asyncRoute(async (req, res) => {
     }
   }
 
+  const duplicate = await query("SELECT id FROM serial_numbers WHERE LOWER(TRIM(serial_no)) = LOWER(?) LIMIT 1", [serialNo]);
+  if (duplicate.rowCount) {
+    return res.status(409).json({ error: "This serial number is already saved." });
+  }
+
+  const qrPayload = serialQrPayload(serialNo);
   await query(
-    "INSERT INTO serial_numbers (product_id, dealer_id, serial_no, qr_status, dispatch_status) VALUES (?, ?, ?, 'Printed', ?)",
-    [product?.id || null, dealer?.id || null, serialNo, dealer ? "Dispatched" : "Pending"]
+    `INSERT INTO serial_numbers
+       (product_id, dealer_id, serial_no, invoice_no, challan_no, batch_no, dispatch_date, qr_status, qr_payload, qr_printed_at, dispatch_status, dispatched_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'Printed', ?, NOW(), ?, ?)`,
+    [
+      product?.id || null,
+      dealer?.id || null,
+      serialNo,
+      invoiceNo || null,
+      challanNo || null,
+      batchNo || null,
+      dispatchDate,
+      qrPayload,
+      dealer ? "Dispatched" : "Pending",
+      dealer ? new Date() : null
+    ]
   );
   const result = await query(
-    `SELECT s.*, p.name AS product_name, p.model_no
+    `SELECT
+       s.*,
+       p.name AS product_name,
+       p.model_no,
+       d.dealer_no,
+       d.name AS dealer_name,
+       COALESCE((
+         SELECT w.status
+         FROM warranties w
+         WHERE w.serial_id = s.id
+         ORDER BY w.created_at DESC
+         LIMIT 1
+       ), 'Pending') AS warranty_status
      FROM serial_numbers s
      LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN dealers d ON d.id = s.dealer_id
      WHERE s.serial_no = ?
      LIMIT 1`,
     [serialNo]
@@ -831,17 +1100,25 @@ app.post("/serial-numbers", asyncRoute(async (req, res) => {
 
 app.post("/serial-numbers/generate-qr", asyncRoute(async (req, res) => {
   const serialNumbers = Array.isArray(req.body?.serialNumbers)
-    ? req.body.serialNumbers.map(cleanString).filter(Boolean)
+    ? req.body.serialNumbers.map(cleanSerialNo).filter(Boolean)
     : [];
 
   const result = serialNumbers.length
     ? await query(
         `UPDATE serial_numbers
-         SET qr_status = 'Printed'
+         SET qr_status = 'Printed',
+             qr_payload = COALESCE(qr_payload, CONCAT('hitaishi://serial?serial=', serial_no)),
+             qr_printed_at = COALESCE(qr_printed_at, NOW())
          WHERE serial_no IN (${serialNumbers.map(() => "?").join(",")})`,
         serialNumbers
       )
-    : await query("UPDATE serial_numbers SET qr_status = 'Printed' WHERE qr_status = 'Not Printed'");
+    : await query(
+        `UPDATE serial_numbers
+         SET qr_status = 'Printed',
+             qr_payload = COALESCE(qr_payload, CONCAT('hitaishi://serial?serial=', serial_no)),
+             qr_printed_at = COALESCE(qr_printed_at, NOW())
+         WHERE qr_status = 'Not Printed'`
+      );
 
   res.json({
     ok: true,
@@ -890,12 +1167,104 @@ app.get("/serial-numbers/:serialNo", asyncRoute(async (req, res) => {
   res.json({ serial: result.rows[0] });
 }));
 
+app.patch("/serial-numbers/:serialNo", asyncRoute(async (req, res) => {
+  const currentSerialNo = cleanSerialNo(req.params.serialNo);
+  const nextSerialNo = cleanSerialNo(req.body.serialNo || req.body.serial_no || currentSerialNo);
+  const modelNo = cleanString(req.body.modelNo || req.body.model_no);
+  const dealerNo = cleanString(req.body.dealerNo || req.body.dealer_no);
+  const invoiceNo = cleanString(req.body.invoiceNo || req.body.invoice_no) || null;
+  const challanNo = cleanString(req.body.challanNo || req.body.challan_no) || null;
+  const batchNo = cleanString(req.body.batchNo || req.body.batch_no) || null;
+  const dispatchDate = cleanDate(req.body.dispatchDate || req.body.dispatch_date);
+
+  if (!currentSerialNo || !nextSerialNo) {
+    return res.status(400).json({ error: "Serial number is required." });
+  }
+
+  const existing = await query("SELECT id FROM serial_numbers WHERE serial_no = ? LIMIT 1", [currentSerialNo]);
+  if (!existing.rowCount) {
+    return res.status(404).json({ error: "Serial number not found." });
+  }
+
+  if (nextSerialNo !== currentSerialNo) {
+    const duplicate = await query("SELECT id FROM serial_numbers WHERE LOWER(TRIM(serial_no)) = LOWER(?) AND serial_no <> ? LIMIT 1", [nextSerialNo, currentSerialNo]);
+    if (duplicate.rowCount) {
+      return res.status(409).json({ error: "This serial number is already saved." });
+    }
+  }
+
+  let product = null;
+  if (modelNo) {
+    const productResult = await query("SELECT id FROM products WHERE LOWER(TRIM(model_no)) = LOWER(?) LIMIT 1", [modelNo]);
+    product = productResult.rows[0] || null;
+    if (!product) {
+      await query("INSERT INTO products (name, model_no, category, warranty_months) VALUES (?, ?, ?, ?)", [`Product ${modelNo}`, modelNo, "General", 12]);
+      const created = await query("SELECT id FROM products WHERE LOWER(TRIM(model_no)) = LOWER(?) LIMIT 1", [modelNo]);
+      product = created.rows[0] || null;
+    }
+  }
+
+  let dealer = null;
+  if (dealerNo) {
+    const dealerResult = await query("SELECT id FROM dealers WHERE LOWER(TRIM(dealer_no)) = LOWER(?) AND status = 'Active' LIMIT 1", [dealerNo]);
+    dealer = dealerResult.rows[0] || null;
+    if (!dealer) {
+      return res.status(400).json({ error: "Active dealer not found for this dealer number." });
+    }
+  }
+
+  await query(
+    `UPDATE serial_numbers
+     SET serial_no = ?,
+         product_id = COALESCE(?, product_id),
+         dealer_id = ?,
+         invoice_no = ?,
+         challan_no = ?,
+         batch_no = ?,
+         dispatch_date = ?,
+         qr_payload = ?
+     WHERE serial_no = ?`,
+    [nextSerialNo, product?.id || null, dealer?.id || null, invoiceNo, challanNo, batchNo, dispatchDate, serialQrPayload(nextSerialNo), currentSerialNo]
+  );
+
+  const row = await query("SELECT * FROM serial_numbers WHERE serial_no = ? LIMIT 1", [nextSerialNo]);
+  res.json({ serial: row.rows[0] });
+}));
+
 app.patch("/serial-numbers/:serialNo/qr", asyncRoute(async (req, res) => {
-  const serialNo = cleanString(req.params.serialNo);
+  const serialNo = cleanSerialNo(req.params.serialNo);
   if (!serialNo) {
     return res.status(400).json({ error: "Serial number is required." });
   }
-  const result = await query("UPDATE serial_numbers SET qr_status = 'Printed' WHERE serial_no = ?", [serialNo]);
+  const result = await query(
+    `UPDATE serial_numbers
+     SET qr_status = 'Printed',
+         qr_payload = COALESCE(qr_payload, ?),
+         qr_printed_at = COALESCE(qr_printed_at, NOW())
+     WHERE serial_no = ?`,
+    [serialQrPayload(serialNo), serialNo]
+  );
+  if (!result.affectedRows) {
+    return res.status(404).json({ error: "Serial number not found." });
+  }
+  res.json({ ok: true });
+}));
+
+app.delete("/serial-numbers/:serialNo", asyncRoute(async (req, res) => {
+  const serialNo = cleanSerialNo(req.params.serialNo);
+  if (!serialNo) {
+    return res.status(400).json({ error: "Serial number is required." });
+  }
+  const linkedWarranty = await query(
+    `SELECT id FROM warranties
+     WHERE serial_id = (SELECT id FROM serial_numbers WHERE serial_no = ? LIMIT 1)
+     LIMIT 1`,
+    [serialNo]
+  );
+  if (linkedWarranty.rowCount) {
+    return res.status(409).json({ error: "Serial is linked with warranty. Edit it instead of deleting." });
+  }
+  const result = await query("DELETE FROM serial_numbers WHERE serial_no = ?", [serialNo]);
   if (!result.affectedRows) {
     return res.status(404).json({ error: "Serial number not found." });
   }
@@ -905,10 +1274,13 @@ app.patch("/serial-numbers/:serialNo/qr", asyncRoute(async (req, res) => {
 app.post("/dispatch-mapping", asyncRoute(async (req, res) => {
   const dealerNo = cleanString(req.body.dealerNo || req.body.dealer_no);
   const serialNumbers = Array.isArray(req.body.serialNumbers)
-    ? req.body.serialNumbers.map(cleanString).filter(Boolean)
-    : cleanString(req.body.serialNo || req.body.serial_no)
-      ? [cleanString(req.body.serialNo || req.body.serial_no)]
+    ? req.body.serialNumbers.map(cleanSerialNo).filter(Boolean)
+    : cleanSerialNo(req.body.serialNo || req.body.serial_no)
+      ? [cleanSerialNo(req.body.serialNo || req.body.serial_no)]
       : [];
+  const invoiceNo = cleanString(req.body.invoiceNo || req.body.invoice_no);
+  const challanNo = cleanString(req.body.challanNo || req.body.challan_no);
+  const dispatchDate = cleanDate(req.body.dispatchDate || req.body.dispatch_date);
 
   if (!dealerNo || !serialNumbers.length) {
     return res.status(400).json({ error: "Dealer number and at least one serial number are required." });
@@ -922,9 +1294,14 @@ app.post("/dispatch-mapping", asyncRoute(async (req, res) => {
   const placeholders = serialNumbers.map(() => "?").join(",");
   const result = await query(
     `UPDATE serial_numbers
-     SET dealer_id = ?, dispatch_status = 'Dispatched'
+     SET dealer_id = ?,
+         dispatch_status = 'Dispatched',
+         dispatched_at = COALESCE(dispatched_at, NOW()),
+         invoice_no = COALESCE(NULLIF(?, ''), invoice_no),
+         challan_no = COALESCE(NULLIF(?, ''), challan_no),
+         dispatch_date = COALESCE(?, dispatch_date)
      WHERE serial_no IN (${placeholders})`,
-    [dealer.rows[0].id, ...serialNumbers]
+    [dealer.rows[0].id, invoiceNo, challanNo, dispatchDate, ...serialNumbers]
   );
 
   res.json({ ok: true, mapped: result.affectedRows });
@@ -961,8 +1338,17 @@ app.use((error, _req, res, _next) => {
       code
     });
   }
+  if (code === "ER_DUP_ENTRY") {
+    return res.status(409).json({ error: "This record already exists." });
+  }
   res.status(500).json({ error: error?.message || "Internal server error" });
 });
+
+try {
+  await ensureSerialNumbersSchema();
+} catch (error) {
+  console.warn("Serial number schema check skipped:", error?.message || error);
+}
 
 app.listen(port, "0.0.0.0", () => {
   console.log(`Hitaishi CRM API listening on http://0.0.0.0:${port} (reachable from phone via your PC LAN IP)`);
