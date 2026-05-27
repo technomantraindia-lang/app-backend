@@ -91,6 +91,39 @@ function cleanString(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+/** Keep complaints.status aligned with the latest technician task action. */
+function complaintStatusForTaskStatus(taskStatus) {
+  const s = cleanString(taskStatus);
+  if (!s) return null;
+  if (s === "Completed") return "Closed";
+  if (s === "Rejected") return "Open";
+  if (s === "Assigned") return "Awaiting Technician";
+  if (
+    s === "Accepted" ||
+    s === "In Progress" ||
+    s === "Scheduled" ||
+    s === "Rescheduled" ||
+    s === "Reached" ||
+    s === "Inspection Started"
+  ) {
+    return "In Progress";
+  }
+  return null;
+}
+
+const COMPLAINT_LATEST_TASK_JOIN = `
+  LEFT JOIN tasks t ON t.id = (
+    SELECT t2.id FROM tasks t2 WHERE t2.complaint_id = c.id ORDER BY t2.created_at DESC LIMIT 1
+  )
+  LEFT JOIN technicians tech ON tech.id = t.technician_id`;
+
+const COMPLAINT_LATEST_TASK_FIELDS = `
+       tech.name AS technician_name,
+       tech.mobile AS technician_mobile,
+       t.task_no,
+       t.due_at,
+       t.status AS task_status`;
+
 function cleanSerialNo(value) {
   return cleanString(value).replace(/\s+/g, "").toUpperCase();
 }
@@ -915,14 +948,13 @@ app.get("/dealers/:id/dashboard", asyncRoute(async (req, res) => {
        s.serial_no,
        p.name AS product_name,
        p.model_no,
-       tech.name AS technician_name
+       ${COMPLAINT_LATEST_TASK_FIELDS}
      FROM complaints c
      INNER JOIN warranties w ON w.id = c.warranty_id
      LEFT JOIN customers cust ON cust.id = c.customer_id
      LEFT JOIN serial_numbers s ON s.id = w.serial_id
      LEFT JOIN products p ON p.id = s.product_id
-     LEFT JOIN tasks t ON t.complaint_id = c.id
-     LEFT JOIN technicians tech ON tech.id = t.technician_id
+     ${COMPLAINT_LATEST_TASK_JOIN}
      WHERE COALESCE(w.dealer_id, s.dealer_id) = ?
      ORDER BY c.created_at DESC
      LIMIT 3`,
@@ -1942,14 +1974,9 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
     }
     const complaintId = row.complaint_id;
     if (!complaintId) return;
-    if (status === "Accepted" || status === "In Progress") {
-      await tx("UPDATE complaints SET status = 'In Progress' WHERE id = ?", [complaintId]);
-    } else if (status === "Rejected") {
-      await tx("UPDATE complaints SET status = 'Open' WHERE id = ?", [complaintId]);
-    } else if (status === "Completed") {
-      await tx("UPDATE complaints SET status = 'Closed' WHERE id = ?", [complaintId]);
-    } else if (status === "Assigned") {
-      await tx("UPDATE complaints SET status = 'Awaiting Technician' WHERE id = ?", [complaintId]);
+    const nextComplaintStatus = complaintStatusForTaskStatus(status);
+    if (nextComplaintStatus) {
+      await tx("UPDATE complaints SET status = ? WHERE id = ?", [nextComplaintStatus, complaintId]);
     }
   });
 
@@ -2251,12 +2278,14 @@ app.get("/complaints/customer/:customerId", asyncRoute(async (req, res) => {
        p.name AS product_name,
        p.model_no,
        d.dealer_no,
-       d.name AS dealer_name
+       d.name AS dealer_name,
+       ${COMPLAINT_LATEST_TASK_FIELDS}
      FROM complaints c
      LEFT JOIN warranties w ON w.id = c.warranty_id
      LEFT JOIN serial_numbers s ON s.id = w.serial_id
      LEFT JOIN products p ON p.id = s.product_id
      LEFT JOIN dealers d ON d.id = COALESCE(w.dealer_id, s.dealer_id)
+     ${COMPLAINT_LATEST_TASK_JOIN}
      WHERE c.customer_id = ?
      ORDER BY c.created_at DESC`,
     [req.params.customerId]
@@ -2281,21 +2310,14 @@ app.get("/complaints/dealer/:dealerId", asyncRoute(async (req, res) => {
        p.model_no,
        d.dealer_no,
        d.name AS dealer_name,
-       tech.name AS technician_name,
-       tech.mobile AS technician_mobile,
-       t.task_no,
-       t.due_at,
-       t.status AS task_status
+       ${COMPLAINT_LATEST_TASK_FIELDS}
      FROM complaints c
      INNER JOIN warranties w ON w.id = c.warranty_id
      LEFT JOIN customers cust ON cust.id = c.customer_id
      LEFT JOIN serial_numbers s ON s.id = w.serial_id
      LEFT JOIN products p ON p.id = s.product_id
      LEFT JOIN dealers d ON d.id = COALESCE(w.dealer_id, s.dealer_id)
-     LEFT JOIN tasks t ON t.id = (
-       SELECT t2.id FROM tasks t2 WHERE t2.complaint_id = c.id ORDER BY t2.created_at DESC LIMIT 1
-     )
-     LEFT JOIN technicians tech ON tech.id = t.technician_id
+     ${COMPLAINT_LATEST_TASK_JOIN}
      WHERE COALESCE(w.dealer_id, s.dealer_id) = ?
      ORDER BY c.created_at DESC`,
     [dealerId]
