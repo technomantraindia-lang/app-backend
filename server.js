@@ -321,6 +321,25 @@ async function resolveComplaintId(identifier, runQuery = query) {
   return result.rowCount ? result.rows[0].id : null;
 }
 
+async function isComplaintSolvedInDb(complaintId, runQuery = query) {
+  const result = await runQuery(
+    `SELECT c.status AS complaint_status, t.status AS task_status
+     FROM complaints c
+     LEFT JOIN tasks t ON t.id = (
+       SELECT t2.id FROM tasks t2 WHERE t2.complaint_id = c.id ORDER BY t2.created_at DESC LIMIT 1
+     )
+     WHERE c.id = ?
+     LIMIT 1`,
+    [complaintId]
+  );
+  if (!result.rowCount) {
+    return false;
+  }
+  const taskStatus = String(result.rows[0].task_status || "").toLowerCase();
+  const complaintStatus = String(result.rows[0].complaint_status || "").toLowerCase();
+  return taskStatus === "completed" || complaintStatus.includes("closed") || complaintStatus.includes("completed");
+}
+
 async function getNextDealerNo(runQuery = query) {
   const result = await runQuery(
     `SELECT dealer_no
@@ -2485,6 +2504,9 @@ async function handleComplaintUpdate(req, res) {
   if (!complaintId) {
     return res.status(404).json({ error: "Complaint not found." });
   }
+  if (requesterRole === "Front Desk" && (await isComplaintSolvedInDb(complaintId))) {
+    return res.status(403).json({ error: "Solved complaints cannot be edited by Front Desk." });
+  }
 
   const result = await query(
     `UPDATE complaints
@@ -2530,6 +2552,9 @@ async function handleComplaintDelete(req, res) {
   const complaintId = await resolveComplaintId(complaintKey);
   if (!complaintId) {
     return res.status(404).json({ error: "Complaint not found." });
+  }
+  if (requesterRole === "Front Desk" && (await isComplaintSolvedInDb(complaintId))) {
+    return res.status(403).json({ error: "Solved complaints cannot be deleted by Front Desk." });
   }
 
   await withTransaction(async (tx) => {
