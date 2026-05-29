@@ -309,6 +309,18 @@ async function ensureComplaintsSchema() {
   }
 }
 
+async function resolveComplaintId(identifier, runQuery = query) {
+  const key = cleanString(identifier);
+  if (!key) {
+    return null;
+  }
+  const result = await runQuery(
+    "SELECT id FROM complaints WHERE id = ? OR complaint_no = ? LIMIT 1",
+    [key, key]
+  );
+  return result.rowCount ? result.rows[0].id : null;
+}
+
 async function getNextDealerNo(runQuery = query) {
   const result = await runQuery(
     `SELECT dealer_no
@@ -1614,15 +1626,14 @@ app.get("/complaints", asyncRoute(async (_req, res) => {
        COALESCE(c.model_no, p.model_no) AS model_no,
        d.dealer_no,
        d.name AS dealer_name,
-       tech.name AS technician_name
+       ${COMPLAINT_LATEST_TASK_FIELDS}
      FROM complaints c
      LEFT JOIN warranties w ON w.id = c.warranty_id
      LEFT JOIN customers cust ON cust.id = c.customer_id
      LEFT JOIN serial_numbers s ON s.id = w.serial_id
      LEFT JOIN products p ON p.id = s.product_id
      LEFT JOIN dealers d ON d.id = COALESCE(w.dealer_id, s.dealer_id)
-     LEFT JOIN tasks t ON t.complaint_id = c.id
-     LEFT JOIN technicians tech ON tech.id = t.technician_id
+     ${COMPLAINT_LATEST_TASK_JOIN}
      ORDER BY c.created_at DESC
      LIMIT 800`
   );
@@ -2430,8 +2441,9 @@ app.get("/complaints/dealer/:dealerId", asyncRoute(async (req, res) => {
   res.json({ complaints: result.rows });
 }));
 
-app.patch("/complaints/:id", asyncRoute(async (req, res) => {
-  const complaintId = cleanString(req.params.id);
+async function handleComplaintUpdate(req, res) {
+  await ensureComplaintsSchema();
+  const complaintKey = cleanString(req.params.id);
   const requesterRole = cleanString(req.body.requesterRole || req.body.requester_role);
   const productPayload = req.body.product && typeof req.body.product === "object" ? req.body.product : {};
   const cleanProductName = cleanString(
@@ -2453,7 +2465,7 @@ app.patch("/complaints/:id", asyncRoute(async (req, res) => {
   const cleanDescription = cleanString(req.body.description) || null;
   const cleanPriority = cleanString(req.body.priority) || "Normal";
 
-  if (!complaintId) {
+  if (!complaintKey) {
     return res.status(400).json({ error: "Complaint id is required." });
   }
   if (!["Front Desk", "Admin"].includes(requesterRole)) {
@@ -2467,6 +2479,11 @@ app.patch("/complaints/:id", asyncRoute(async (req, res) => {
   }
   if (!cleanProblemType) {
     return res.status(400).json({ error: "Problem type is required." });
+  }
+
+  const complaintId = await resolveComplaintId(complaintKey);
+  if (!complaintId) {
+    return res.status(404).json({ error: "Complaint not found." });
   }
 
   const result = await query(
@@ -2497,21 +2514,21 @@ app.patch("/complaints/:id", asyncRoute(async (req, res) => {
   }
   const updated = await query("SELECT * FROM complaints WHERE id = ? LIMIT 1", [complaintId]);
   res.json({ complaint: updated.rows[0] });
-}));
+}
 
-app.delete("/complaints/:id", asyncRoute(async (req, res) => {
-  const complaintId = cleanString(req.params.id);
+async function handleComplaintDelete(req, res) {
+  const complaintKey = cleanString(req.params.id);
   const requesterRole = cleanString(req.body.requesterRole || req.body.requester_role);
 
-  if (!complaintId) {
+  if (!complaintKey) {
     return res.status(400).json({ error: "Complaint id is required." });
   }
   if (!["Front Desk", "Admin"].includes(requesterRole)) {
     return res.status(403).json({ error: "Only Front Desk or Admin can delete complaints." });
   }
 
-  const existing = await query("SELECT id FROM complaints WHERE id = ? LIMIT 1", [complaintId]);
-  if (!existing.rowCount) {
+  const complaintId = await resolveComplaintId(complaintKey);
+  if (!complaintId) {
     return res.status(404).json({ error: "Complaint not found." });
   }
 
@@ -2520,15 +2537,21 @@ app.delete("/complaints/:id", asyncRoute(async (req, res) => {
     await tx("DELETE FROM complaints WHERE id = ?", [complaintId]);
   });
   res.json({ ok: true });
-}));
+}
+
+app.patch("/complaints/:id", asyncRoute(handleComplaintUpdate));
+app.post("/complaints/:id/update", asyncRoute(handleComplaintUpdate));
+app.delete("/complaints/:id", asyncRoute(handleComplaintDelete));
+app.post("/complaints/:id/delete", asyncRoute(handleComplaintDelete));
 
 app.post("/complaints/:id/assign-technician", asyncRoute(async (req, res) => {
-  const complaintId = cleanString(req.params.id);
+  const complaintKey = cleanString(req.params.id);
   const technicianId = cleanString(req.body.technicianId || req.body.technician_id);
   const workType = cleanString(req.body.workType || req.body.work_type) || "Warranty Repair";
   const dueAt = cleanString(req.body.dueAt || req.body.due_at) || null;
   const payableAmount = Number(req.body.payableAmount || req.body.payable_amount || 0);
 
+  const complaintId = await resolveComplaintId(complaintKey);
   if (!complaintId || !technicianId) {
     return res.status(400).json({ error: "Complaint and technician are required." });
   }
