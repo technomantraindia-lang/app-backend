@@ -284,6 +284,31 @@ async function ensureSerialNumbersSchema() {
   }
 }
 
+async function ensureComplaintsSchema() {
+  const columns = [
+    ["product_name", "ALTER TABLE complaints ADD COLUMN product_name VARCHAR(160) NULL AFTER priority"],
+    ["model_no", "ALTER TABLE complaints ADD COLUMN model_no VARCHAR(120) NULL AFTER product_name"],
+    ["warranty_start_date", "ALTER TABLE complaints ADD COLUMN warranty_start_date DATE NULL AFTER model_no"],
+    ["warranty_end_date", "ALTER TABLE complaints ADD COLUMN warranty_end_date DATE NULL AFTER warranty_start_date"],
+    ["warranty_status", "ALTER TABLE complaints ADD COLUMN warranty_status VARCHAR(60) NULL AFTER warranty_end_date"]
+  ];
+
+  for (const [columnName, ddl] of columns) {
+    const found = await query(
+      `SELECT COLUMN_NAME
+       FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE()
+         AND TABLE_NAME = 'complaints'
+         AND COLUMN_NAME = ?
+       LIMIT 1`,
+      [columnName]
+    );
+    if (!found.rowCount) {
+      await query(ddl);
+    }
+  }
+}
+
 async function getNextDealerNo(runQuery = query) {
   const result = await runQuery(
     `SELECT dealer_no
@@ -1014,15 +1039,15 @@ app.get("/dealers/:id/dashboard", asyncRoute(async (req, res) => {
     `SELECT
        c.*,
        w.warranty_no,
-       w.start_date,
-       w.expiry_date,
-       w.status AS warranty_status,
+       COALESCE(c.warranty_start_date, w.start_date) AS start_date,
+       COALESCE(c.warranty_end_date, w.expiry_date) AS expiry_date,
+       COALESCE(c.warranty_status, w.status) AS warranty_status,
        w.installation_status,
        cust.name AS customer_name,
        cust.mobile AS customer_mobile,
        s.serial_no,
-       p.name AS product_name,
-       p.model_no,
+       COALESCE(c.product_name, p.name) AS product_name,
+       COALESCE(c.model_no, p.model_no) AS model_no,
        ${COMPLAINT_LATEST_TASK_FIELDS}
      FROM complaints c
      INNER JOIN warranties w ON w.id = c.warranty_id
@@ -1578,15 +1603,15 @@ app.get("/complaints", asyncRoute(async (_req, res) => {
     `SELECT
        c.*,
        w.warranty_no,
-       w.start_date,
-       w.expiry_date,
-       w.status AS warranty_status,
+       COALESCE(c.warranty_start_date, w.start_date) AS start_date,
+       COALESCE(c.warranty_end_date, w.expiry_date) AS expiry_date,
+       COALESCE(c.warranty_status, w.status) AS warranty_status,
        w.installation_status,
        cust.name AS customer_name,
        cust.mobile AS customer_mobile,
        s.serial_no,
-       p.name AS product_name,
-       p.model_no,
+       COALESCE(c.product_name, p.name) AS product_name,
+       COALESCE(c.model_no, p.model_no) AS model_no,
        d.dealer_no,
        d.name AS dealer_name,
        tech.name AS technician_name
@@ -1932,13 +1957,13 @@ const TASK_DETAIL_SELECT = `
        cust.city AS customer_city,
        cust.state AS customer_state,
        cust.pincode AS customer_pincode,
-       p.name AS product_name,
-       p.model_no,
+       COALESCE(c.product_name, p.name) AS product_name,
+       COALESCE(c.model_no, p.model_no) AS model_no,
        s.serial_no,
        w.warranty_no,
-       w.start_date AS warranty_start,
-       w.expiry_date AS warranty_expiry,
-       w.status AS warranty_status,
+       COALESCE(c.warranty_start_date, w.start_date) AS warranty_start,
+       COALESCE(c.warranty_end_date, w.expiry_date) AS warranty_expiry,
+       COALESCE(c.warranty_status, w.status) AS warranty_status,
        w.installation_status,
        d.dealer_no,
        d.name AS dealer_name,
@@ -2349,9 +2374,14 @@ app.get("/complaints/customer/:customerId", asyncRoute(async (req, res) => {
   const result = await query(
     `SELECT
        c.*,
+       w.warranty_no,
+       COALESCE(c.warranty_start_date, w.start_date) AS start_date,
+       COALESCE(c.warranty_end_date, w.expiry_date) AS expiry_date,
+       COALESCE(c.warranty_status, w.status) AS warranty_status,
+       w.installation_status,
        s.serial_no,
-       p.name AS product_name,
-       p.model_no,
+       COALESCE(c.product_name, p.name) AS product_name,
+       COALESCE(c.model_no, p.model_no) AS model_no,
        d.dealer_no,
        d.name AS dealer_name,
        ${COMPLAINT_LATEST_TASK_FIELDS}
@@ -2374,15 +2404,15 @@ app.get("/complaints/dealer/:dealerId", asyncRoute(async (req, res) => {
     `SELECT
        c.*,
        w.warranty_no,
-       w.start_date,
-       w.expiry_date,
-       w.status AS warranty_status,
+       COALESCE(c.warranty_start_date, w.start_date) AS start_date,
+       COALESCE(c.warranty_end_date, w.expiry_date) AS expiry_date,
+       COALESCE(c.warranty_status, w.status) AS warranty_status,
        w.installation_status,
        cust.name AS customer_name,
        cust.mobile AS customer_mobile,
        s.serial_no,
-       p.name AS product_name,
-       p.model_no,
+       COALESCE(c.product_name, p.name) AS product_name,
+       COALESCE(c.model_no, p.model_no) AS model_no,
        d.dealer_no,
        d.name AS dealer_name,
        ${COMPLAINT_LATEST_TASK_FIELDS}
@@ -2398,6 +2428,98 @@ app.get("/complaints/dealer/:dealerId", asyncRoute(async (req, res) => {
     [dealerId]
   );
   res.json({ complaints: result.rows });
+}));
+
+app.patch("/complaints/:id", asyncRoute(async (req, res) => {
+  const complaintId = cleanString(req.params.id);
+  const requesterRole = cleanString(req.body.requesterRole || req.body.requester_role);
+  const productPayload = req.body.product && typeof req.body.product === "object" ? req.body.product : {};
+  const cleanProductName = cleanString(
+    productPayload.name || productPayload.productName || productPayload.product_name || req.body.productName || req.body.product_name
+  );
+  const cleanModelNo = cleanString(
+    productPayload.modelNo || productPayload.model_no || productPayload.model || req.body.modelNo || req.body.model_no
+  );
+  const cleanWarrantyStatus = cleanString(
+    productPayload.warrantyStatus || productPayload.warranty_status || req.body.warrantyStatus || req.body.warranty_status
+  ) || "Active";
+  const cleanWarrantyStartDate = cleanWarrantyStatus === "Expired"
+    ? null
+    : cleanDate(productPayload.warrantyStartDate || productPayload.warranty_start_date || productPayload.startDate || req.body.warrantyStartDate || req.body.warranty_start_date);
+  const cleanWarrantyEndDate = cleanWarrantyStatus === "Expired"
+    ? null
+    : cleanDate(productPayload.warrantyEndDate || productPayload.warranty_end_date || productPayload.endDate || req.body.warrantyEndDate || req.body.warranty_end_date);
+  const cleanProblemType = cleanString(req.body.problemType || req.body.problem_type);
+  const cleanDescription = cleanString(req.body.description) || null;
+  const cleanPriority = cleanString(req.body.priority) || "Normal";
+
+  if (!complaintId) {
+    return res.status(400).json({ error: "Complaint id is required." });
+  }
+  if (!["Front Desk", "Admin"].includes(requesterRole)) {
+    return res.status(403).json({ error: "Only Front Desk or Admin can edit complaints." });
+  }
+  if (!cleanProductName || !cleanModelNo) {
+    return res.status(400).json({ error: "Product name and model number are required." });
+  }
+  if (cleanWarrantyStatus === "Active" && (!cleanWarrantyStartDate || !cleanWarrantyEndDate)) {
+    return res.status(400).json({ error: "Warranty start and end date are required for active warranty." });
+  }
+  if (!cleanProblemType) {
+    return res.status(400).json({ error: "Problem type is required." });
+  }
+
+  const result = await query(
+    `UPDATE complaints
+     SET problem_type = ?,
+         description = ?,
+         priority = ?,
+         product_name = ?,
+         model_no = ?,
+         warranty_start_date = ?,
+         warranty_end_date = ?,
+         warranty_status = ?
+     WHERE id = ?`,
+    [
+      cleanProblemType,
+      cleanDescription,
+      cleanPriority,
+      cleanProductName,
+      cleanModelNo,
+      cleanWarrantyStartDate,
+      cleanWarrantyEndDate,
+      cleanWarrantyStatus,
+      complaintId
+    ]
+  );
+  if (!result.affectedRows) {
+    return res.status(404).json({ error: "Complaint not found." });
+  }
+  const updated = await query("SELECT * FROM complaints WHERE id = ? LIMIT 1", [complaintId]);
+  res.json({ complaint: updated.rows[0] });
+}));
+
+app.delete("/complaints/:id", asyncRoute(async (req, res) => {
+  const complaintId = cleanString(req.params.id);
+  const requesterRole = cleanString(req.body.requesterRole || req.body.requester_role);
+
+  if (!complaintId) {
+    return res.status(400).json({ error: "Complaint id is required." });
+  }
+  if (!["Front Desk", "Admin"].includes(requesterRole)) {
+    return res.status(403).json({ error: "Only Front Desk or Admin can delete complaints." });
+  }
+
+  const existing = await query("SELECT id FROM complaints WHERE id = ? LIMIT 1", [complaintId]);
+  if (!existing.rowCount) {
+    return res.status(404).json({ error: "Complaint not found." });
+  }
+
+  await withTransaction(async (tx) => {
+    await tx("DELETE FROM tasks WHERE complaint_id = ?", [complaintId]);
+    await tx("DELETE FROM complaints WHERE id = ?", [complaintId]);
+  });
+  res.json({ ok: true });
 }));
 
 app.post("/complaints/:id/assign-technician", asyncRoute(async (req, res) => {
@@ -2459,14 +2581,37 @@ app.post("/complaints", asyncRoute(async (req, res) => {
     description,
     priority,
     createdByRole,
-    customer
+    customer,
+    product
   } = req.body;
   const creatorRole = typeof createdByRole === "string" ? createdByRole.trim() : "";
   const cleanProblemType = typeof problemType === "string" ? problemType.trim() : "";
   const cleanComplaintNo = typeof complaintNo === "string" ? complaintNo.trim() : "";
+  const productPayload = product && typeof product === "object" ? product : {};
+  const cleanProductName = cleanString(
+    productPayload.name || productPayload.productName || productPayload.product_name || req.body.productName || req.body.product_name
+  ) || null;
+  const cleanModelNo = cleanString(
+    productPayload.modelNo || productPayload.model_no || productPayload.model || req.body.modelNo || req.body.model_no
+  ) || null;
+  const cleanWarrantyStatus = cleanString(
+    productPayload.warrantyStatus || productPayload.warranty_status || req.body.warrantyStatus || req.body.warranty_status
+  ) || null;
+  const cleanWarrantyStartDate = cleanWarrantyStatus === "Expired"
+    ? null
+    : cleanDate(productPayload.warrantyStartDate || productPayload.warranty_start_date || productPayload.startDate || req.body.warrantyStartDate || req.body.warranty_start_date);
+  const cleanWarrantyEndDate = cleanWarrantyStatus === "Expired"
+    ? null
+    : cleanDate(productPayload.warrantyEndDate || productPayload.warranty_end_date || productPayload.endDate || req.body.warrantyEndDate || req.body.warranty_end_date);
 
   if (!cleanComplaintNo || !cleanProblemType) {
     return res.status(400).json({ error: "complaintNo and problemType are required" });
+  }
+  if (creatorRole === "Front Desk" && (!cleanProductName || !cleanModelNo)) {
+    return res.status(400).json({ error: "Product name and model number are required." });
+  }
+  if (creatorRole === "Front Desk" && cleanWarrantyStatus === "Active" && (!cleanWarrantyStartDate || !cleanWarrantyEndDate)) {
+    return res.status(400).json({ error: "Warranty start and end date are required for active warranty." });
   }
 
   let resolvedCustomerId = typeof customerId === "string" ? customerId.trim() : "";
@@ -2509,14 +2654,21 @@ app.post("/complaints", asyncRoute(async (req, res) => {
   }
 
   await query(
-    "INSERT INTO complaints (complaint_no, warranty_id, customer_id, problem_type, description, priority) VALUES (?, ?, ?, ?, ?, ?)",
+    `INSERT INTO complaints
+     (complaint_no, warranty_id, customer_id, problem_type, description, priority, product_name, model_no, warranty_start_date, warranty_end_date, warranty_status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       cleanComplaintNo,
       resolvedWarrantyId,
       resolvedCustomerId,
       cleanProblemType,
       typeof description === "string" && description.trim() ? description.trim() : null,
-      typeof priority === "string" && priority.trim() ? priority.trim() : "Normal"
+      typeof priority === "string" && priority.trim() ? priority.trim() : "Normal",
+      cleanProductName,
+      cleanModelNo,
+      cleanWarrantyStartDate,
+      cleanWarrantyEndDate,
+      cleanWarrantyStatus
     ]
   );
   const result = await query("SELECT * FROM complaints WHERE complaint_no = ? LIMIT 1", [cleanComplaintNo]);
@@ -2544,8 +2696,9 @@ app.use((error, _req, res, _next) => {
 
 try {
   await ensureSerialNumbersSchema();
+  await ensureComplaintsSchema();
 } catch (error) {
-  console.warn("Serial number schema check skipped:", error?.message || error);
+  console.warn("Runtime schema check skipped:", error?.message || error);
 }
 
 app.listen(port, "0.0.0.0", () => {
