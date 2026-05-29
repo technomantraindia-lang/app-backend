@@ -91,6 +91,29 @@ function cleanString(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+/** Customer login accounts must have a customers row for lists and dashboard counts. */
+async function syncCustomerProfilesFromUsers(runQuery = query) {
+  await runQuery(
+    `UPDATE customers c
+     INNER JOIN users u ON u.role = 'Customer'
+       AND ${sqlNormalizeMobileColumn("c.mobile")} = ${sqlNormalizeMobileColumn("u.mobile")}
+     SET c.user_id = u.id,
+         c.name = COALESCE(NULLIF(TRIM(c.name), ''), u.name)
+     WHERE c.user_id IS NULL`
+  );
+  await runQuery(
+    `INSERT INTO customers (user_id, name, mobile, address, city, state, pincode)
+     SELECT u.id, u.name, u.mobile, NULL, NULL, NULL, NULL
+     FROM users u
+     WHERE u.role = 'Customer'
+       AND NOT EXISTS (SELECT 1 FROM customers c WHERE c.user_id = u.id)
+       AND NOT EXISTS (
+         SELECT 1 FROM customers c
+         WHERE ${sqlNormalizeMobileColumn("c.mobile")} = ${sqlNormalizeMobileColumn("u.mobile")}
+       )`
+  );
+}
+
 /** Keep complaints.status aligned with the latest technician task action. */
 function complaintStatusForTaskStatus(taskStatus) {
   const s = cleanString(taskStatus);
@@ -422,7 +445,10 @@ app.get("/dealers/next-number", asyncRoute(async (_req, res) => {
 }));
 
 app.get("/admin/dashboard", asyncRoute(async (_req, res) => {
+  await syncCustomerProfilesFromUsers();
   const [
+    totalCustomers,
+    totalTechnicians,
     totalDealers,
     totalProducts,
     totalSerials,
@@ -435,12 +461,15 @@ app.get("/admin/dashboard", asyncRoute(async (_req, res) => {
     activeDealers,
     overdueComplaints,
     pendingComplaints,
+    pendingCallsToday,
     closedToday,
     pendingTechnicians,
     pendingSerials,
     pendingQuotationApprovals,
     pendingPayable
   ] = await Promise.all([
+    query("SELECT COUNT(*) AS total FROM customers"),
+    query("SELECT COUNT(*) AS total FROM technicians"),
     query("SELECT COUNT(*) AS total FROM dealers"),
     query("SELECT COUNT(*) AS total FROM products"),
     query("SELECT COUNT(*) AS total FROM serial_numbers"),
@@ -460,6 +489,7 @@ app.get("/admin/dashboard", asyncRoute(async (_req, res) => {
          AND t.due_at < NOW()`
     ),
     query("SELECT COUNT(*) AS total FROM complaints WHERE status NOT IN ('Closed', 'Completed', 'Cancelled')"),
+    query("SELECT COUNT(*) AS total FROM tasks WHERE status NOT IN ('Closed', 'Completed', 'Cancelled') AND DATE(COALESCE(due_at, created_at)) <= CURDATE()"),
     query("SELECT COUNT(*) AS total FROM complaints WHERE status IN ('Closed', 'Completed') AND DATE(created_at) = CURDATE()"),
     query("SELECT COUNT(*) AS total FROM technicians WHERE approval_status = 'Pending'"),
     query("SELECT COUNT(*) AS total FROM serial_numbers WHERE qr_status = 'Not Printed' OR dispatch_status = 'Pending'"),
@@ -470,6 +500,8 @@ app.get("/admin/dashboard", asyncRoute(async (_req, res) => {
   const count = (result) => Number(result.rows?.[0]?.total || 0);
   res.json({
     summary: {
+      totalCustomers: count(totalCustomers),
+      totalTechnicians: count(totalTechnicians),
       totalDealers: count(totalDealers),
       totalProducts: count(totalProducts),
       totalSerials: count(totalSerials),
@@ -482,6 +514,7 @@ app.get("/admin/dashboard", asyncRoute(async (_req, res) => {
       activeDealers: count(activeDealers),
       overdueComplaints: count(overdueComplaints),
       pendingComplaints: count(pendingComplaints),
+      pendingCallsToday: count(pendingCallsToday),
       closedToday: count(closedToday),
       pendingTechnicians: count(pendingTechnicians),
       pendingSerials: count(pendingSerials),
@@ -659,6 +692,9 @@ app.post("/accounts", asyncRoute(async (req, res) => {
   if (!accountCreatorRoles.includes(cleanCreatedByRole)) {
     return res.status(403).json({ error: "Only Admin or Front Desk can create login accounts." });
   }
+  if (cleanCreatedByRole === "Front Desk" && cleanRole !== "Customer") {
+    return res.status(403).json({ error: "Front Desk can create customer login accounts only." });
+  }
   if (!accountRoles.includes(cleanRole)) {
     return res.status(400).json({ error: "Select a valid role." });
   }
@@ -752,6 +788,45 @@ app.post("/customers", asyncRoute(async (req, res) => {
     user: publicUser(user.rows[0]),
     customer: customer.rows[0]
   });
+}));
+
+app.get("/customers", asyncRoute(async (_req, res) => {
+  await syncCustomerProfilesFromUsers();
+  const result = await query(
+    `SELECT
+       c.id,
+       c.user_id,
+       c.name,
+       c.mobile,
+       c.address,
+       c.city,
+       c.state,
+       c.pincode,
+       c.created_at,
+       u.email,
+       COALESCE(u.status, 'Active') AS user_status,
+       COUNT(DISTINCT w.id) AS warranties,
+       COUNT(DISTINCT comp.id) AS complaints
+     FROM customers c
+     LEFT JOIN users u ON u.id = c.user_id
+     LEFT JOIN warranties w ON w.customer_id = c.id
+     LEFT JOIN complaints comp ON comp.customer_id = c.id
+     GROUP BY
+       c.id,
+       c.user_id,
+       c.name,
+       c.mobile,
+       c.address,
+       c.city,
+       c.state,
+       c.pincode,
+       c.created_at,
+       u.email,
+       u.status
+     ORDER BY c.created_at DESC
+     LIMIT 800`
+  );
+  res.json({ customers: result.rows });
 }));
 
 app.post("/technicians", asyncRoute(async (req, res) => {
@@ -2376,16 +2451,75 @@ app.post("/complaints/:id/assign-technician", asyncRoute(async (req, res) => {
 }));
 
 app.post("/complaints", asyncRoute(async (req, res) => {
-  const { complaintNo, warrantyId, customerId, problemType, description, priority } = req.body;
-  if (!complaintNo || !customerId || !problemType) {
+  const {
+    complaintNo,
+    warrantyId,
+    customerId,
+    problemType,
+    description,
+    priority,
+    createdByRole,
+    customer
+  } = req.body;
+  const creatorRole = typeof createdByRole === "string" ? createdByRole.trim() : "";
+  const cleanProblemType = typeof problemType === "string" ? problemType.trim() : "";
+  const cleanComplaintNo = typeof complaintNo === "string" ? complaintNo.trim() : "";
+
+  if (!cleanComplaintNo || !cleanProblemType) {
+    return res.status(400).json({ error: "complaintNo and problemType are required" });
+  }
+
+  let resolvedCustomerId = typeof customerId === "string" ? customerId.trim() : "";
+
+  if (creatorRole === "Front Desk") {
+    const customerPayload = customer && typeof customer === "object" ? customer : null;
+    if (!resolvedCustomerId && customerPayload) {
+      const profile = await findOrCreateCustomer({
+        name: customerPayload.name,
+        mobile: customerPayload.mobile,
+        email: customerPayload.email,
+        address: customerPayload.address,
+        city: customerPayload.city,
+        state: customerPayload.state,
+        pincode: customerPayload.pincode
+      });
+      resolvedCustomerId = profile.id;
+    }
+    if (!resolvedCustomerId) {
+      return res.status(400).json({ error: "Customer name and mobile are required." });
+    }
+  } else if (!resolvedCustomerId) {
     return res.status(400).json({ error: "complaintNo, customerId, and problemType are required" });
+  }
+
+  const customerCheck = await query("SELECT id FROM customers WHERE id = ? LIMIT 1", [resolvedCustomerId]);
+  if (!customerCheck.rowCount) {
+    return res.status(404).json({ error: "Customer account not found." });
+  }
+
+  let resolvedWarrantyId = typeof warrantyId === "string" && warrantyId.trim() ? warrantyId.trim() : null;
+  if (resolvedWarrantyId) {
+    const warrantyCheck = await query(
+      "SELECT id FROM warranties WHERE id = ? AND customer_id = ? LIMIT 1",
+      [resolvedWarrantyId, resolvedCustomerId]
+    );
+    if (!warrantyCheck.rowCount) {
+      return res.status(400).json({ error: "Selected warranty does not belong to this customer." });
+    }
   }
 
   await query(
     "INSERT INTO complaints (complaint_no, warranty_id, customer_id, problem_type, description, priority) VALUES (?, ?, ?, ?, ?, ?)",
-    [complaintNo, warrantyId || null, customerId, problemType, description || null, priority || "Normal"]
+    [
+      cleanComplaintNo,
+      resolvedWarrantyId,
+      resolvedCustomerId,
+      cleanProblemType,
+      typeof description === "string" && description.trim() ? description.trim() : null,
+      typeof priority === "string" && priority.trim() ? priority.trim() : "Normal"
+    ]
   );
-  const result = await query("SELECT * FROM complaints WHERE complaint_no = ? LIMIT 1", [complaintNo]);
+  const result = await query("SELECT * FROM complaints WHERE complaint_no = ? LIMIT 1", [cleanComplaintNo]);
   res.status(201).json({ complaint: result.rows[0] });
 }));
 
