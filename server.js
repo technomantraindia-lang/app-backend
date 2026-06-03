@@ -32,7 +32,9 @@ function publicUser(row) {
 }
 
 const accountRoles = ["Front Desk", "Dispatch", "Dealer", "Technician", "Customer"];
-const accountCreatorRoles = ["Admin"];
+const accountCreatorRoles = ["Admin", "Dealer"];
+const customerOnlyAccountCreators = ["Front Desk"];
+const dealerCreatableRoles = ["Customer", "Technician"];
 
 function normalizeEmail(email) {
   return typeof email === "string" ? email.trim().toLowerCase() : "";
@@ -57,6 +59,97 @@ async function findDealerForUser(userRow) {
     [dealerMobile]
   );
   return result.rowCount ? result.rows[0] : null;
+}
+
+/** Dealer table id from profile id or dealer login user id. */
+async function resolveDealerRecord(idOrUserId) {
+  const key = cleanString(idOrUserId);
+  if (!key) {
+    return null;
+  }
+  const byProfile = await query("SELECT * FROM dealers WHERE id = ? LIMIT 1", [key]);
+  if (byProfile.rowCount) {
+    return byProfile.rows[0];
+  }
+  const userResult = await query("SELECT * FROM users WHERE id = ? AND role = 'Dealer' LIMIT 1", [key]);
+  if (!userResult.rowCount) {
+    return null;
+  }
+  return findDealerForUser(userResult.rows[0]);
+}
+
+const DEALER_COMPLAINT_FROM = `
+  FROM complaints c
+  LEFT JOIN warranties w ON w.id = c.warranty_id
+  LEFT JOIN serial_numbers s ON s.id = w.serial_id`;
+
+/** Same rules as isComplaintSolvedInDb / app isComplaintSolved (case-insensitive task status). */
+const COMPLAINT_TASK_COMPLETED_SQL = `
+  EXISTS (
+    SELECT 1 FROM tasks t
+    WHERE t.complaint_id = c.id AND LOWER(TRIM(COALESCE(t.status, ''))) = 'completed'
+  )`;
+
+const COMPLAINT_SOLVED_WHERE = `
+  (
+    ${COMPLAINT_TASK_COMPLETED_SQL}
+    OR LOWER(COALESCE(c.status, '')) LIKE '%closed%'
+    OR LOWER(COALESCE(c.status, '')) LIKE '%completed%'
+    OR LOWER(COALESCE(c.status, '')) LIKE '%solved%'
+  )`;
+
+const COMPLAINT_OPEN_WHERE = `
+  (
+    TRIM(COALESCE(c.status, '')) NOT IN ('Cancelled')
+    AND NOT (
+      ${COMPLAINT_TASK_COMPLETED_SQL}
+      OR LOWER(COALESCE(c.status, '')) LIKE '%closed%'
+      OR LOWER(COALESCE(c.status, '')) LIKE '%completed%'
+      OR LOWER(COALESCE(c.status, '')) LIKE '%solved%'
+    )
+  )`;
+
+async function getDealerDashboardStats(dealerId) {
+  const [serials, warranties, totalComplaints, openComplaints, solvedComplaints, pendingScan] = await Promise.all([
+    query("SELECT COUNT(*) AS total FROM serial_numbers WHERE dealer_id = ?", [dealerId]),
+    query("SELECT COUNT(*) AS total FROM warranties WHERE dealer_id = ?", [dealerId]),
+    query(
+      `SELECT COUNT(*) AS total ${DEALER_COMPLAINT_FROM} WHERE COALESCE(w.dealer_id, s.dealer_id) = ?`,
+      [dealerId]
+    ),
+    query(
+      `SELECT COUNT(*) AS total ${DEALER_COMPLAINT_FROM}
+       WHERE COALESCE(w.dealer_id, s.dealer_id) = ? AND ${COMPLAINT_OPEN_WHERE}`,
+      [dealerId]
+    ),
+    query(
+      `SELECT COUNT(*) AS total ${DEALER_COMPLAINT_FROM}
+       WHERE COALESCE(w.dealer_id, s.dealer_id) = ? AND ${COMPLAINT_SOLVED_WHERE}`,
+      [dealerId]
+    ),
+    query(
+      `SELECT COUNT(*) AS total
+       FROM serial_numbers s
+       LEFT JOIN warranties w ON w.serial_id = s.id
+       WHERE s.dealer_id = ? AND w.id IS NULL`,
+      [dealerId]
+    )
+  ]);
+  const count = (result) => Number(result.rows[0]?.total || 0);
+  const productsSold = count(warranties);
+  const openProblems = count(openComplaints);
+  const solvedProblems = count(solvedComplaints);
+  return {
+    productsDispatched: count(serials),
+    productsSold,
+    warrantiesRegistered: productsSold,
+    complaintsOnSoldProducts: count(totalComplaints),
+    openProblems,
+    complaintsOpen: openProblems,
+    solvedProblems,
+    complaintsSolved: solvedProblems,
+    pendingScan: count(pendingScan)
+  };
 }
 
 /** Resolve technician profile for login — by user_id, then mobile (auto-links user_id when missing). */
@@ -337,7 +430,12 @@ async function isComplaintSolvedInDb(complaintId, runQuery = query) {
   }
   const taskStatus = String(result.rows[0].task_status || "").toLowerCase();
   const complaintStatus = String(result.rows[0].complaint_status || "").toLowerCase();
-  return taskStatus === "completed" || complaintStatus.includes("closed") || complaintStatus.includes("completed");
+  return (
+    taskStatus === "completed" ||
+    complaintStatus.includes("closed") ||
+    complaintStatus.includes("completed") ||
+    complaintStatus.includes("solved")
+  );
 }
 
 async function getNextDealerNo(runQuery = query) {
@@ -746,7 +844,13 @@ app.post("/accounts", asyncRoute(async (req, res) => {
   const cleanPassword = typeof password === "string" ? password : "";
 
   if (!accountCreatorRoles.includes(cleanCreatedByRole)) {
-    return res.status(403).json({ error: "Only Admin can create login accounts." });
+    return res.status(403).json({ error: "You are not allowed to create login accounts." });
+  }
+  if (customerOnlyAccountCreators.includes(cleanCreatedByRole) && cleanRole !== "Customer") {
+    return res.status(403).json({ error: "Only customer login accounts can be created for this role." });
+  }
+  if (cleanCreatedByRole === "Dealer" && !dealerCreatableRoles.includes(cleanRole)) {
+    return res.status(403).json({ error: "Dealers can create customer or technician login accounts only." });
   }
   if (!accountRoles.includes(cleanRole)) {
     return res.status(400).json({ error: "Select a valid role." });
@@ -1050,7 +1154,8 @@ app.patch("/technicians/:id/approval", asyncRoute(async (req, res) => {
 app.get("/dealers", asyncRoute(async (_req, res) => {
   const result = await query(
     `SELECT
-       COALESCE(d.id, u.id) AS id,
+       d.id AS id,
+       u.id AS user_id,
        COALESCE(d.dealer_no, 'Pending Dealer No') AS dealer_no,
        COALESCE(d.name, u.name) AS name,
        COALESCE(d.contact_person, u.name) AS contact_person,
@@ -1061,11 +1166,12 @@ app.get("/dealers", asyncRoute(async (_req, res) => {
        COALESCE(d.status, u.status, 'Active') AS status,
        COALESCE(d.created_at, u.created_at) AS created_at
      FROM users u
-     LEFT JOIN dealers d ON d.mobile = u.mobile
+     LEFT JOIN dealers d ON ${sqlNormalizeMobileColumn("d.mobile")} = ${sqlNormalizeMobileColumn("u.mobile")}
      WHERE u.role = 'Dealer'
      UNION
      SELECT
        d.id,
+       NULL AS user_id,
        d.dealer_no,
        d.name,
        d.contact_person,
@@ -1076,11 +1182,23 @@ app.get("/dealers", asyncRoute(async (_req, res) => {
        d.status,
        d.created_at
      FROM dealers d
-     LEFT JOIN users u ON u.mobile = d.mobile AND u.role = 'Dealer'
+     LEFT JOIN users u ON ${sqlNormalizeMobileColumn("u.mobile")} = ${sqlNormalizeMobileColumn("d.mobile")} AND u.role = 'Dealer'
      WHERE u.id IS NULL
      ORDER BY created_at DESC`
   );
-  res.json({ dealers: result.rows });
+  const dealers = [];
+  for (const row of result.rows) {
+    const entry = { ...row };
+    if (row.id) {
+      try {
+        entry.stats = await getDealerDashboardStats(row.id);
+      } catch {
+        entry.stats = null;
+      }
+    }
+    dealers.push(entry);
+  }
+  res.json({ dealers });
 }));
 
 app.get("/dealers/by-user/:userId", asyncRoute(async (req, res) => {
@@ -1122,42 +1240,19 @@ app.get("/technicians/by-user/:userId", asyncRoute(async (req, res) => {
 }));
 
 app.get("/dealers/:id/dashboard", asyncRoute(async (req, res) => {
-  const dealerId = cleanString(req.params.id);
-  if (!dealerId) {
+  const dealerKey = cleanString(req.params.id);
+  if (!dealerKey) {
     return res.status(400).json({ error: "Dealer id is required." });
   }
-  const dealer = await query("SELECT * FROM dealers WHERE id = ? LIMIT 1", [dealerId]);
-  if (!dealer.rowCount) {
-    return res.status(404).json({ error: "Dealer not found." });
+  const dealer = await resolveDealerRecord(dealerKey);
+  if (!dealer) {
+    return res.status(404).json({
+      error:
+        "Dealer profile not found. Link the dealer login mobile to a dealer record in Admin → Dealer Management.",
+    });
   }
-  const [serials, warranties, totalComplaints, openComplaints, pendingScan] = await Promise.all([
-    query("SELECT COUNT(*) AS total FROM serial_numbers WHERE dealer_id = ?", [dealerId]),
-    query("SELECT COUNT(*) AS total FROM warranties WHERE dealer_id = ?", [dealerId]),
-    query(
-      `SELECT COUNT(*) AS total
-       FROM complaints c
-       LEFT JOIN warranties w ON w.id = c.warranty_id
-       LEFT JOIN serial_numbers s ON s.id = w.serial_id
-       WHERE COALESCE(w.dealer_id, s.dealer_id) = ?`,
-      [dealerId]
-    ),
-    query(
-      `SELECT COUNT(*) AS total
-       FROM complaints c
-       LEFT JOIN warranties w ON w.id = c.warranty_id
-       LEFT JOIN serial_numbers s ON s.id = w.serial_id
-       WHERE COALESCE(w.dealer_id, s.dealer_id) = ?
-         AND c.status NOT IN ('Closed', 'Completed', 'Cancelled')`,
-      [dealerId]
-    ),
-    query(
-      `SELECT COUNT(*) AS total
-       FROM serial_numbers s
-       LEFT JOIN warranties w ON w.serial_id = s.id
-       WHERE s.dealer_id = ? AND w.id IS NULL`,
-      [dealerId]
-    )
-  ]);
+  const dealerId = dealer.id;
+  const stats = await getDealerDashboardStats(dealerId);
   const complaints = await query(
     `SELECT
        c.*,
@@ -1183,21 +1278,9 @@ app.get("/dealers/:id/dashboard", asyncRoute(async (req, res) => {
      LIMIT 3`,
     [dealerId]
   );
-  const count = (result) => Number(result.rows[0]?.total || 0);
-  const productsSold = count(warranties);
-  const complaintsOnSoldProducts = count(totalComplaints);
-  const openProblems = count(openComplaints);
   res.json({
-    dealer: dealer.rows[0],
-    stats: {
-      productsDispatched: count(serials),
-      productsSold,
-      warrantiesRegistered: productsSold,
-      complaintsOnSoldProducts,
-      openProblems,
-      complaintsOpen: openProblems,
-      pendingScan: count(pendingScan)
-    },
+    dealer,
+    stats,
     complaints: complaints.rows
   });
 }));
@@ -2527,7 +2610,12 @@ app.get("/complaints/customer/:customerId", asyncRoute(async (req, res) => {
 }));
 
 app.get("/complaints/dealer/:dealerId", asyncRoute(async (req, res) => {
-  const dealerId = cleanString(req.params.dealerId);
+  const dealerKey = cleanString(req.params.dealerId);
+  const dealer = await resolveDealerRecord(dealerKey);
+  if (!dealer) {
+    return res.status(404).json({ error: "Dealer not found." });
+  }
+  const dealerId = dealer.id;
   const result = await query(
     `SELECT
        c.*,
@@ -2750,19 +2838,34 @@ app.post("/complaints", asyncRoute(async (req, res) => {
     ? null
     : cleanDate(productPayload.warrantyEndDate || productPayload.warranty_end_date || productPayload.endDate || req.body.warrantyEndDate || req.body.warranty_end_date);
 
+  const staffComplaintCreators = ["Front Desk", "Dealer"];
+  const isStaffCreator = staffComplaintCreators.includes(creatorRole);
+
   if (!cleanComplaintNo || !cleanProblemType) {
     return res.status(400).json({ error: "complaintNo and problemType are required" });
   }
-  if (creatorRole === "Front Desk" && (!cleanProductName || !cleanModelNo)) {
+  if (isStaffCreator && (!cleanProductName || !cleanModelNo)) {
     return res.status(400).json({ error: "Product name and model number are required." });
   }
-  if (creatorRole === "Front Desk" && cleanWarrantyStatus === "Active" && (!cleanWarrantyStartDate || !cleanWarrantyEndDate)) {
+  if (isStaffCreator && cleanWarrantyStatus === "Active" && (!cleanWarrantyStartDate || !cleanWarrantyEndDate)) {
     return res.status(400).json({ error: "Warranty start and end date are required for active warranty." });
+  }
+
+  let actingDealerId = null;
+  if (creatorRole === "Dealer") {
+    actingDealerId = cleanString(req.body.dealerId || req.body.dealer_id);
+    const dealerProfile = actingDealerId ? await resolveDealerRecord(actingDealerId) : null;
+    if (!dealerProfile) {
+      return res.status(400).json({
+        error: "Dealer profile is required. Link your login mobile with Dealer Management in Admin.",
+      });
+    }
+    actingDealerId = dealerProfile.id;
   }
 
   let resolvedCustomerId = typeof customerId === "string" ? customerId.trim() : "";
 
-  if (creatorRole === "Front Desk") {
+  if (isStaffCreator) {
     const customerPayload = customer && typeof customer === "object" ? customer : null;
     if (!resolvedCustomerId && customerPayload) {
       const profile = await findOrCreateCustomer({
@@ -2790,12 +2893,27 @@ app.post("/complaints", asyncRoute(async (req, res) => {
 
   let resolvedWarrantyId = typeof warrantyId === "string" && warrantyId.trim() ? warrantyId.trim() : null;
   if (resolvedWarrantyId) {
-    const warrantyCheck = await query(
-      "SELECT id FROM warranties WHERE id = ? AND customer_id = ? LIMIT 1",
-      [resolvedWarrantyId, resolvedCustomerId]
-    );
-    if (!warrantyCheck.rowCount) {
-      return res.status(400).json({ error: "Selected warranty does not belong to this customer." });
+    if (creatorRole === "Dealer") {
+      const warrantyCheck = await query(
+        `SELECT w.id
+         FROM warranties w
+         LEFT JOIN serial_numbers s ON s.id = w.serial_id
+         WHERE w.id = ? AND w.customer_id = ?
+           AND COALESCE(w.dealer_id, s.dealer_id) = ?
+         LIMIT 1`,
+        [resolvedWarrantyId, resolvedCustomerId, actingDealerId]
+      );
+      if (!warrantyCheck.rowCount) {
+        return res.status(400).json({ error: "Selected warranty does not belong to this customer or your dealership." });
+      }
+    } else {
+      const warrantyCheck = await query(
+        "SELECT id FROM warranties WHERE id = ? AND customer_id = ? LIMIT 1",
+        [resolvedWarrantyId, resolvedCustomerId]
+      );
+      if (!warrantyCheck.rowCount) {
+        return res.status(400).json({ error: "Selected warranty does not belong to this customer." });
+      }
     }
   }
 
