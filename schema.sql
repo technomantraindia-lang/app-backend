@@ -31,8 +31,10 @@ CREATE TABLE IF NOT EXISTS customers (
   city VARCHAR(120),
   state VARCHAR(120),
   pincode VARCHAR(20),
+  created_by_dealer_id CHAR(36),
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  CONSTRAINT fk_customers_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+  CONSTRAINT fk_customers_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
+  CONSTRAINT fk_customers_created_by_dealer FOREIGN KEY (created_by_dealer_id) REFERENCES dealers(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS technicians (
@@ -41,10 +43,13 @@ CREATE TABLE IF NOT EXISTS technicians (
   name VARCHAR(160) NOT NULL,
   mobile VARCHAR(30) NOT NULL UNIQUE,
   city VARCHAR(120),
+  pincode VARCHAR(20),
   service_areas TEXT,
   approval_status VARCHAR(40) NOT NULL DEFAULT 'Pending',
+  created_by_dealer_id CHAR(36),
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  CONSTRAINT fk_technicians_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+  CONSTRAINT fk_technicians_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
+  CONSTRAINT fk_technicians_created_by_dealer FOREIGN KEY (created_by_dealer_id) REFERENCES dealers(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS products (

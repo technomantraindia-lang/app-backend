@@ -377,6 +377,48 @@ async function ensureSerialNumbersSchema() {
   }
 }
 
+async function ensureDealerCreatedBySchema() {
+  for (const [tableName, columnName, ddl] of [
+    ["customers", "created_by_dealer_id", "ALTER TABLE customers ADD COLUMN created_by_dealer_id CHAR(36) NULL AFTER pincode"],
+    ["technicians", "created_by_dealer_id", "ALTER TABLE technicians ADD COLUMN created_by_dealer_id CHAR(36) NULL AFTER approval_status"]
+  ]) {
+    const found = await query(
+      `SELECT COLUMN_NAME
+       FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE()
+         AND TABLE_NAME = ?
+         AND COLUMN_NAME = ?
+       LIMIT 1`,
+      [tableName, columnName]
+    );
+    if (!found.rowCount) {
+      await query(ddl);
+    }
+  }
+}
+
+async function ensureTechniciansSchema() {
+  await ensureDealerCreatedBySchema();
+  const columns = [
+    ["pincode", "ALTER TABLE technicians ADD COLUMN pincode VARCHAR(20) NULL AFTER city"]
+  ];
+
+  for (const [columnName, ddl] of columns) {
+    const found = await query(
+      `SELECT COLUMN_NAME
+       FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE()
+         AND TABLE_NAME = 'technicians'
+         AND COLUMN_NAME = ?
+       LIMIT 1`,
+      [columnName]
+    );
+    if (!found.rowCount) {
+      await query(ddl);
+    }
+  }
+}
+
 async function ensureComplaintsSchema() {
   const columns = [
     ["product_name", "ALTER TABLE complaints ADD COLUMN product_name VARCHAR(160) NULL AFTER priority"],
@@ -819,6 +861,7 @@ app.delete("/accounts/:id", asyncRoute(async (req, res) => {
 }));
 
 app.post("/accounts", asyncRoute(async (req, res) => {
+  await ensureTechniciansSchema();
   const {
     role,
     name,
@@ -827,6 +870,7 @@ app.post("/accounts", asyncRoute(async (req, res) => {
     password,
     status,
     createdByRole,
+    dealerId,
     city,
     state,
     address,
@@ -852,6 +896,18 @@ app.post("/accounts", asyncRoute(async (req, res) => {
   if (cleanCreatedByRole === "Dealer" && !dealerCreatableRoles.includes(cleanRole)) {
     return res.status(403).json({ error: "Dealers can create customer or technician login accounts only." });
   }
+
+  let creatorDealerId = null;
+  if (cleanCreatedByRole === "Dealer") {
+    const dealerProfile = await resolveDealerRecord(cleanString(dealerId));
+    if (!dealerProfile) {
+      return res.status(400).json({
+        error: "Dealer profile is required. Link your login mobile with Dealer Management in Admin.",
+      });
+    }
+    creatorDealerId = dealerProfile.id;
+  }
+
   if (!accountRoles.includes(cleanRole)) {
     return res.status(400).json({ error: "Select a valid role." });
   }
@@ -890,17 +946,18 @@ app.post("/accounts", asyncRoute(async (req, res) => {
 
   if (cleanRole === "Customer") {
     await query(
-      "INSERT INTO customers (user_id, name, mobile, address, city, state, pincode) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      [userId, cleanName, cleanMobile, address || null, city || null, state || null, pincode || null]
+      "INSERT INTO customers (user_id, name, mobile, address, city, state, pincode, created_by_dealer_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      [userId, cleanName, cleanMobile, address || null, city || null, state || null, cleanString(pincode) || null, creatorDealerId]
     );
     const result = await query("SELECT * FROM customers WHERE user_id = ? LIMIT 1", [userId]);
     customer = result.rows[0] || null;
   }
 
   if (cleanRole === "Technician") {
+    const cleanPincode = cleanString(pincode) || null;
     await query(
-      "INSERT INTO technicians (user_id, name, mobile, city, service_areas, approval_status) VALUES (?, ?, ?, ?, ?, 'Pending')",
-      [userId, cleanName, cleanMobile, city || null, serviceAreas || null]
+      "INSERT INTO technicians (user_id, name, mobile, city, pincode, service_areas, approval_status, created_by_dealer_id) VALUES (?, ?, ?, ?, ?, ?, 'Pending', ?)",
+      [userId, cleanName, cleanMobile, city || null, cleanPincode, serviceAreas || null, creatorDealerId]
     );
     const result = await query("SELECT * FROM technicians WHERE user_id = ? LIMIT 1", [userId]);
     technician = result.rows[0] || null;
@@ -1074,7 +1131,8 @@ app.get("/customers/by-mobile/:mobile", asyncRoute(async (req, res) => {
 }));
 
 app.post("/technicians", asyncRoute(async (req, res) => {
-  const { name, mobile, email, password, city, serviceAreas } = req.body;
+  await ensureTechniciansSchema();
+  const { name, mobile, email, password, city, serviceAreas, pincode } = req.body;
   if (!name || !mobile) {
     return res.status(400).json({ error: "name and mobile are required" });
   }
@@ -1085,8 +1143,8 @@ app.post("/technicians", asyncRoute(async (req, res) => {
   );
   const user = await query("SELECT * FROM users WHERE mobile = ? AND role = 'Technician' LIMIT 1", [mobile]);
   await query(
-    "INSERT INTO technicians (user_id, name, mobile, city, service_areas) VALUES (?, ?, ?, ?, ?)",
-    [user.rows[0].id, name, mobile, city || null, serviceAreas || null]
+    "INSERT INTO technicians (user_id, name, mobile, city, pincode, service_areas) VALUES (?, ?, ?, ?, ?, ?)",
+    [user.rows[0].id, name, mobile, city || null, cleanString(pincode) || null, serviceAreas || null]
   );
   const technician = await query("SELECT * FROM technicians WHERE mobile = ? LIMIT 1", [mobile]);
 
@@ -1283,6 +1341,72 @@ app.get("/dealers/:id/dashboard", asyncRoute(async (req, res) => {
     stats,
     complaints: complaints.rows
   });
+}));
+
+app.get("/dealers/:id/created-customers", asyncRoute(async (req, res) => {
+  await ensureDealerCreatedBySchema();
+  const dealer = await resolveDealerRecord(req.params.id);
+  if (!dealer) {
+    return res.status(404).json({ error: "Dealer not found." });
+  }
+  const result = await query(
+    `SELECT
+       c.id,
+       c.user_id,
+       c.name,
+       c.mobile,
+       c.address,
+       c.city,
+       c.state,
+       c.pincode,
+       c.created_at,
+       u.email,
+       COALESCE(u.status, 'Active') AS user_status,
+       COUNT(DISTINCT w.id) AS warranties,
+       COUNT(DISTINCT comp.id) AS complaints
+     FROM customers c
+     LEFT JOIN users u ON u.id = c.user_id
+     LEFT JOIN warranties w ON w.customer_id = c.id
+     LEFT JOIN complaints comp ON comp.customer_id = c.id
+     WHERE c.created_by_dealer_id = ?
+     GROUP BY
+       c.id,
+       c.user_id,
+       c.name,
+       c.mobile,
+       c.address,
+       c.city,
+       c.state,
+       c.pincode,
+       c.created_at,
+       u.email,
+       u.status
+     ORDER BY c.created_at DESC
+     LIMIT 500`,
+    [dealer.id]
+  );
+  res.json({ dealer: { id: dealer.id, name: dealer.name, dealer_no: dealer.dealer_no }, customers: result.rows });
+}));
+
+app.get("/dealers/:id/created-technicians", asyncRoute(async (req, res) => {
+  await ensureDealerCreatedBySchema();
+  const dealer = await resolveDealerRecord(req.params.id);
+  if (!dealer) {
+    return res.status(404).json({ error: "Dealer not found." });
+  }
+  const result = await query(
+    `SELECT
+       t.*,
+       u.email,
+       u.status AS user_status
+     FROM technicians t
+     LEFT JOIN users u ON u.id = t.user_id
+     WHERE t.created_by_dealer_id = ?
+     ORDER BY t.created_at DESC
+     LIMIT 500`,
+    [dealer.id]
+  );
+  res.json({ dealer: { id: dealer.id, name: dealer.name, dealer_no: dealer.dealer_no }, technicians: result.rows });
 }));
 
 app.post("/dealers", asyncRoute(async (req, res) => {
