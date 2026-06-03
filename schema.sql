@@ -206,10 +206,13 @@ CREATE TABLE IF NOT EXISTS feedback (
   id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
   complaint_id CHAR(36),
   customer_id CHAR(36),
-  rating INT,
+  technician_id CHAR(36),
+  rating INT NOT NULL,
   remarks TEXT,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_feedback_complaint (complaint_id),
   CONSTRAINT chk_feedback_rating CHECK (rating BETWEEN 1 AND 5),
-  CONSTRAINT fk_feedback_complaint FOREIGN KEY (complaint_id) REFERENCES complaints(id) ON DELETE SET NULL,
-  CONSTRAINT fk_feedback_customer FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE
+  CONSTRAINT fk_feedback_complaint FOREIGN KEY (complaint_id) REFERENCES complaints(id) ON DELETE CASCADE,
+  CONSTRAINT fk_feedback_customer FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE,
+  CONSTRAINT fk_feedback_technician FOREIGN KEY (technician_id) REFERENCES technicians(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

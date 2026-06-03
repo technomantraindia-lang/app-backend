@@ -234,11 +234,19 @@ const COMPLAINT_LATEST_TASK_JOIN = `
   LEFT JOIN technicians tech ON tech.id = t.technician_id`;
 
 const COMPLAINT_LATEST_TASK_FIELDS = `
+       t.technician_id,
        tech.name AS technician_name,
        tech.mobile AS technician_mobile,
        t.task_no,
        t.due_at,
-       t.status AS task_status`;
+       t.status AS task_status,
+       fb.id AS feedback_id,
+       fb.rating AS feedback_rating,
+       fb.remarks AS feedback_remarks,
+       fb.created_at AS feedback_at`;
+
+const COMPLAINT_FEEDBACK_JOIN = `
+  LEFT JOIN feedback fb ON fb.complaint_id = c.id`;
 
 function cleanSerialNo(value) {
   return cleanString(value).replace(/\s+/g, "").toUpperCase();
@@ -442,6 +450,131 @@ async function ensureComplaintsSchema() {
       await query(ddl);
     }
   }
+}
+
+async function ensureFeedbackSchema() {
+  await query(
+    `CREATE TABLE IF NOT EXISTS feedback (
+      id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
+      complaint_id CHAR(36),
+      customer_id CHAR(36),
+      technician_id CHAR(36),
+      rating INT NOT NULL,
+      remarks TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE KEY uq_feedback_complaint (complaint_id),
+      CONSTRAINT chk_feedback_rating CHECK (rating BETWEEN 1 AND 5),
+      CONSTRAINT fk_feedback_complaint FOREIGN KEY (complaint_id) REFERENCES complaints(id) ON DELETE CASCADE,
+      CONSTRAINT fk_feedback_customer FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE,
+      CONSTRAINT fk_feedback_technician FOREIGN KEY (technician_id) REFERENCES technicians(id) ON DELETE SET NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
+  );
+
+  const columns = [
+    ["technician_id", "ALTER TABLE feedback ADD COLUMN technician_id CHAR(36) NULL AFTER customer_id"]
+  ];
+  for (const [columnName, ddl] of columns) {
+    const found = await query(
+      `SELECT COLUMN_NAME
+       FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE()
+         AND TABLE_NAME = 'feedback'
+         AND COLUMN_NAME = ?
+       LIMIT 1`,
+      [columnName]
+    );
+    if (!found.rowCount) {
+      await query(ddl);
+    }
+  }
+
+  await query(
+    `UPDATE feedback f
+     INNER JOIN tasks t ON t.complaint_id = f.complaint_id
+     SET f.technician_id = t.technician_id
+     WHERE f.technician_id IS NULL AND t.technician_id IS NOT NULL`
+  );
+}
+
+async function getTechnicianRankMap(runQuery = query) {
+  const result = await runQuery(
+    `SELECT
+       t.id,
+       COUNT(f.id) AS review_count,
+       ROUND(AVG(f.rating), 2) AS avg_rating
+     FROM technicians t
+     INNER JOIN feedback f ON f.technician_id = t.id
+     WHERE t.approval_status = 'Approved'
+     GROUP BY t.id
+     HAVING review_count > 0
+     ORDER BY avg_rating DESC, review_count DESC, t.name ASC`
+  );
+  const map = new Map();
+  let rank = 0;
+  let prevAvg = null;
+  let prevCount = null;
+  for (const row of result.rows) {
+    const avg = Number(row.avg_rating);
+    const cnt = Number(row.review_count);
+    if (prevAvg !== avg || prevCount !== cnt) {
+      rank += 1;
+      prevAvg = avg;
+      prevCount = cnt;
+    }
+    map.set(String(row.id), {
+      rank,
+      reviewCount: cnt,
+      avgRating: avg,
+      totalRanked: result.rows.length
+    });
+  }
+  const totalRanked = result.rows.length;
+  for (const [, value] of map) {
+    value.totalRanked = totalRanked;
+  }
+  return map;
+}
+
+async function getTechnicianRatingSummary(technicianId, runQuery = query) {
+  const id = cleanString(technicianId);
+  if (!id) {
+    return { reviewCount: 0, avgRating: null, rank: null, totalRanked: 0 };
+  }
+  const stats = await runQuery(
+    `SELECT COUNT(*) AS review_count, ROUND(AVG(rating), 2) AS avg_rating
+     FROM feedback
+     WHERE technician_id = ?
+     LIMIT 1`,
+    [id]
+  );
+  const reviewCount = Number(stats.rows[0]?.review_count || 0);
+  const avgRating = stats.rows[0]?.avg_rating != null ? Number(stats.rows[0].avg_rating) : null;
+  const rankMap = await getTechnicianRankMap(runQuery);
+  const ranked = rankMap.get(id);
+  return {
+    reviewCount,
+    avgRating,
+    rank: ranked?.rank ?? null,
+    totalRanked: ranked?.totalRanked ?? rankMap.size
+  };
+}
+
+function withTechnicianRatingFields(technicianRow, rankMap) {
+  if (!technicianRow) {
+    return technicianRow;
+  }
+  const id = String(technicianRow.id || "");
+  const ranked = rankMap?.get(id);
+  const reviewCount = ranked?.reviewCount ?? Number(technicianRow.review_count || 0);
+  const avgRating =
+    ranked?.avgRating ?? (technicianRow.avg_rating != null ? Number(technicianRow.avg_rating) : null);
+  return {
+    ...technicianRow,
+    review_count: reviewCount,
+    avg_rating: avgRating,
+    rank: ranked?.rank ?? null,
+    total_ranked: ranked?.totalRanked ?? rankMap?.size ?? 0
+  };
 }
 
 async function resolveComplaintId(identifier, runQuery = query) {
@@ -1164,6 +1297,7 @@ app.post("/technicians", asyncRoute(async (req, res) => {
 }));
 
 app.get("/technicians", asyncRoute(async (req, res) => {
+  await ensureFeedbackSchema();
   const status = cleanString(req.query.status);
   const allowed = ["Pending", "Approved", "Rejected"];
   const where = allowed.includes(status) ? "WHERE t.approval_status = ?" : "";
@@ -1172,7 +1306,9 @@ app.get("/technicians", asyncRoute(async (req, res) => {
     `SELECT
        t.*,
        u.email,
-       u.status AS user_status
+       u.status AS user_status,
+       (SELECT COUNT(*) FROM feedback f WHERE f.technician_id = t.id) AS review_count,
+       (SELECT ROUND(AVG(f.rating), 2) FROM feedback f WHERE f.technician_id = t.id) AS avg_rating
      FROM technicians t
      LEFT JOIN users u ON u.id = t.user_id
      ${where}
@@ -1180,7 +1316,10 @@ app.get("/technicians", asyncRoute(async (req, res) => {
      LIMIT 800`,
     params
   );
-  res.json({ technicians: result.rows });
+  const rankMap = await getTechnicianRankMap();
+  res.json({
+    technicians: result.rows.map((row) => withTechnicianRatingFields(row, rankMap))
+  });
 }));
 
 app.patch("/technicians/:id/approval", asyncRoute(async (req, res) => {
@@ -1288,6 +1427,7 @@ app.get("/dealers/by-user/:userId", asyncRoute(async (req, res) => {
 }));
 
 app.get("/technicians/by-user/:userId", asyncRoute(async (req, res) => {
+  await ensureFeedbackSchema();
   const userId = cleanString(req.params.userId);
   if (!userId) {
     return res.status(400).json({ error: "userId is required." });
@@ -1303,7 +1443,122 @@ app.get("/technicians/by-user/:userId", asyncRoute(async (req, res) => {
         "Technician profile not linked. Use the same mobile in Technician Management as this login, or sign up again.",
     });
   }
-  res.json({ technician });
+  const rankMap = await getTechnicianRankMap();
+  res.json({ technician: withTechnicianRatingFields(technician, rankMap) });
+}));
+
+app.get("/technicians/:id/rating", asyncRoute(async (req, res) => {
+  await ensureFeedbackSchema();
+  const technicianId = cleanString(req.params.id);
+  const existing = await query("SELECT id, name FROM technicians WHERE id = ? LIMIT 1", [technicianId]);
+  if (!existing.rowCount) {
+    return res.status(404).json({ error: "Technician not found." });
+  }
+  const summary = await getTechnicianRatingSummary(technicianId);
+  const recent = await query(
+    `SELECT
+       f.id,
+       f.rating,
+       f.remarks,
+       f.created_at,
+       c.complaint_no,
+       cust.name AS customer_name
+     FROM feedback f
+     LEFT JOIN complaints c ON c.id = f.complaint_id
+     LEFT JOIN customers cust ON cust.id = f.customer_id
+     WHERE f.technician_id = ?
+     ORDER BY f.created_at DESC
+     LIMIT 10`,
+    [technicianId]
+  );
+  res.json({
+    technicianId,
+    technicianName: existing.rows[0].name,
+    ...summary,
+    recentReviews: recent.rows
+  });
+}));
+
+app.get("/feedback/customer/:customerId", asyncRoute(async (req, res) => {
+  await ensureFeedbackSchema();
+  const customerId = cleanString(req.params.customerId);
+  const result = await query(
+    `SELECT
+       f.*,
+       c.complaint_no,
+       tech.name AS technician_name
+     FROM feedback f
+     LEFT JOIN complaints c ON c.id = f.complaint_id
+     LEFT JOIN technicians tech ON tech.id = f.technician_id
+     WHERE f.customer_id = ?
+     ORDER BY f.created_at DESC
+     LIMIT 200`,
+    [customerId]
+  );
+  res.json({ feedback: result.rows });
+}));
+
+app.post("/feedback", asyncRoute(async (req, res) => {
+  await ensureFeedbackSchema();
+  const complaintId = await resolveComplaintId(req.body.complaintId || req.body.complaint_id);
+  const customerId = cleanString(req.body.customerId || req.body.customer_id);
+  const rating = Number(req.body.rating);
+  const remarks =
+    typeof req.body.remarks === "string" && req.body.remarks.trim() ? req.body.remarks.trim() : null;
+
+  if (!complaintId || !customerId) {
+    return res.status(400).json({ error: "complaintId and customerId are required." });
+  }
+  if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+    return res.status(400).json({ error: "Rating must be between 1 and 5." });
+  }
+
+  const complaint = await query(
+    "SELECT id, customer_id FROM complaints WHERE id = ? AND customer_id = ? LIMIT 1",
+    [complaintId, customerId]
+  );
+  if (!complaint.rowCount) {
+    return res.status(404).json({ error: "Complaint not found for this customer." });
+  }
+  if (!(await isComplaintSolvedInDb(complaintId))) {
+    return res.status(400).json({ error: "You can review only after the problem is solved." });
+  }
+
+  const existing = await query("SELECT id FROM feedback WHERE complaint_id = ? LIMIT 1", [complaintId]);
+  if (existing.rowCount) {
+    return res.status(409).json({ error: "Feedback already submitted for this complaint." });
+  }
+
+  const task = await query(
+    `SELECT technician_id FROM tasks
+     WHERE complaint_id = ? AND technician_id IS NOT NULL
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [complaintId]
+  );
+  const technicianId = cleanString(task.rows[0]?.technician_id);
+  if (!technicianId) {
+    return res.status(400).json({ error: "No technician is linked to this complaint yet." });
+  }
+
+  await query(
+    "INSERT INTO feedback (complaint_id, customer_id, technician_id, rating, remarks) VALUES (?, ?, ?, ?, ?)",
+    [complaintId, customerId, technicianId, rating, remarks]
+  );
+  const saved = await query(
+    `SELECT f.*, c.complaint_no, tech.name AS technician_name
+     FROM feedback f
+     LEFT JOIN complaints c ON c.id = f.complaint_id
+     LEFT JOIN technicians tech ON tech.id = f.technician_id
+     WHERE f.complaint_id = ?
+     LIMIT 1`,
+    [complaintId]
+  );
+  const technicianRating = await getTechnicianRatingSummary(technicianId);
+  res.status(201).json({
+    feedback: saved.rows[0] || null,
+    technicianRating
+  });
 }));
 
 app.get("/dealers/:id/dashboard", asyncRoute(async (req, res) => {
@@ -2715,6 +2970,7 @@ app.post("/dispatch-mapping", asyncRoute(async (req, res) => {
 }));
 
 app.get("/complaints/customer/:customerId", asyncRoute(async (req, res) => {
+  await ensureFeedbackSchema();
   const result = await query(
     `SELECT
        c.*,
@@ -2735,6 +2991,7 @@ app.get("/complaints/customer/:customerId", asyncRoute(async (req, res) => {
      LEFT JOIN products p ON p.id = s.product_id
      LEFT JOIN dealers d ON d.id = COALESCE(w.dealer_id, s.dealer_id)
      ${COMPLAINT_LATEST_TASK_JOIN}
+     ${COMPLAINT_FEEDBACK_JOIN}
      WHERE c.customer_id = ?
      ORDER BY c.created_at DESC`,
     [req.params.customerId]
@@ -3094,6 +3351,7 @@ app.use((error, _req, res, _next) => {
 try {
   await ensureSerialNumbersSchema();
   await ensureComplaintsSchema();
+  await ensureFeedbackSchema();
 } catch (error) {
   console.warn("Runtime schema check skipped:", error?.message || error);
 }
