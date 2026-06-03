@@ -32,7 +32,7 @@ function publicUser(row) {
 }
 
 const accountRoles = ["Front Desk", "Dispatch", "Dealer", "Technician", "Customer"];
-const accountCreatorRoles = ["Admin", "Front Desk"];
+const accountCreatorRoles = ["Admin"];
 
 function normalizeEmail(email) {
   return typeof email === "string" ? email.trim().toLowerCase() : "";
@@ -746,10 +746,7 @@ app.post("/accounts", asyncRoute(async (req, res) => {
   const cleanPassword = typeof password === "string" ? password : "";
 
   if (!accountCreatorRoles.includes(cleanCreatedByRole)) {
-    return res.status(403).json({ error: "Only Admin or Front Desk can create login accounts." });
-  }
-  if (cleanCreatedByRole === "Front Desk" && cleanRole !== "Customer") {
-    return res.status(403).json({ error: "Front Desk can create customer login accounts only." });
+    return res.status(403).json({ error: "Only Admin can create login accounts." });
   }
   if (!accountRoles.includes(cleanRole)) {
     return res.status(400).json({ error: "Select a valid role." });
@@ -1133,13 +1130,21 @@ app.get("/dealers/:id/dashboard", asyncRoute(async (req, res) => {
   if (!dealer.rowCount) {
     return res.status(404).json({ error: "Dealer not found." });
   }
-  const [serials, warranties, openComplaints, pendingScan] = await Promise.all([
+  const [serials, warranties, totalComplaints, openComplaints, pendingScan] = await Promise.all([
     query("SELECT COUNT(*) AS total FROM serial_numbers WHERE dealer_id = ?", [dealerId]),
     query("SELECT COUNT(*) AS total FROM warranties WHERE dealer_id = ?", [dealerId]),
     query(
       `SELECT COUNT(*) AS total
        FROM complaints c
-       INNER JOIN warranties w ON w.id = c.warranty_id
+       LEFT JOIN warranties w ON w.id = c.warranty_id
+       LEFT JOIN serial_numbers s ON s.id = w.serial_id
+       WHERE COALESCE(w.dealer_id, s.dealer_id) = ?`,
+      [dealerId]
+    ),
+    query(
+      `SELECT COUNT(*) AS total
+       FROM complaints c
+       LEFT JOIN warranties w ON w.id = c.warranty_id
        LEFT JOIN serial_numbers s ON s.id = w.serial_id
        WHERE COALESCE(w.dealer_id, s.dealer_id) = ?
          AND c.status NOT IN ('Closed', 'Completed', 'Cancelled')`,
@@ -1179,12 +1184,18 @@ app.get("/dealers/:id/dashboard", asyncRoute(async (req, res) => {
     [dealerId]
   );
   const count = (result) => Number(result.rows[0]?.total || 0);
+  const productsSold = count(warranties);
+  const complaintsOnSoldProducts = count(totalComplaints);
+  const openProblems = count(openComplaints);
   res.json({
     dealer: dealer.rows[0],
     stats: {
       productsDispatched: count(serials),
-      warrantiesRegistered: count(warranties),
-      complaintsOpen: count(openComplaints),
+      productsSold,
+      warrantiesRegistered: productsSold,
+      complaintsOnSoldProducts,
+      openProblems,
+      complaintsOpen: openProblems,
       pendingScan: count(pendingScan)
     },
     complaints: complaints.rows
