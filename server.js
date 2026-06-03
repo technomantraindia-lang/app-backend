@@ -238,8 +238,12 @@ const COMPLAINT_LATEST_TASK_FIELDS = `
        tech.name AS technician_name,
        tech.mobile AS technician_mobile,
        t.task_no,
+       t.work_type AS task_work_type,
        t.due_at,
        t.status AS task_status,
+       t.completed_at AS task_completed_at,
+       t.resolution_notes AS task_resolution_notes,
+       t.created_at AS task_created_at,
        fb.id AS feedback_id,
        fb.rating AS feedback_rating,
        fb.remarks AS feedback_remarks,
@@ -247,6 +251,165 @@ const COMPLAINT_LATEST_TASK_FIELDS = `
 
 const COMPLAINT_FEEDBACK_JOIN = `
   LEFT JOIN feedback fb ON fb.complaint_id = c.id`;
+
+const COMPLAINT_LATEST_QUOTATION_JOIN = `
+  LEFT JOIN quotations qt ON qt.id = (
+    SELECT q2.id FROM quotations q2 WHERE q2.complaint_id = c.id ORDER BY q2.created_at DESC LIMIT 1
+  )`;
+
+const COMPLAINT_LATEST_QUOTATION_FIELDS = `
+       qt.id AS quotation_id,
+       qt.quotation_no,
+       qt.status AS quotation_status,
+       qt.spare_part_amount AS quotation_spare_part,
+       qt.service_charge AS quotation_service_charge,
+       qt.visit_charge AS quotation_visit_charge,
+       qt.tax_amount AS quotation_tax,
+       qt.discount_amount AS quotation_discount,
+       qt.total_amount AS quotation_total,
+       qt.technician_remarks AS quotation_technician_remarks,
+       qt.customer_remarks AS quotation_customer_remarks,
+       qt.created_at AS quotation_created_at`;
+
+function isWarrantyExpiredStatus(status, expiryDate) {
+  const st = String(status || "").toLowerCase();
+  if (st.includes("expired")) {
+    return true;
+  }
+  if (expiryDate) {
+    const exp = new Date(expiryDate);
+    if (!Number.isNaN(exp.getTime())) {
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      exp.setHours(23, 59, 59, 999);
+      if (exp.getTime() < today.getTime()) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function calcQuotationTotal(parts) {
+  const spare = Number(parts.sparePartAmount) || 0;
+  const service = Number(parts.serviceCharge) || 0;
+  const visit = Number(parts.visitCharge) || 0;
+  const tax = Number(parts.taxAmount) || 0;
+  const discount = Number(parts.discountAmount) || 0;
+  const total = spare + service + visit + tax - discount;
+  return Math.max(0, Math.round(total * 100) / 100);
+}
+
+async function ensureQuotationsSchema() {
+  await query(
+    `CREATE TABLE IF NOT EXISTS quotations (
+      id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
+      quotation_no VARCHAR(80) NOT NULL UNIQUE,
+      complaint_id CHAR(36),
+      technician_id CHAR(36),
+      spare_part_amount DECIMAL(10, 2) DEFAULT 0,
+      service_charge DECIMAL(10, 2) DEFAULT 0,
+      visit_charge DECIMAL(10, 2) DEFAULT 0,
+      tax_amount DECIMAL(10, 2) DEFAULT 0,
+      discount_amount DECIMAL(10, 2) DEFAULT 0,
+      total_amount DECIMAL(10, 2) DEFAULT 0,
+      technician_remarks TEXT,
+      customer_remarks TEXT,
+      customer_decided_at TIMESTAMP NULL,
+      status VARCHAR(60) NOT NULL DEFAULT 'Pending Customer Approval',
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT fk_quotations_complaint FOREIGN KEY (complaint_id) REFERENCES complaints(id) ON DELETE CASCADE,
+      CONSTRAINT fk_quotations_technician FOREIGN KEY (technician_id) REFERENCES technicians(id) ON DELETE SET NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
+  );
+  const columns = [
+    ["technician_remarks", "ALTER TABLE quotations ADD COLUMN technician_remarks TEXT NULL AFTER total_amount"],
+    ["customer_remarks", "ALTER TABLE quotations ADD COLUMN customer_remarks TEXT NULL AFTER technician_remarks"],
+    ["customer_decided_at", "ALTER TABLE quotations ADD COLUMN customer_decided_at TIMESTAMP NULL AFTER customer_remarks"]
+  ];
+  for (const [columnName, ddl] of columns) {
+    const found = await query(
+      `SELECT COLUMN_NAME
+       FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE()
+         AND TABLE_NAME = 'quotations'
+         AND COLUMN_NAME = ?
+       LIMIT 1`,
+      [columnName]
+    );
+    if (!found.rowCount) {
+      await query(ddl);
+    }
+  }
+}
+
+async function getNextQuotationNo(runQuery = query) {
+  const year = new Date().getFullYear();
+  const prefix = `QT-${year}-`;
+  const result = await runQuery(
+    `SELECT quotation_no FROM quotations WHERE quotation_no LIKE ? ORDER BY quotation_no DESC LIMIT 1`,
+    [`${prefix}%`]
+  );
+  let seq = 1;
+  if (result.rowCount) {
+    const last = String(result.rows[0].quotation_no || "");
+    const match = last.match(/(\d+)$/);
+    if (match) {
+      seq = Number(match[1]) + 1;
+    }
+  }
+  return `${prefix}${String(seq).padStart(4, "0")}`;
+}
+
+async function loadComplaintForQuotation(complaintId, runQuery = query) {
+  const result = await runQuery(
+    `SELECT
+       c.id,
+       c.complaint_no,
+       c.customer_id,
+       c.status AS complaint_status,
+       COALESCE(c.warranty_status, w.status) AS warranty_status,
+       COALESCE(c.warranty_end_date, w.expiry_date) AS warranty_expiry,
+       COALESCE(c.product_name, p.name) AS product_name,
+       COALESCE(c.model_no, p.model_no) AS model_no,
+       s.serial_no,
+       cust.name AS customer_name
+     FROM complaints c
+     LEFT JOIN warranties w ON w.id = c.warranty_id
+     LEFT JOIN serial_numbers s ON s.id = w.serial_id
+     LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN customers cust ON cust.id = c.customer_id
+     WHERE c.id = ?
+     LIMIT 1`,
+    [complaintId]
+  );
+  return result.rowCount ? result.rows[0] : null;
+}
+
+async function fetchQuotationById(quotationId, runQuery = query) {
+  const result = await runQuery(
+    `SELECT
+       q.*,
+       c.complaint_no,
+       c.customer_id,
+       COALESCE(c.product_name, p.name) AS product_name,
+       COALESCE(c.model_no, p.model_no) AS model_no,
+       s.serial_no,
+       cust.name AS customer_name,
+       tech.name AS technician_name
+     FROM quotations q
+     LEFT JOIN complaints c ON c.id = q.complaint_id
+     LEFT JOIN warranties w ON w.id = c.warranty_id
+     LEFT JOIN serial_numbers s ON s.id = w.serial_id
+     LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN customers cust ON cust.id = c.customer_id
+     LEFT JOIN technicians tech ON tech.id = q.technician_id
+     WHERE q.id = ?
+     LIMIT 1`,
+    [quotationId]
+  );
+  return result.rowCount ? result.rows[0] : null;
+}
 
 function cleanSerialNo(value) {
   return cleanString(value).replace(/\s+/g, "").toUpperCase();
@@ -283,6 +446,120 @@ function cleanDate(value) {
 
 function serialQrPayload(serialNo) {
   return `hitaishi://serial?serial=${encodeURIComponent(serialNo)}`;
+}
+
+function productQrPayload(product) {
+  const productId = cleanString(product?.id || product?.product_id);
+  const model = cleanString(product?.model_no || product?.modelNo);
+  const name = cleanString(product?.name || product?.product_name);
+  const params = new URLSearchParams();
+  if (productId) params.set("productId", productId);
+  if (model) params.set("model", model);
+  if (name) params.set("name", name);
+  return `hitaishi://product?${params.toString()}`;
+}
+
+function productFromPayload(value) {
+  const raw = cleanString(value);
+  if (!raw) return { productId: "", model: "", name: "" };
+  try {
+    const url = new URL(raw);
+    if (url.protocol === "hitaishi:" && url.hostname === "product") {
+      return {
+        productId: cleanString(url.searchParams.get("productId") || url.searchParams.get("product_id")),
+        model: cleanString(url.searchParams.get("model") || url.searchParams.get("modelNo")),
+        name: cleanString(url.searchParams.get("name")),
+      };
+    }
+    const productId = url.searchParams.get("productId") || url.searchParams.get("product_id");
+    if (productId) {
+      return {
+        productId: cleanString(productId),
+        model: cleanString(url.searchParams.get("model") || url.searchParams.get("modelNo")),
+        name: cleanString(url.searchParams.get("name")),
+      };
+    }
+  } catch {
+    // Plain payloads handled below.
+  }
+  const idMatch = raw.match(/(?:productId|product_id)\s*[:=]\s*([A-Za-z0-9-]+)/i);
+  const modelMatch = raw.match(/(?:model|modelNo|model_no)\s*[:=]\s*([^&\s]+)/i);
+  const nameMatch = raw.match(/(?:name)\s*[:=]\s*([^&]+)/i);
+  return {
+    productId: cleanString(idMatch?.[1] || ""),
+    model: cleanString(modelMatch?.[1] || ""),
+    name: cleanString(nameMatch?.[1] || ""),
+  };
+}
+
+async function ensureProductsQrSchema() {
+  const columns = [
+    ["qr_status", "ALTER TABLE products ADD COLUMN qr_status VARCHAR(40) NOT NULL DEFAULT 'Not Printed' AFTER warranty_months"],
+    ["qr_payload", "ALTER TABLE products ADD COLUMN qr_payload VARCHAR(255) NULL AFTER qr_status"],
+    ["qr_printed_at", "ALTER TABLE products ADD COLUMN qr_printed_at TIMESTAMP NULL AFTER qr_payload"],
+    ["qr_locked", "ALTER TABLE products ADD COLUMN qr_locked TINYINT(1) NOT NULL DEFAULT 0 AFTER qr_printed_at"],
+  ];
+  for (const [columnName, ddl] of columns) {
+    const found = await query(
+      `SELECT COLUMN_NAME
+       FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE()
+         AND TABLE_NAME = 'products'
+         AND COLUMN_NAME = ?`,
+      [columnName]
+    );
+    if (!found.rowCount) {
+      await query(ddl);
+    }
+  }
+}
+
+async function productHasActiveWarranty(productId) {
+  if (!productId) return false;
+  const result = await query(
+    `SELECT 1
+     FROM warranties w
+     INNER JOIN serial_numbers s ON s.id = w.serial_id
+     WHERE s.product_id = ?
+       AND w.customer_id IS NOT NULL
+       AND LOWER(TRIM(COALESCE(w.status, ''))) = 'active'
+     LIMIT 1`,
+    [productId]
+  );
+  return Boolean(result.rowCount);
+}
+
+async function lockProductQrAfterWarrantyActivation(productId) {
+  if (!productId) return;
+  await query("UPDATE products SET qr_locked = 1 WHERE id = ?", [productId]);
+}
+
+/** Link serials only to products already saved in Product Master (admin name). */
+async function resolveProductFromMaster({ productId, productName, modelNo }) {
+  const id = cleanString(productId);
+  if (id) {
+    const byId = await query("SELECT id, name, model_no FROM products WHERE id = ? LIMIT 1", [id]);
+    if (byId.rowCount) return byId.rows[0];
+    const err = new Error("Selected product not found in Product Master.");
+    err.statusCode = 404;
+    throw err;
+  }
+
+  const name = cleanString(productName);
+  if (name) {
+    const byName = await query("SELECT id, name, model_no FROM products WHERE LOWER(TRIM(name)) = LOWER(?) LIMIT 1", [name]);
+    if (byName.rowCount) return byName.rows[0];
+  }
+
+  const model = cleanString(modelNo);
+  if (model) {
+    const byModel = await query("SELECT id, name, model_no FROM products WHERE LOWER(TRIM(model_no)) = LOWER(?) LIMIT 1", [model]);
+    if (byModel.rowCount) return byModel.rows[0];
+  }
+
+  const err = new Error("Product not found in Product Master. Add the product with admin name first, then create serial.");
+  err.statusCode = 400;
+  throw err;
 }
 
 function qrSvg(payload, size = 220) {
@@ -403,6 +680,32 @@ async function ensureDealerCreatedBySchema() {
       await query(ddl);
     }
   }
+}
+
+async function ensureTasksSchema() {
+  const columns = [
+    ["completed_at", "ALTER TABLE tasks ADD COLUMN completed_at TIMESTAMP NULL AFTER status"],
+    ["resolution_notes", "ALTER TABLE tasks ADD COLUMN resolution_notes TEXT NULL AFTER completed_at"]
+  ];
+  for (const [columnName, ddl] of columns) {
+    const found = await query(
+      `SELECT COLUMN_NAME
+       FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE()
+         AND TABLE_NAME = 'tasks'
+         AND COLUMN_NAME = ?
+       LIMIT 1`,
+      [columnName]
+    );
+    if (!found.rowCount) {
+      await query(ddl);
+    }
+  }
+  await query(
+    `UPDATE tasks
+     SET completed_at = COALESCE(completed_at, created_at)
+     WHERE LOWER(TRIM(COALESCE(status, ''))) = 'completed' AND completed_at IS NULL`
+  );
 }
 
 async function ensureTechniciansSchema() {
@@ -802,7 +1105,7 @@ app.get("/admin/dashboard", asyncRoute(async (_req, res) => {
     query("SELECT COUNT(*) AS total FROM dealers"),
     query("SELECT COUNT(*) AS total FROM products"),
     query("SELECT COUNT(*) AS total FROM serial_numbers"),
-    query("SELECT COUNT(*) AS total FROM serial_numbers WHERE qr_status = 'Printed'"),
+    query("SELECT COUNT(*) AS total FROM products WHERE qr_status = 'Printed'"),
     query("SELECT COUNT(*) AS total FROM warranties WHERE DATE(created_at) = CURDATE()"),
     query("SELECT COUNT(*) AS total FROM warranties WHERE status = 'Active'"),
     query("SELECT COUNT(*) AS total FROM tasks WHERE work_type = 'Installation' AND status NOT IN ('Closed', 'Completed', 'Cancelled')"),
@@ -1561,6 +1864,251 @@ app.post("/feedback", asyncRoute(async (req, res) => {
   });
 }));
 
+app.get("/quotations", asyncRoute(async (req, res) => {
+  await ensureQuotationsSchema();
+  const status = cleanString(req.query.status);
+  const where = status ? "WHERE q.status = ?" : "";
+  const params = status ? [status] : [];
+  const result = await query(
+    `SELECT
+       q.*,
+       c.complaint_no,
+       c.customer_id,
+       COALESCE(c.product_name, p.name) AS product_name,
+       COALESCE(c.model_no, p.model_no) AS model_no,
+       s.serial_no,
+       cust.name AS customer_name,
+       cust.mobile AS customer_mobile,
+       tech.name AS technician_name
+     FROM quotations q
+     LEFT JOIN complaints c ON c.id = q.complaint_id
+     LEFT JOIN warranties w ON w.id = c.warranty_id
+     LEFT JOIN serial_numbers s ON s.id = w.serial_id
+     LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN customers cust ON cust.id = c.customer_id
+     LEFT JOIN technicians tech ON tech.id = q.technician_id
+     ${where}
+     ORDER BY q.created_at DESC
+     LIMIT 500`,
+    params
+  );
+  res.json({ quotations: result.rows });
+}));
+
+app.get("/quotations/complaint/:complaintId", asyncRoute(async (req, res) => {
+  await ensureQuotationsSchema();
+  const complaintId = await resolveComplaintId(req.params.complaintId);
+  if (!complaintId) {
+    return res.status(404).json({ error: "Complaint not found." });
+  }
+  const result = await query(
+    `SELECT
+       q.*,
+       c.complaint_no,
+       c.customer_id,
+       COALESCE(c.product_name, p.name) AS product_name,
+       tech.name AS technician_name
+     FROM quotations q
+     LEFT JOIN complaints c ON c.id = q.complaint_id
+     LEFT JOIN warranties w ON w.id = c.warranty_id
+     LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN serial_numbers s ON s.id = w.serial_id
+     LEFT JOIN technicians tech ON tech.id = q.technician_id
+     WHERE q.complaint_id = ?
+     ORDER BY q.created_at DESC
+     LIMIT 20`,
+    [complaintId]
+  );
+  res.json({ quotations: result.rows });
+}));
+
+app.get("/quotations/customer/:customerId", asyncRoute(async (req, res) => {
+  await ensureQuotationsSchema();
+  const customerId = cleanString(req.params.customerId);
+  const result = await query(
+    `SELECT
+       q.*,
+       c.complaint_no,
+       COALESCE(c.product_name, p.name) AS product_name,
+       COALESCE(c.model_no, p.model_no) AS model_no,
+       s.serial_no,
+       tech.name AS technician_name
+     FROM quotations q
+     INNER JOIN complaints c ON c.id = q.complaint_id
+     LEFT JOIN warranties w ON w.id = c.warranty_id
+     LEFT JOIN serial_numbers s ON s.id = w.serial_id
+     LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN technicians tech ON tech.id = q.technician_id
+     WHERE c.customer_id = ?
+     ORDER BY q.created_at DESC
+     LIMIT 100`,
+    [customerId]
+  );
+  res.json({ quotations: result.rows });
+}));
+
+app.post("/quotations", asyncRoute(async (req, res) => {
+  await ensureQuotationsSchema();
+  const complaintId = await resolveComplaintId(req.body.complaintId || req.body.complaint_id);
+  const technicianId = cleanString(req.body.technicianId || req.body.technician_id);
+  const sparePartAmount = Number(req.body.sparePartAmount ?? req.body.spare_part_amount ?? 0);
+  const serviceCharge = Number(req.body.serviceCharge ?? req.body.service_charge ?? 0);
+  const visitCharge = Number(req.body.visitCharge ?? req.body.visit_charge ?? 0);
+  const taxAmount = Number(req.body.taxAmount ?? req.body.tax_amount ?? 0);
+  const discountAmount = Number(req.body.discountAmount ?? req.body.discount_amount ?? 0);
+  const technicianRemarks = cleanString(req.body.technicianRemarks || req.body.technician_remarks) || null;
+
+  if (!complaintId || !technicianId) {
+    return res.status(400).json({ error: "complaintId and technicianId are required." });
+  }
+
+  const complaint = await loadComplaintForQuotation(complaintId);
+  if (!complaint) {
+    return res.status(404).json({ error: "Complaint not found." });
+  }
+  if (!isWarrantyExpiredStatus(complaint.warranty_status, complaint.warranty_expiry)) {
+    return res.status(400).json({
+      error: "Quotation is required only when product warranty is expired. Active warranty repairs do not need a paid quotation.",
+    });
+  }
+
+  const task = await query(
+    `SELECT id FROM tasks
+     WHERE complaint_id = ? AND technician_id = ?
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [complaintId, technicianId]
+  );
+  if (!task.rowCount) {
+    return res.status(403).json({ error: "This complaint is not assigned to you." });
+  }
+
+  const pending = await query(
+    `SELECT id FROM quotations
+     WHERE complaint_id = ? AND status IN ('Pending Customer Approval', 'Pending Admin Approval')
+     LIMIT 1`,
+    [complaintId]
+  );
+  if (pending.rowCount) {
+    return res.status(409).json({ error: "A quotation is already waiting for approval on this complaint." });
+  }
+
+  const totalAmount = calcQuotationTotal({
+    sparePartAmount,
+    serviceCharge,
+    visitCharge,
+    taxAmount,
+    discountAmount
+  });
+  if (totalAmount <= 0) {
+    return res.status(400).json({ error: "Quotation total must be greater than zero." });
+  }
+
+  const quotationNo = await getNextQuotationNo();
+  await query(
+    `INSERT INTO quotations
+     (quotation_no, complaint_id, technician_id, spare_part_amount, service_charge, visit_charge, tax_amount, discount_amount, total_amount, technician_remarks, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending Customer Approval')`,
+    [
+      quotationNo,
+      complaintId,
+      technicianId,
+      sparePartAmount,
+      serviceCharge,
+      visitCharge,
+      taxAmount,
+      discountAmount,
+      totalAmount,
+      technicianRemarks
+    ]
+  );
+
+  await query("UPDATE complaints SET status = ? WHERE id = ?", ["Quotation Pending", complaintId]);
+
+  const saved = await fetchQuotationById(
+    (await query("SELECT id FROM quotations WHERE quotation_no = ? LIMIT 1", [quotationNo])).rows[0]?.id
+  );
+  res.status(201).json({ quotation: saved });
+}));
+
+app.patch("/quotations/:id/customer-decision", asyncRoute(async (req, res) => {
+  await ensureQuotationsSchema();
+  const quotationId = cleanString(req.params.id);
+  const customerId = cleanString(req.body.customerId || req.body.customer_id);
+  const decision = cleanString(req.body.decision);
+  const customerRemarks = cleanString(req.body.customerRemarks || req.body.customer_remarks) || null;
+
+  if (!quotationId || !customerId) {
+    return res.status(400).json({ error: "Quotation id and customerId are required." });
+  }
+  if (!["Accepted", "Rejected"].includes(decision)) {
+    return res.status(400).json({ error: "decision must be Accepted or Rejected." });
+  }
+
+  const row = await fetchQuotationById(quotationId);
+  if (!row) {
+    return res.status(404).json({ error: "Quotation not found." });
+  }
+  if (String(row.customer_id) !== customerId) {
+    return res.status(403).json({ error: "This quotation does not belong to your account." });
+  }
+  if (row.status !== "Pending Customer Approval") {
+    return res.status(400).json({ error: "This quotation is no longer waiting for your decision." });
+  }
+
+  const nextStatus = decision === "Accepted" ? "Accepted by Customer" : "Rejected by Customer";
+  const nextComplaintStatus = decision === "Accepted" ? "Paid Repair Approved" : "Quotation Rejected";
+
+  await withTransaction(async (tx) => {
+    await tx(
+      `UPDATE quotations
+       SET status = ?, customer_remarks = ?, customer_decided_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [nextStatus, customerRemarks, quotationId]
+    );
+    if (row.complaint_id) {
+      await tx("UPDATE complaints SET status = ? WHERE id = ?", [nextComplaintStatus, row.complaint_id]);
+    }
+  });
+
+  const updated = await fetchQuotationById(quotationId);
+  res.json({ quotation: updated });
+}));
+
+app.patch("/quotations/:id/admin-decision", asyncRoute(async (req, res) => {
+  await ensureQuotationsSchema();
+  const quotationId = cleanString(req.params.id);
+  const decision = cleanString(req.body.decision);
+  const remarks = cleanString(req.body.remarks) || null;
+
+  if (!quotationId) {
+    return res.status(400).json({ error: "Quotation id is required." });
+  }
+  if (!["Approved", "Rejected"].includes(decision)) {
+    return res.status(400).json({ error: "decision must be Approved or Rejected." });
+  }
+
+  const row = await fetchQuotationById(quotationId);
+  if (!row) {
+    return res.status(404).json({ error: "Quotation not found." });
+  }
+  if (row.status !== "Pending Admin Approval") {
+    return res.status(400).json({ error: "Quotation is not pending admin approval." });
+  }
+
+  const nextStatus = decision === "Approved" ? "Pending Customer Approval" : "Rejected by Admin";
+  await query("UPDATE quotations SET status = ?, technician_remarks = COALESCE(?, technician_remarks) WHERE id = ?", [
+    nextStatus,
+    remarks,
+    quotationId
+  ]);
+  if (row.complaint_id && decision === "Approved") {
+    await query("UPDATE complaints SET status = ? WHERE id = ?", ["Quotation Pending", row.complaint_id]);
+  }
+  const updated = await fetchQuotationById(quotationId);
+  res.json({ quotation: updated });
+}));
+
 app.get("/dealers/:id/dashboard", asyncRoute(async (req, res) => {
   const dealerKey = cleanString(req.params.id);
   if (!dealerKey) {
@@ -1733,6 +2281,129 @@ app.delete("/dealers/:id", asyncRoute(async (req, res) => {
 app.get("/products", asyncRoute(async (_req, res) => {
   const result = await query("SELECT * FROM products ORDER BY created_at DESC LIMIT 800");
   res.json({ products: result.rows });
+}));
+
+app.get("/products/print-sticker", asyncRoute(async (req, res) => {
+  const productId = cleanString(req.query.productId || req.query.product_id);
+  if (!productId) {
+    return res.status(400).json({ error: "productId is required." });
+  }
+  const result = await query("SELECT * FROM products WHERE id = ? LIMIT 1", [productId]);
+  if (!result.rowCount) {
+    return res.status(404).json({ error: "Product not found." });
+  }
+  const product = result.rows[0];
+  if (product.qr_status !== "Printed") {
+    return res.status(400).send("Generate product QR before printing.");
+  }
+  const payload = product.qr_payload || productQrPayload(product);
+  const qrUrl = `/products/${encodeURIComponent(productId)}/qr.svg?download=1`;
+  const card = `
+    <section class="label">
+      ${qrSvg(payload, 180)}
+      <div class="brand">Hitaishi CRM</div>
+      <div class="product">${escapeHtml(product.name)}</div>
+      <div class="model">${escapeHtml(product.model_no)}</div>
+      <div class="meta">${escapeHtml(product.category || "Product")} · ${Number(product.warranty_months || 12)} months warranty</div>
+      <a class="download" href="${qrUrl}">Download QR</a>
+    </section>`;
+  res.type("html").send(`<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Hitaishi Product QR</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 16px; color: #111827; }
+    .toolbar { margin-bottom: 16px; }
+    .sheet { display: flex; justify-content: center; }
+    .label { border: 1px solid #111827; border-radius: 8px; padding: 14px; text-align: center; max-width: 260px; }
+    .brand { font-weight: 700; margin-top: 6px; }
+    .product { font-size: 18px; font-weight: 800; margin-top: 4px; }
+    .model { font-size: 15px; margin-top: 2px; }
+    .meta { font-size: 12px; color: #4b5563; margin-top: 4px; }
+    .download { display: inline-block; margin-top: 8px; color: #0f3f6b; font-size: 12px; }
+    @media print { .toolbar, .download { display: none; } body { margin: 0; } }
+  </style>
+</head>
+<body>
+  <div class="toolbar"><button onclick="window.print()">Print Product QR</button></div>
+  <main class="sheet">${card}</main>
+</body>
+</html>`);
+}));
+
+app.post("/products/:productId/generate-qr", asyncRoute(async (req, res) => {
+  const productId = cleanString(req.params.productId);
+  const result = await query("SELECT * FROM products WHERE id = ? LIMIT 1", [productId]);
+  if (!result.rowCount) {
+    return res.status(404).json({ error: "Product not found." });
+  }
+  const product = result.rows[0];
+  if (Number(product.qr_locked) === 1 || await productHasActiveWarranty(productId)) {
+    return res.status(409).json({
+      error: "Warranty is already active for this product. New QR cannot be created.",
+    });
+  }
+  if (product.qr_status === "Printed") {
+    return res.status(409).json({
+      error: "This product already has a QR code. Use Print to reprint the same sticker.",
+    });
+  }
+  const payload = productQrPayload(product);
+  await query(
+    `UPDATE products
+     SET qr_status = 'Printed',
+         qr_payload = ?,
+         qr_printed_at = COALESCE(qr_printed_at, NOW())
+     WHERE id = ?`,
+    [payload, productId]
+  );
+  const updated = await query("SELECT * FROM products WHERE id = ? LIMIT 1", [productId]);
+  res.json({
+    ok: true,
+    product: updated.rows[0],
+    message: "Product QR generated. You can print the sticker now.",
+  });
+}));
+
+app.get("/products/:productId/qr.svg", asyncRoute(async (req, res) => {
+  const productId = cleanString(req.params.productId);
+  const result = await query("SELECT id, name, model_no, qr_status, qr_payload FROM products WHERE id = ? LIMIT 1", [productId]);
+  if (!result.rowCount) {
+    return res.status(404).send("Product not found.");
+  }
+  const product = result.rows[0];
+  if (product.qr_status !== "Printed") {
+    return res.status(400).send("Product QR is not generated yet.");
+  }
+  const payload = product.qr_payload || productQrPayload(product);
+  if (cleanString(req.query.download)) {
+    res.setHeader("Content-Disposition", `attachment; filename="${product.model_no || product.id}-product-qr.svg"`);
+  }
+  res.type("image/svg+xml").send(qrSvg(payload, 220));
+}));
+
+app.get("/products/:productId/scan", asyncRoute(async (req, res) => {
+  const productId = cleanString(req.params.productId);
+  const result = await query("SELECT * FROM products WHERE id = ? LIMIT 1", [productId]);
+  if (!result.rowCount) {
+    return res.status(404).json({ error: "Product not found." });
+  }
+  const product = result.rows[0];
+  if (product.qr_status !== "Printed") {
+    return res.status(400).json({ error: "Product QR is not generated yet." });
+  }
+  res.json({
+    product: {
+      id: product.id,
+      name: product.name,
+      model_no: product.model_no,
+      category: product.category,
+      warranty_months: product.warranty_months,
+      qr_status: product.qr_status,
+      qr_locked: product.qr_locked,
+    },
+  });
 }));
 
 app.post("/products", asyncRoute(async (req, res) => {
@@ -2069,8 +2740,24 @@ async function activateWarrantyFromSerial({ customerId, serialNo, purchaseDate, 
   }
 
   const row = serial.rows[0];
-  if (row.qr_status !== "Printed") {
-    const err = new Error("QR is not generated/printed for this serial yet.");
+  if (!row.product_id) {
+    const err = new Error("Serial is not linked to a product. Contact dispatch.");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const productRow = await query(
+    "SELECT id, name, model_no, qr_status, qr_locked, qr_payload FROM products WHERE id = ? LIMIT 1",
+    [row.product_id]
+  );
+  if (!productRow.rowCount) {
+    const err = new Error("Product not found for this serial.");
+    err.statusCode = 404;
+    throw err;
+  }
+  const product = productRow.rows[0];
+  if (product.qr_status !== "Printed") {
+    const err = new Error("Product QR is not generated yet. Ask admin to print product QR sticker.");
     err.statusCode = 400;
     throw err;
   }
@@ -2131,6 +2818,8 @@ async function activateWarrantyFromSerial({ customerId, serialNo, purchaseDate, 
     await query("UPDATE serial_numbers SET dealer_id = ? WHERE id = ?", [actingDealerId, row.id]);
   }
 
+  await lockProductQrAfterWarrantyActivation(row.product_id);
+
   const warranty = await query(
     `SELECT
        w.*,
@@ -2156,9 +2845,27 @@ async function activateWarrantyFromSerial({ customerId, serialNo, purchaseDate, 
 
 app.post("/warranties/activate-from-qr", asyncRoute(async (req, res) => {
   const customerId = cleanString(req.body.customerId || req.body.customer_id);
-  const serialNo = serialFromPayload(req.body.serialNo || req.body.serial_no || req.body.qr || req.body.qrPayload);
+  const serialNo = serialFromPayload(req.body.serialNo || req.body.serial_no);
+  const scannedProduct = productFromPayload(req.body.qr || req.body.qrPayload || req.body.productQr);
+  const productId = cleanString(req.body.productId || req.body.product_id || scannedProduct.productId);
   const purchaseDate = cleanDate(req.body.purchaseDate || req.body.purchase_date) || new Date().toISOString().slice(0, 10);
   const invoiceNo = cleanString(req.body.invoiceNo || req.body.invoice_no);
+
+  if (!serialNo) {
+    return res.status(400).json({ error: "Serial number is required after scanning product QR." });
+  }
+  if (productId) {
+    const serialCheck = await query(
+      "SELECT product_id FROM serial_numbers WHERE LOWER(TRIM(serial_no)) = LOWER(TRIM(?)) LIMIT 1",
+      [serialNo]
+    );
+    if (!serialCheck.rowCount) {
+      return res.status(404).json({ error: "Serial number not found." });
+    }
+    if (String(serialCheck.rows[0].product_id || "") !== String(productId)) {
+      return res.status(400).json({ error: "This serial number does not belong to the scanned product." });
+    }
+  }
 
   const warranty = await activateWarrantyFromSerial({
     customerId,
@@ -2173,7 +2880,9 @@ app.post("/warranties/activate-from-qr", asyncRoute(async (req, res) => {
 /** Dealer scans QR and registers customer details to activate warranty. */
 app.post("/warranties/dealer/activate-from-qr", asyncRoute(async (req, res) => {
   const dealerId = cleanString(req.body.dealerId || req.body.dealer_id);
-  const serialNo = serialFromPayload(req.body.serialNo || req.body.serial_no || req.body.qr || req.body.qrPayload);
+  const serialNo = serialFromPayload(req.body.serialNo || req.body.serial_no);
+  const scannedProduct = productFromPayload(req.body.qr || req.body.qrPayload || req.body.productQr);
+  const productId = cleanString(req.body.productId || req.body.product_id || scannedProduct.productId);
   const purchaseDate = cleanDate(req.body.purchaseDate || req.body.purchase_date) || new Date().toISOString().slice(0, 10);
   const invoiceNo = cleanString(req.body.invoiceNo || req.body.invoice_no);
   const { name, mobile, email, address, city, state, pincode } = req.body;
@@ -2184,6 +2893,22 @@ app.post("/warranties/dealer/activate-from-qr", asyncRoute(async (req, res) => {
   const dealer = await query("SELECT id FROM dealers WHERE id = ? LIMIT 1", [dealerId]);
   if (!dealer.rowCount) {
     return res.status(404).json({ error: "Dealer not found." });
+  }
+
+  if (!serialNo) {
+    return res.status(400).json({ error: "Serial number is required after scanning product QR." });
+  }
+  if (productId) {
+    const serialCheck = await query(
+      "SELECT product_id FROM serial_numbers WHERE LOWER(TRIM(serial_no)) = LOWER(TRIM(?)) LIMIT 1",
+      [serialNo]
+    );
+    if (!serialCheck.rowCount) {
+      return res.status(404).json({ error: "Serial number not found." });
+    }
+    if (String(serialCheck.rows[0].product_id || "") !== String(productId)) {
+      return res.status(400).json({ error: "This serial number does not belong to the scanned product." });
+    }
   }
 
   const customer = await findOrCreateCustomer({ name, mobile, email, address, city, state, pincode });
@@ -2229,7 +2954,25 @@ app.get("/complaints", asyncRoute(async (_req, res) => {
 }));
 
 /** Serial inventory for dispatch/dealer tooling */
-app.get("/serial-numbers", asyncRoute(async (_req, res) => {
+app.get("/serial-numbers", asyncRoute(async (req, res) => {
+  const productId = cleanString(req.query.productId || req.query.product_id);
+  const modelNo = cleanString(req.query.modelNo || req.query.model_no);
+  const qrStatus = cleanString(req.query.qrStatus || req.query.qr_status);
+  const where = [];
+  const params = [];
+  if (productId) {
+    where.push("s.product_id = ?");
+    params.push(productId);
+  }
+  if (modelNo) {
+    where.push("LOWER(TRIM(p.model_no)) = LOWER(?)");
+    params.push(modelNo);
+  }
+  if (qrStatus && ["Printed", "Not Printed"].includes(qrStatus)) {
+    where.push("s.qr_status = ?");
+    params.push(qrStatus);
+  }
+  const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
   const result = await query(
     `SELECT
        s.*,
@@ -2247,8 +2990,10 @@ app.get("/serial-numbers", asyncRoute(async (_req, res) => {
      FROM serial_numbers s
      LEFT JOIN products p ON p.id = s.product_id
      LEFT JOIN dealers d ON d.id = s.dealer_id
+     ${whereSql}
      ORDER BY s.created_at DESC
-     LIMIT 800`
+     LIMIT 800`,
+    params
   );
   res.json({ serials: result.rows });
 }));
@@ -2270,21 +3015,12 @@ app.post("/serial-numbers", asyncRoute(async (req, res) => {
     return res.status(400).json({ error: "Serial number must be 120 characters or less." });
   }
 
+  const productName = cleanString(req.body.productName || req.body.product_name || req.body.name);
   let product = null;
-  if (productId) {
-    const result = await query("SELECT id FROM products WHERE id = ? LIMIT 1", [productId]);
-    product = result.rows[0] || null;
-  } else if (modelNo) {
-    const result = await query("SELECT id FROM products WHERE LOWER(TRIM(model_no)) = LOWER(?) LIMIT 1", [modelNo]);
-    product = result.rows[0] || null;
-    if (!product) {
-      await query(
-        "INSERT INTO products (name, model_no, category, warranty_months) VALUES (?, ?, ?, ?)",
-        [`Product ${modelNo}`, modelNo, "General", 12]
-      );
-      const created = await query("SELECT id FROM products WHERE LOWER(TRIM(model_no)) = LOWER(?) LIMIT 1", [modelNo]);
-      product = created.rows[0] || null;
-    }
+  if (productId || productName || modelNo) {
+    product = await resolveProductFromMaster({ productId, productName, modelNo });
+  } else {
+    return res.status(400).json({ error: "Select a product from Product Master before saving serial." });
   }
 
   let dealer = null;
@@ -2305,7 +3041,7 @@ app.post("/serial-numbers", asyncRoute(async (req, res) => {
   await query(
     `INSERT INTO serial_numbers
        (product_id, dealer_id, serial_no, invoice_no, challan_no, batch_no, dispatch_date, qr_status, qr_payload, qr_printed_at, dispatch_status, dispatched_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'Printed', ?, NOW(), ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'Not Printed', ?, NULL, ?, ?)`,
     [
       product?.id || null,
       dealer?.id || null,
@@ -2390,7 +3126,7 @@ app.post("/serial-numbers/bulk", asyncRoute(async (req, res) => {
     const row = rows[index] || {};
     const serialNo = cleanSerialNo(pickRowValue(row, ["serial", "serialno", "serial_no", "serial number"]));
     const modelNo = cleanString(pickRowValue(row, ["model", "modelno", "model_no", "model number"]));
-    const productName = cleanString(pickRowValue(row, ["product", "productname", "product_name", "product name"])) || (modelNo ? `Product ${modelNo}` : "");
+    const productName = cleanString(pickRowValue(row, ["product", "productname", "product_name", "product name"]));
     const dealerNo = cleanString(pickRowValue(row, ["dealer", "dealerno", "dealer_no", "dealer number"]));
     const invoiceNo = cleanString(pickRowValue(row, ["invoice", "invoiceno", "invoice_no", "invoice number"])) || null;
     const challanNo = cleanString(pickRowValue(row, ["challan", "challanno", "challan_no", "challan number"])) || null;
@@ -2411,18 +3147,19 @@ app.post("/serial-numbers/bulk", asyncRoute(async (req, res) => {
         continue;
       }
 
-      let product = null;
-      if (modelNo) {
-        const productResult = await query("SELECT id FROM products WHERE LOWER(TRIM(model_no)) = LOWER(?) LIMIT 1", [modelNo]);
-        product = productResult.rows[0] || null;
-        if (!product) {
-          await query(
-            "INSERT INTO products (name, model_no, category, warranty_months) VALUES (?, ?, ?, ?)",
-            [productName || `Product ${modelNo}`, modelNo, "General", 12]
-          );
-          const created = await query("SELECT id FROM products WHERE LOWER(TRIM(model_no)) = LOWER(?) LIMIT 1", [modelNo]);
-          product = created.rows[0] || null;
-        }
+      if (!productName && !modelNo) {
+        summary.failed += 1;
+        errors.push({ row: index + 2, serial: serialNo, error: "Product name (admin) or model required from Product Master." });
+        continue;
+      }
+
+      let product;
+      try {
+        product = await resolveProductFromMaster({ productName, modelNo });
+      } catch (error) {
+        summary.failed += 1;
+        errors.push({ row: index + 2, serial: serialNo, error: error.message || "Product not in Product Master." });
+        continue;
       }
 
       let dealer = null;
@@ -2439,7 +3176,7 @@ app.post("/serial-numbers/bulk", asyncRoute(async (req, res) => {
       await query(
         `INSERT INTO serial_numbers
          (product_id, dealer_id, serial_no, invoice_no, challan_no, batch_no, dispatch_date, qr_status, qr_payload, qr_printed_at, dispatch_status, dispatched_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'Printed', ?, NOW(), ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'Not Printed', ?, NULL, ?, ?)`,
         [
           product?.id || null,
           dealer?.id || null,
@@ -2468,9 +3205,27 @@ app.get("/serial-numbers/print-stickers", asyncRoute(async (req, res) => {
     .split(",")
     .map(cleanSerialNo)
     .filter(Boolean);
-  const where = requested.length
-    ? `WHERE s.serial_no IN (${requested.map(() => "?").join(",")})`
-    : "WHERE s.qr_status = 'Printed'";
+  const productId = cleanString(req.query.productId || req.query.product_id);
+  const modelNo = cleanString(req.query.modelNo || req.query.model_no);
+  const clauses = [];
+  const params = [];
+  if (requested.length) {
+    clauses.push(`s.serial_no IN (${requested.map(() => "?").join(",")})`);
+    params.push(...requested);
+  } else {
+    if (productId) {
+      clauses.push("s.product_id = ?");
+      params.push(productId);
+    }
+    if (modelNo) {
+      clauses.push("LOWER(TRIM(p.model_no)) = LOWER(?)");
+      params.push(modelNo);
+    }
+    if (!productId && !modelNo) {
+      clauses.push("s.qr_status = 'Printed'");
+    }
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
   const result = await query(
     `SELECT s.*, p.name AS product_name, p.model_no, d.dealer_no, d.name AS dealer_name
      FROM serial_numbers s
@@ -2479,7 +3234,7 @@ app.get("/serial-numbers/print-stickers", asyncRoute(async (req, res) => {
      ${where}
      ORDER BY s.created_at DESC
      LIMIT 300`,
-    requested
+    params
   );
 
   const cards = result.rows.map((serial) => {
@@ -2540,6 +3295,8 @@ const TASK_DETAIL_SELECT = `
        t.work_type,
        t.due_at,
        t.status,
+       t.completed_at,
+       t.resolution_notes,
        t.payable_amount,
        t.created_at,
        c.id AS complaint_db_id,
@@ -2628,10 +3385,12 @@ app.get("/tasks/:id", asyncRoute(async (req, res) => {
 }));
 
 app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
+  await ensureTasksSchema();
   const id = cleanString(req.params.id);
   const status = cleanString(req.body?.status);
   const dueAt = cleanString(req.body?.dueAt || req.body?.due_at) || null;
   const technicianId = cleanString(req.body?.technicianId || req.body?.technician_id);
+  const resolutionNotes = cleanString(req.body?.resolutionNotes || req.body?.resolution_notes) || null;
   if (!id || !status) {
     return res.status(400).json({ error: "Task id and status are required." });
   }
@@ -2668,6 +3427,13 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
   await withTransaction(async (tx) => {
     if (dueAt && (status === "Rescheduled" || status === "Scheduled")) {
       await tx("UPDATE tasks SET status = ?, due_at = ? WHERE id = ?", [status, dueAt, id]);
+    } else if (status === "Completed") {
+      await tx(
+        "UPDATE tasks SET status = ?, completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP), resolution_notes = COALESCE(?, resolution_notes) WHERE id = ?",
+        [status, resolutionNotes, id]
+      );
+    } else if (resolutionNotes) {
+      await tx("UPDATE tasks SET status = ?, resolution_notes = ? WHERE id = ?", [status, resolutionNotes, id]);
     } else {
       await tx("UPDATE tasks SET status = ? WHERE id = ?", [status, id]);
     }
@@ -2804,6 +3570,8 @@ app.get("/serial-numbers/:serialNo", asyncRoute(async (req, res) => {
        p.model_no,
        p.category,
        p.warranty_months,
+       p.qr_status AS product_qr_status,
+       p.qr_locked AS product_qr_locked,
        d.dealer_no,
        d.name AS dealer_name,
        d.mobile AS dealer_mobile,
@@ -2855,15 +3623,15 @@ app.patch("/serial-numbers/:serialNo", asyncRoute(async (req, res) => {
     }
   }
 
+  const patchProductId = cleanString(req.body.productId || req.body.product_id);
+  const patchProductName = cleanString(req.body.productName || req.body.product_name);
   let product = null;
-  if (modelNo) {
-    const productResult = await query("SELECT id FROM products WHERE LOWER(TRIM(model_no)) = LOWER(?) LIMIT 1", [modelNo]);
-    product = productResult.rows[0] || null;
-    if (!product) {
-      await query("INSERT INTO products (name, model_no, category, warranty_months) VALUES (?, ?, ?, ?)", [`Product ${modelNo}`, modelNo, "General", 12]);
-      const created = await query("SELECT id FROM products WHERE LOWER(TRIM(model_no)) = LOWER(?) LIMIT 1", [modelNo]);
-      product = created.rows[0] || null;
-    }
+  if (patchProductId || patchProductName || modelNo) {
+    product = await resolveProductFromMaster({
+      productId: patchProductId,
+      productName: patchProductName,
+      modelNo,
+    });
   }
 
   let dealer = null;
@@ -2971,6 +3739,7 @@ app.post("/dispatch-mapping", asyncRoute(async (req, res) => {
 
 app.get("/complaints/customer/:customerId", asyncRoute(async (req, res) => {
   await ensureFeedbackSchema();
+  await ensureQuotationsSchema();
   const result = await query(
     `SELECT
        c.*,
@@ -2984,7 +3753,8 @@ app.get("/complaints/customer/:customerId", asyncRoute(async (req, res) => {
        COALESCE(c.model_no, p.model_no) AS model_no,
        d.dealer_no,
        d.name AS dealer_name,
-       ${COMPLAINT_LATEST_TASK_FIELDS}
+       ${COMPLAINT_LATEST_TASK_FIELDS},
+       ${COMPLAINT_LATEST_QUOTATION_FIELDS}
      FROM complaints c
      LEFT JOIN warranties w ON w.id = c.warranty_id
      LEFT JOIN serial_numbers s ON s.id = w.serial_id
@@ -2992,6 +3762,7 @@ app.get("/complaints/customer/:customerId", asyncRoute(async (req, res) => {
      LEFT JOIN dealers d ON d.id = COALESCE(w.dealer_id, s.dealer_id)
      ${COMPLAINT_LATEST_TASK_JOIN}
      ${COMPLAINT_FEEDBACK_JOIN}
+     ${COMPLAINT_LATEST_QUOTATION_JOIN}
      WHERE c.customer_id = ?
      ORDER BY c.created_at DESC`,
     [req.params.customerId]
@@ -3350,8 +4121,11 @@ app.use((error, _req, res, _next) => {
 
 try {
   await ensureSerialNumbersSchema();
+  await ensureProductsQrSchema();
   await ensureComplaintsSchema();
   await ensureFeedbackSchema();
+  await ensureTasksSchema();
+  await ensureQuotationsSchema();
 } catch (error) {
   console.warn("Runtime schema check skipped:", error?.message || error);
 }

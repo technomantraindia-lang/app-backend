@@ -58,6 +58,10 @@ CREATE TABLE IF NOT EXISTS products (
   model_no VARCHAR(120) NOT NULL,
   category VARCHAR(120),
   warranty_months INT NOT NULL DEFAULT 12,
+  qr_status VARCHAR(40) NOT NULL DEFAULT 'Not Printed',
+  qr_payload VARCHAR(255),
+  qr_printed_at TIMESTAMP NULL,
+  qr_locked TINYINT(1) NOT NULL DEFAULT 0,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -157,6 +161,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   work_type VARCHAR(120) NOT NULL,
   due_at TIMESTAMP NULL,
   status VARCHAR(40) NOT NULL DEFAULT 'Assigned',
+  completed_at TIMESTAMP NULL,
+  resolution_notes TEXT,
   payable_amount DECIMAL(10, 2) DEFAULT 0,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   INDEX idx_tasks_technician_id (technician_id),
@@ -175,7 +181,10 @@ CREATE TABLE IF NOT EXISTS quotations (
   tax_amount DECIMAL(10, 2) DEFAULT 0,
   discount_amount DECIMAL(10, 2) DEFAULT 0,
   total_amount DECIMAL(10, 2) DEFAULT 0,
-  status VARCHAR(60) NOT NULL DEFAULT 'Pending Admin Approval',
+  technician_remarks TEXT,
+  customer_remarks TEXT,
+  customer_decided_at TIMESTAMP NULL,
+  status VARCHAR(60) NOT NULL DEFAULT 'Pending Customer Approval',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT fk_quotations_complaint FOREIGN KEY (complaint_id) REFERENCES complaints(id) ON DELETE CASCADE,
   CONSTRAINT fk_quotations_technician FOREIGN KEY (technician_id) REFERENCES technicians(id) ON DELETE SET NULL
