@@ -898,11 +898,20 @@ app.post("/accounts", asyncRoute(async (req, res) => {
   }
 
   let creatorDealerId = null;
-  if (cleanCreatedByRole === "Dealer") {
+  const linkToDealerRole = cleanRole === "Customer" || cleanRole === "Technician";
+  if (cleanCreatedByRole === "Dealer" && linkToDealerRole) {
     const dealerProfile = await resolveDealerRecord(cleanString(dealerId));
     if (!dealerProfile) {
       return res.status(400).json({
         error: "Dealer profile is required. Link your login mobile with Dealer Management in Admin.",
+      });
+    }
+    creatorDealerId = dealerProfile.id;
+  } else if (cleanCreatedByRole === "Admin" && linkToDealerRole) {
+    const dealerProfile = await resolveDealerRecord(cleanString(dealerId));
+    if (!dealerProfile) {
+      return res.status(400).json({
+        error: "Select a dealer. This account will show in that dealer's customer or technician list.",
       });
     }
     creatorDealerId = dealerProfile.id;
