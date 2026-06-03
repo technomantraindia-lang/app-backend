@@ -885,6 +885,93 @@ app.get("/customers", asyncRoute(async (_req, res) => {
   res.json({ customers: result.rows });
 }));
 
+app.get("/customers/by-mobile/:mobile", asyncRoute(async (req, res) => {
+  const cleanMobile = normalizeMobileValue(req.params.mobile);
+  if (cleanMobile.length < 10) {
+    return res.status(400).json({ error: "Enter a valid 10-digit mobile number." });
+  }
+
+  await syncCustomerProfilesFromUsers();
+
+  const result = await query(
+    `SELECT
+       c.id,
+       c.user_id,
+       c.name,
+       c.mobile,
+       c.address,
+       c.city,
+       c.state,
+       c.pincode,
+       c.created_at,
+       u.email,
+       COALESCE(u.status, 'Active') AS user_status,
+       (u.password_hash IS NOT NULL AND TRIM(u.password_hash) <> '') AS has_login_account
+     FROM customers c
+     LEFT JOIN users u ON u.id = c.user_id
+     WHERE ${sqlNormalizeMobileColumn("c.mobile")} = ?
+     LIMIT 1`,
+    [cleanMobile]
+  );
+
+  if (!result.rowCount) {
+    return res.status(404).json({ error: "No customer found for this mobile number." });
+  }
+
+  const customer = result.rows[0];
+
+  const dealerResult = await query(
+    `SELECT
+       d.id AS dealer_id,
+       d.dealer_no,
+       d.name AS dealer_name,
+       d.city AS dealer_city,
+       w.created_at AS registered_at
+     FROM warranties w
+     INNER JOIN dealers d ON d.id = w.dealer_id
+     WHERE w.customer_id = ?
+     ORDER BY w.created_at ASC
+     LIMIT 1`,
+    [customer.id]
+  );
+
+  const warrantyCount = await query("SELECT COUNT(*) AS total FROM warranties WHERE customer_id = ?", [customer.id]);
+  const complaintCount = await query("SELECT COUNT(*) AS total FROM complaints WHERE customer_id = ?", [customer.id]);
+
+  const registrationDealer = dealerResult.rows[0] || null;
+  const hasLoginAccount = Boolean(customer.has_login_account);
+
+  let accountSource = null;
+  if (registrationDealer && hasLoginAccount) {
+    accountSource = "dealer_and_login";
+  } else if (registrationDealer) {
+    accountSource = "dealer_warranty";
+  } else if (hasLoginAccount) {
+    accountSource = "login_only";
+  }
+
+  res.json({
+    customer: {
+      id: customer.id,
+      user_id: customer.user_id,
+      name: customer.name,
+      mobile: customer.mobile,
+      email: customer.email || null,
+      address: customer.address,
+      city: customer.city,
+      state: customer.state,
+      pincode: customer.pincode,
+      created_at: customer.created_at,
+      user_status: customer.user_status
+    },
+    hasLoginAccount,
+    registrationDealer,
+    accountSource,
+    warranties: Number(warrantyCount.rows[0]?.total || 0),
+    complaints: Number(complaintCount.rows[0]?.total || 0)
+  });
+}));
+
 app.post("/technicians", asyncRoute(async (req, res) => {
   const { name, mobile, email, password, city, serviceAreas } = req.body;
   if (!name || !mobile) {
