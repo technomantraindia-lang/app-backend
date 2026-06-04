@@ -473,7 +473,7 @@ async function getComplaintNotifyContext(complaintId, runQuery = query) {
      LEFT JOIN warranties w ON w.id = c.warranty_id
      LEFT JOIN serial_numbers s ON s.id = w.serial_id
      LEFT JOIN products p ON p.id = s.product_id
-     LEFT JOIN dealers d ON d.id = COALESCE(c.dealer_id, w.dealer_id, s.dealer_id)
+     LEFT JOIN dealers d ON d.id = COALESCE(w.dealer_id, s.dealer_id)
      LEFT JOIN users du ON du.role = 'Dealer' AND ${sqlNormalizeMobileColumn("du.mobile")} = ${sqlNormalizeMobileColumn("d.mobile")}
      LEFT JOIN tasks t ON t.complaint_id = c.id
      LEFT JOIN technicians tech ON tech.id = t.technician_id
@@ -3069,7 +3069,7 @@ app.get("/warranties/customer/:customerId", asyncRoute(async (req, res) => {
      FROM warranties w
      LEFT JOIN serial_numbers s ON s.id = w.serial_id
      LEFT JOIN products p ON p.id = s.product_id
-     LEFT JOIN dealers d ON d.id = COALESCE(c.dealer_id, w.dealer_id, s.dealer_id)
+     LEFT JOIN dealers d ON d.id = COALESCE(w.dealer_id, s.dealer_id)
      WHERE w.customer_id = ?
      ORDER BY w.created_at DESC`,
     [req.params.customerId]
@@ -3320,7 +3320,7 @@ async function activateWarrantyFromSerial({ customerId, serialNo, purchaseDate, 
      FROM warranties w
      LEFT JOIN serial_numbers s ON s.id = w.serial_id
      LEFT JOIN products p ON p.id = s.product_id
-     LEFT JOIN dealers d ON d.id = COALESCE(c.dealer_id, w.dealer_id, s.dealer_id)
+     LEFT JOIN dealers d ON d.id = COALESCE(w.dealer_id, s.dealer_id)
      LEFT JOIN customers cust ON cust.id = w.customer_id
      WHERE w.warranty_no = ?
      LIMIT 1`,
@@ -4371,6 +4371,7 @@ app.post("/dispatch-mapping", asyncRoute(async (req, res) => {
 }));
 
 app.get("/complaints/customer/:customerId", asyncRoute(async (req, res) => {
+  await ensureComplaintsSchema();
   await ensureFeedbackSchema();
   await ensureQuotationsSchema();
   const result = await query(
@@ -4392,7 +4393,7 @@ app.get("/complaints/customer/:customerId", asyncRoute(async (req, res) => {
      LEFT JOIN warranties w ON w.id = c.warranty_id
      LEFT JOIN serial_numbers s ON s.id = w.serial_id
      LEFT JOIN products p ON p.id = s.product_id
-     LEFT JOIN dealers d ON d.id = COALESCE(w.dealer_id, s.dealer_id)
+     LEFT JOIN dealers d ON d.id = COALESCE(c.dealer_id, w.dealer_id, s.dealer_id)
      ${COMPLAINT_LATEST_TASK_JOIN}
      ${COMPLAINT_FEEDBACK_JOIN}
      ${COMPLAINT_LATEST_QUOTATION_JOIN}
@@ -4404,6 +4405,7 @@ app.get("/complaints/customer/:customerId", asyncRoute(async (req, res) => {
 }));
 
 app.get("/complaints/dealer/:dealerId", asyncRoute(async (req, res) => {
+  await ensureComplaintsSchema();
   await ensureFeedbackSchema();
   const dealerKey = cleanString(req.params.dealerId);
   const dealer = await resolveDealerRecord(dealerKey);
