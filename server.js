@@ -2387,6 +2387,7 @@ app.get("/products/:productId/qr.svg", asyncRoute(async (req, res) => {
 
 app.get("/products/:productId/scan", asyncRoute(async (req, res) => {
   const productId = cleanString(req.params.productId);
+  const dealerId = cleanString(req.query.dealerId || req.query.dealer_id);
   const result = await query("SELECT * FROM products WHERE id = ? LIMIT 1", [productId]);
   if (!result.rowCount) {
     return res.status(404).json({ error: "Product not found." });
@@ -2395,6 +2396,41 @@ app.get("/products/:productId/scan", asyncRoute(async (req, res) => {
   if (product.qr_status !== "Printed") {
     return res.status(400).json({ error: "Product QR is not generated yet." });
   }
+  const serialWhere = dealerId
+    ? "s.product_id = ? AND (s.dealer_id = ? OR s.dealer_id IS NULL)"
+    : "s.product_id = ?";
+  const serialParams = dealerId ? [product.id, dealerId] : [product.id];
+  const serials = await query(
+    `SELECT
+       s.*,
+       p.name AS product_name,
+       p.model_no,
+       p.qr_status AS product_qr_status,
+       p.qr_locked AS product_qr_locked,
+       d.dealer_no,
+       d.name AS dealer_name,
+       COALESCE((
+         SELECT w.status
+         FROM warranties w
+         WHERE w.serial_id = s.id
+         ORDER BY w.created_at DESC
+         LIMIT 1
+       ), 'Pending') AS warranty_status,
+       (
+         SELECT w.warranty_no
+         FROM warranties w
+         WHERE w.serial_id = s.id
+         ORDER BY w.created_at DESC
+         LIMIT 1
+       ) AS warranty_no
+     FROM serial_numbers s
+     LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN dealers d ON d.id = s.dealer_id
+     WHERE ${serialWhere}
+     ORDER BY s.created_at DESC
+     LIMIT 100`,
+    serialParams
+  );
   res.json({
     product: {
       id: product.id,
@@ -2405,6 +2441,7 @@ app.get("/products/:productId/scan", asyncRoute(async (req, res) => {
       qr_status: product.qr_status,
       qr_locked: product.qr_locked,
     },
+    serials: serials.rows,
   });
 }));
 
