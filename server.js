@@ -2642,11 +2642,18 @@ app.get("/warranties/customer/:customerId", asyncRoute(async (req, res) => {
   res.json({ warranties: result.rows });
 }));
 
-async function findOrCreateCustomer({ name, mobile, email, address, city, state, pincode }) {
+async function findOrCreateCustomer({ name, mobile, email, address, city, state, pincode, password, createdByDealerId }) {
   const cleanName = cleanString(name);
   const cleanMobile = normalizeMobileValue(mobile);
+  const emailNorm = normalizeEmail(email);
+  const cleanPassword = typeof password === "string" ? password : "";
   if (!cleanName || cleanMobile.length < 10) {
     const err = new Error("Customer name and a valid 10-digit mobile number are required.");
+    err.statusCode = 400;
+    throw err;
+  }
+  if (cleanPassword && cleanPassword.length < 8) {
+    const err = new Error("Customer login password must be at least 8 characters.");
     err.statusCode = 400;
     throw err;
   }
@@ -2657,17 +2664,52 @@ async function findOrCreateCustomer({ name, mobile, email, address, city, state,
   );
   if (existing.rowCount) {
     const row = existing.rows[0];
+    let userId = row.user_id || null;
+    let user = userId
+      ? await query("SELECT * FROM users WHERE id = ? LIMIT 1", [userId])
+      : await query("SELECT * FROM users WHERE mobile = ? LIMIT 1", [cleanMobile]);
+    if (user.rowCount && user.rows[0].role !== "Customer") {
+      const err = new Error("This mobile number is already used for another account type.");
+      err.statusCode = 409;
+      throw err;
+    }
+    if (user.rowCount) {
+      userId = user.rows[0].id;
+      await query(
+        `UPDATE users
+         SET name = ?,
+             email = COALESCE(?, email),
+             password_hash = CASE
+               WHEN (password_hash IS NULL OR TRIM(password_hash) = '') AND ? <> '' THEN ?
+               ELSE password_hash
+             END
+         WHERE id = ?`,
+        [cleanName, emailNorm || null, cleanPassword, cleanPassword ? hashPassword(cleanPassword) : null, userId]
+      );
+    } else {
+      await query(
+        "INSERT INTO users (role, name, mobile, email, password_hash, status) VALUES ('Customer', ?, ?, ?, ?, 'Active')",
+        [cleanName, cleanMobile, emailNorm || null, cleanPassword ? hashPassword(cleanPassword) : null]
+      );
+      const createdUser = await query("SELECT id FROM users WHERE mobile = ? AND role = 'Customer' LIMIT 1", [cleanMobile]);
+      userId = createdUser.rows[0]?.id || null;
+    }
     await query(
       `UPDATE customers
-       SET name = ?, address = COALESCE(?, address), city = COALESCE(?, city), state = COALESCE(?, state), pincode = COALESCE(?, pincode)
+       SET user_id = COALESCE(user_id, ?),
+           name = ?,
+           address = COALESCE(?, address),
+           city = COALESCE(?, city),
+           state = COALESCE(?, state),
+           pincode = COALESCE(?, pincode),
+           created_by_dealer_id = COALESCE(created_by_dealer_id, ?)
        WHERE id = ?`,
-      [cleanName, address || null, city || null, state || null, pincode || null, row.id]
+      [userId, cleanName, address || null, city || null, state || null, pincode || null, createdByDealerId || null, row.id]
     );
     const updated = await query("SELECT * FROM customers WHERE id = ? LIMIT 1", [row.id]);
     return updated.rows[0];
   }
 
-  const emailNorm = normalizeEmail(email);
   const userCheck = await query("SELECT id, role FROM users WHERE mobile = ? LIMIT 1", [cleanMobile]);
   if (userCheck.rowCount && userCheck.rows[0].role !== "Customer") {
     const err = new Error("This mobile number is already used for another account type.");
@@ -2679,8 +2721,15 @@ async function findOrCreateCustomer({ name, mobile, email, address, city, state,
   if (userCheck.rowCount) {
     userId = userCheck.rows[0].id;
     await query(
-      "UPDATE users SET name = ?, email = COALESCE(?, email) WHERE id = ?",
-      [cleanName, emailNorm || null, userId]
+      `UPDATE users
+       SET name = ?,
+           email = COALESCE(?, email),
+           password_hash = CASE
+             WHEN (password_hash IS NULL OR TRIM(password_hash) = '') AND ? <> '' THEN ?
+             ELSE password_hash
+           END
+       WHERE id = ?`,
+      [cleanName, emailNorm || null, cleanPassword, cleanPassword ? hashPassword(cleanPassword) : null, userId]
     );
     const orphan = await query("SELECT id FROM customers WHERE user_id = ? LIMIT 1", [userId]);
     if (orphan.rowCount) {
@@ -2689,16 +2738,16 @@ async function findOrCreateCustomer({ name, mobile, email, address, city, state,
     }
   } else {
     await query(
-      "INSERT INTO users (role, name, mobile, email, password_hash, status) VALUES ('Customer', ?, ?, ?, NULL, 'Active')",
-      [cleanName, cleanMobile, emailNorm || null]
+      "INSERT INTO users (role, name, mobile, email, password_hash, status) VALUES ('Customer', ?, ?, ?, ?, 'Active')",
+      [cleanName, cleanMobile, emailNorm || null, cleanPassword ? hashPassword(cleanPassword) : null]
     );
     const user = await query("SELECT id FROM users WHERE mobile = ? AND role = 'Customer' LIMIT 1", [cleanMobile]);
     userId = user.rows[0].id;
   }
 
   await query(
-    "INSERT INTO customers (user_id, name, mobile, address, city, state, pincode) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    [userId, cleanName, cleanMobile, address || null, city || null, state || null, pincode || null]
+    "INSERT INTO customers (user_id, name, mobile, address, city, state, pincode, created_by_dealer_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    [userId, cleanName, cleanMobile, address || null, city || null, state || null, pincode || null, createdByDealerId || null]
   );
   const created = await query("SELECT * FROM customers WHERE user_id = ? LIMIT 1", [userId]);
   return created.rows[0];
@@ -2887,6 +2936,7 @@ app.post("/warranties/dealer/activate-from-qr", asyncRoute(async (req, res) => {
   const productId = cleanString(req.body.productId || req.body.product_id || scannedProduct.productId);
   const purchaseDate = cleanDate(req.body.purchaseDate || req.body.purchase_date) || new Date().toISOString().slice(0, 10);
   const invoiceNo = cleanString(req.body.invoiceNo || req.body.invoice_no);
+  const password = typeof req.body.password === "string" ? req.body.password : "";
   const { name, mobile, email, address, city, state, pincode } = req.body;
 
   if (!dealerId) {
@@ -2899,6 +2949,9 @@ app.post("/warranties/dealer/activate-from-qr", asyncRoute(async (req, res) => {
 
   if (!serialNo) {
     return res.status(400).json({ error: "Serial number is required after scanning product QR." });
+  }
+  if (!password || password.length < 8) {
+    return res.status(400).json({ error: "Customer login password must be at least 8 characters." });
   }
   if (productId) {
     const serialCheck = await query(
@@ -2913,7 +2966,17 @@ app.post("/warranties/dealer/activate-from-qr", asyncRoute(async (req, res) => {
     }
   }
 
-  const customer = await findOrCreateCustomer({ name, mobile, email, address, city, state, pincode });
+  const customer = await findOrCreateCustomer({
+    name,
+    mobile,
+    email,
+    address,
+    city,
+    state,
+    pincode,
+    password,
+    createdByDealerId: dealerId,
+  });
   const warranty = await activateWarrantyFromSerial({
     customerId: customer.id,
     serialNo,
@@ -2960,6 +3023,7 @@ app.get("/complaints", asyncRoute(async (_req, res) => {
 /** Serial inventory for dispatch/dealer tooling */
 app.get("/serial-numbers", asyncRoute(async (req, res) => {
   const productId = cleanString(req.query.productId || req.query.product_id);
+  const dealerId = cleanString(req.query.dealerId || req.query.dealer_id);
   const modelNo = cleanString(req.query.modelNo || req.query.model_no);
   const qrStatus = cleanString(req.query.qrStatus || req.query.qr_status);
   const where = [];
@@ -2967,6 +3031,10 @@ app.get("/serial-numbers", asyncRoute(async (req, res) => {
   if (productId) {
     where.push("s.product_id = ?");
     params.push(productId);
+  }
+  if (dealerId) {
+    where.push("(s.dealer_id = ? OR s.dealer_id IS NULL)");
+    params.push(dealerId);
   }
   if (modelNo) {
     where.push("LOWER(TRIM(p.model_no)) = LOWER(?)");
@@ -2982,6 +3050,8 @@ app.get("/serial-numbers", asyncRoute(async (req, res) => {
        s.*,
        p.name AS product_name,
        p.model_no,
+       p.qr_status AS product_qr_status,
+       p.qr_locked AS product_qr_locked,
        d.dealer_no,
        d.name AS dealer_name,
        COALESCE((
