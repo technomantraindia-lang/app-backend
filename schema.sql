@@ -187,6 +187,9 @@ CREATE TABLE IF NOT EXISTS quotations (
   technician_remarks TEXT,
   customer_remarks TEXT,
   customer_decided_at TIMESTAMP NULL,
+  frontdesk_instruction VARCHAR(40),
+  frontdesk_instructed_at TIMESTAMP NULL,
+  sent_to_frontdesk_at TIMESTAMP NULL,
   status VARCHAR(60) NOT NULL DEFAULT 'Pending Customer Approval',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT fk_quotations_complaint FOREIGN KEY (complaint_id) REFERENCES complaints(id) ON DELETE CASCADE,
@@ -223,6 +226,20 @@ CREATE TABLE IF NOT EXISTS status_history (
   INDEX idx_status_history_complaint (complaint_id),
   INDEX idx_status_history_created (created_at),
   CONSTRAINT fk_status_history_complaint FOREIGN KEY (complaint_id) REFERENCES complaints(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS complaint_assignments (
+  id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
+  complaint_id CHAR(36) NOT NULL,
+  technician_id CHAR(36) NOT NULL,
+  assigned_by_role VARCHAR(80),
+  assigned_by_id CHAR(36),
+  assigned_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  status VARCHAR(40) NOT NULL DEFAULT 'Assigned',
+  remarks TEXT,
+  INDEX idx_complaint_assignments_complaint (complaint_id),
+  CONSTRAINT fk_complaint_assignments_complaint FOREIGN KEY (complaint_id) REFERENCES complaints(id) ON DELETE CASCADE,
+  CONSTRAINT fk_complaint_assignments_technician FOREIGN KEY (technician_id) REFERENCES technicians(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS messages_or_comments (

@@ -214,10 +214,10 @@ function complaintStatusForTaskStatus(taskStatus) {
   if (s === "Completed") return "Closed";
   if (s === "Closed") return "Closed";
   if (s === "On Hold") return "On Hold";
-  if (s === "Rejected") return "Open";
-  if (s === "Assigned") return "Awaiting Technician";
+  if (s === "Rejected") return "Technician Rejected";
+  if (s === "Assigned") return "Assigned to Technician";
+  if (s === "Accepted") return "Technician Accepted";
   if (
-    s === "Accepted" ||
     s === "In Progress" ||
     s === "Scheduled" ||
     s === "Rescheduled" ||
@@ -243,6 +243,22 @@ async function ensureWorkflowAuditSchema() {
       INDEX idx_status_history_complaint (complaint_id),
       INDEX idx_status_history_created (created_at),
       CONSTRAINT fk_status_history_complaint FOREIGN KEY (complaint_id) REFERENCES complaints(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
+  );
+  await query(
+    `CREATE TABLE IF NOT EXISTS complaint_assignments (
+      id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
+      complaint_id CHAR(36) NOT NULL,
+      technician_id CHAR(36) NOT NULL,
+      assigned_by_role VARCHAR(80),
+      assigned_by_id CHAR(36),
+      assigned_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      status VARCHAR(40) NOT NULL DEFAULT 'Assigned',
+      remarks TEXT,
+      INDEX idx_complaint_assignments_complaint (complaint_id),
+      INDEX idx_complaint_assignments_technician (technician_id),
+      CONSTRAINT fk_complaint_assignments_complaint FOREIGN KEY (complaint_id) REFERENCES complaints(id) ON DELETE CASCADE,
+      CONSTRAINT fk_complaint_assignments_technician FOREIGN KEY (technician_id) REFERENCES technicians(id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
   );
   await query(
@@ -398,7 +414,10 @@ async function ensureQuotationsSchema() {
   const columns = [
     ["technician_remarks", "ALTER TABLE quotations ADD COLUMN technician_remarks TEXT NULL AFTER total_amount"],
     ["customer_remarks", "ALTER TABLE quotations ADD COLUMN customer_remarks TEXT NULL AFTER technician_remarks"],
-    ["customer_decided_at", "ALTER TABLE quotations ADD COLUMN customer_decided_at TIMESTAMP NULL AFTER customer_remarks"]
+    ["customer_decided_at", "ALTER TABLE quotations ADD COLUMN customer_decided_at TIMESTAMP NULL AFTER customer_remarks"],
+    ["frontdesk_instruction", "ALTER TABLE quotations ADD COLUMN frontdesk_instruction VARCHAR(40) NULL AFTER customer_decided_at"],
+    ["frontdesk_instructed_at", "ALTER TABLE quotations ADD COLUMN frontdesk_instructed_at TIMESTAMP NULL AFTER frontdesk_instruction"],
+    ["sent_to_frontdesk_at", "ALTER TABLE quotations ADD COLUMN sent_to_frontdesk_at TIMESTAMP NULL AFTER status"]
   ];
   for (const [columnName, ddl] of columns) {
     const found = await query(
@@ -1763,9 +1782,19 @@ app.post("/technicians", asyncRoute(async (req, res) => {
 app.get("/technicians", asyncRoute(async (req, res) => {
   await ensureFeedbackSchema();
   const status = cleanString(req.query.status);
+  const dealerId = cleanString(req.query.dealerId || req.query.dealer_id);
   const allowed = ["Pending", "Approved", "Rejected"];
-  const where = allowed.includes(status) ? "WHERE t.approval_status = ?" : "";
-  const params = allowed.includes(status) ? [status] : [];
+  const clauses = [];
+  const params = [];
+  if (allowed.includes(status)) {
+    clauses.push("t.approval_status = ?");
+    params.push(status);
+  }
+  if (dealerId) {
+    clauses.push("t.created_by_dealer_id = ?");
+    params.push(dealerId);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
   const result = await query(
     `SELECT
        t.*,
@@ -2028,8 +2057,17 @@ app.post("/feedback", asyncRoute(async (req, res) => {
 app.get("/quotations", asyncRoute(async (req, res) => {
   await ensureQuotationsSchema();
   const status = cleanString(req.query.status);
-  const where = status ? "WHERE q.status = ?" : "";
-  const params = status ? [status] : [];
+  const queue = cleanString(req.query.queue);
+  const clauses = [];
+  const params = [];
+  if (queue === "customer_decision") {
+    clauses.push("q.status IN ('Accepted by Customer', 'Rejected by Customer')");
+    clauses.push("(q.frontdesk_instruction IS NULL OR q.frontdesk_instruction = '')");
+  } else if (status) {
+    clauses.push("q.status = ?");
+    params.push(status);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
   const result = await query(
     `SELECT
        q.*,
@@ -2200,8 +2238,8 @@ app.post("/quotations", asyncRoute(async (req, res) => {
   const quotationNo = await getNextQuotationNo();
   await query(
     `INSERT INTO quotations
-     (quotation_no, complaint_id, technician_id, spare_part_amount, service_charge, visit_charge, tax_amount, discount_amount, total_amount, technician_remarks, status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending Front Desk Review')`,
+     (quotation_no, complaint_id, technician_id, spare_part_amount, service_charge, visit_charge, tax_amount, discount_amount, total_amount, technician_remarks, status, sent_to_frontdesk_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending Front Desk Review', NOW())`,
     [
       quotationNo,
       complaintId,
@@ -2279,7 +2317,7 @@ app.patch("/quotations/:id/customer-decision", asyncRoute(async (req, res) => {
   }
 
   const nextStatus = decision === "Accepted" ? "Accepted by Customer" : "Rejected by Customer";
-  const nextComplaintStatus = decision === "Accepted" ? "Paid Repair Approved" : "Quotation Rejected";
+  const nextComplaintStatus = decision === "Accepted" ? "Customer Accepted" : "Customer Rejected";
 
   await withTransaction(async (tx) => {
     await tx(
@@ -2315,17 +2353,7 @@ app.patch("/quotations/:id/customer-decision", asyncRoute(async (req, res) => {
       recipientRole: "Front Desk",
       type: "quotation_customer_decision",
       title: decision === "Accepted" ? "Customer accepted quotation" : "Customer rejected quotation",
-      message: `${row.quotation_no || "Quotation"} — ${decision} by customer for ${ctx.product_name || "product"}.`,
-      entityType: "quotation",
-      entityId: quotationId,
-    });
-    await notifyTechnicianForComplaint(ctx, {
-      type: "quotation_customer_decision",
-      title: decision === "Accepted" ? "Customer approved paid repair" : "Customer rejected quotation",
-      message:
-        decision === "Accepted"
-          ? "Front Desk confirmed customer approval. You may continue repair work."
-          : "Customer rejected the quotation. Contact Front Desk or send a revised estimate.",
+      message: `${row.quotation_no || "Quotation"} — ${decision} by customer. Send final instruction to technician.`,
       entityType: "quotation",
       entityId: quotationId,
     });
@@ -2337,6 +2365,99 @@ app.patch("/quotations/:id/customer-decision", asyncRoute(async (req, res) => {
         message: `Your decision on ${row.quotation_no || "quotation"} was saved.`,
         entityType: "quotation",
         entityId: quotationId,
+      });
+    }
+  }
+
+  const updated = await fetchQuotationById(quotationId);
+  res.json({ quotation: updated });
+}));
+
+/** Front Desk sends final Proceed / Hold instruction to technician after customer quotation decision. */
+app.patch("/quotations/:id/frontdesk-instruction", asyncRoute(async (req, res) => {
+  await ensureQuotationsSchema();
+  await ensureNotificationsSchema();
+  await ensureWorkflowAuditSchema();
+  const quotationId = cleanString(req.params.id);
+  const instruction = cleanString(req.body.instruction);
+  const remarks = cleanString(req.body.remarks) || null;
+  const frontDeskUserId = cleanString(req.body.userId || req.body.user_id) || null;
+
+  if (!quotationId) {
+    return res.status(400).json({ error: "Quotation id is required." });
+  }
+  if (!["Proceed", "Hold"].includes(instruction)) {
+    return res.status(400).json({ error: "instruction must be Proceed or Hold." });
+  }
+
+  const row = await fetchQuotationById(quotationId);
+  if (!row) {
+    return res.status(404).json({ error: "Quotation not found." });
+  }
+  if (!["Accepted by Customer", "Rejected by Customer"].includes(row.status)) {
+    return res.status(400).json({ error: "Customer must accept or reject quotation before Front Desk instruction." });
+  }
+  if (row.frontdesk_instruction) {
+    return res.status(409).json({ error: "Final instruction already sent to technician." });
+  }
+
+  const nextComplaintStatus = instruction === "Proceed" ? "Proceed with Work" : "On Hold";
+
+  await withTransaction(async (tx) => {
+    await tx(
+      `UPDATE quotations
+       SET frontdesk_instruction = ?, frontdesk_instructed_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [instruction, quotationId]
+    );
+    if (row.complaint_id) {
+      await tx("UPDATE complaints SET status = ? WHERE id = ?", [nextComplaintStatus, row.complaint_id]);
+      await recordStatusHistory({
+        complaintId: row.complaint_id,
+        oldStatus: row.complaint_status || null,
+        newStatus: nextComplaintStatus,
+        changedByRole: "Front Desk",
+        changedById: frontDeskUserId,
+        remarks: remarks || `Front Desk instruction: ${instruction}`,
+      }, tx);
+      await createWorkflowMessage({
+        complaintId: row.complaint_id,
+        quotationId,
+        senderRole: "Front Desk",
+        senderId: frontDeskUserId,
+        receiverRole: "Technician",
+        receiverId: row.technician_id || null,
+        message:
+          instruction === "Proceed"
+            ? remarks || "Proceed with work. Customer approved the quotation."
+            : remarks || "Hold / do not proceed. Customer rejected the quotation.",
+      }, tx);
+    }
+  });
+
+  const ctx = row.complaint_id ? await getComplaintNotifyContext(row.complaint_id) : null;
+  if (ctx) {
+    await notifyTechnicianForComplaint(ctx, {
+      type: instruction === "Proceed" ? "frontdesk_proceed" : "frontdesk_hold",
+      title: instruction === "Proceed" ? "Proceed with work" : "On hold — do not proceed",
+      message:
+        instruction === "Proceed"
+          ? remarks || "Front Desk approved. Continue and complete the repair."
+          : remarks || "Front Desk placed this job on hold. Do not proceed until further notice.",
+      entityType: "quotation",
+      entityId: quotationId,
+    });
+    if (ctx.customer_id) {
+      await createNotification({
+        customerId: ctx.customer_id,
+        type: "frontdesk_instruction",
+        title: instruction === "Proceed" ? "Repair will continue" : "Repair on hold",
+        message:
+          instruction === "Proceed"
+            ? "Front Desk instructed the technician to proceed with your approved quotation."
+            : "Front Desk placed the repair on hold after your quotation response.",
+        entityType: "complaint",
+        entityId: row.complaint_id,
       });
     }
   }
@@ -2413,11 +2534,11 @@ app.patch("/quotations/:id/admin-decision", asyncRoute(async (req, res) => {
         quotationId
       ]);
       if (row.complaint_id) {
-        await tx("UPDATE complaints SET status = ? WHERE id = ?", ["In Progress", row.complaint_id]);
+        await tx("UPDATE complaints SET status = ? WHERE id = ?", ["Under Warranty Approved", row.complaint_id]);
         await recordStatusHistory({
           complaintId: row.complaint_id,
           oldStatus: row.complaint_status || null,
-          newStatus: "In Progress",
+          newStatus: "Under Warranty Approved",
           changedByRole: "Front Desk",
           remarks: remarks || "Warranty active; proceed with work",
         }, tx);
@@ -4576,26 +4697,34 @@ app.post("/complaints/:id/assign-technician", asyncRoute(async (req, res) => {
     return res.status(404).json({ error: "Approved technician not found." });
   }
   const assignmentCtx = await getComplaintNotifyContext(complaintId);
-  if (
-    assignmentCtx?.dealer_id &&
-    technician.rows[0]?.created_by_dealer_id &&
-    String(technician.rows[0].created_by_dealer_id) !== String(assignmentCtx.dealer_id)
-  ) {
+  if (!assignmentCtx?.dealer_id) {
+    return res.status(400).json({ error: "Complaint is not mapped to a dealer. Customer must register warranty from dealer purchase." });
+  }
+  if (!technician.rows[0]?.created_by_dealer_id) {
+    return res.status(400).json({ error: "Technician must belong to a dealer before assignment." });
+  }
+  if (String(technician.rows[0].created_by_dealer_id) !== String(assignmentCtx.dealer_id)) {
     return res.status(403).json({ error: "Dealer can assign only technicians linked to this dealership." });
   }
 
   const existingTask = await query("SELECT id FROM tasks WHERE complaint_id = ? ORDER BY created_at DESC LIMIT 1", [complaintId]);
   const oldComplaintStatus = complaint.rows[0]?.status || null;
   await withTransaction(async (tx) => {
-    await tx("UPDATE complaints SET status = 'Awaiting Technician' WHERE id = ?", [complaintId]);
+    await tx("UPDATE complaints SET status = 'Assigned to Technician' WHERE id = ?", [complaintId]);
     await recordStatusHistory({
       complaintId,
       oldStatus: oldComplaintStatus,
-      newStatus: "Awaiting Technician",
+      newStatus: "Assigned to Technician",
       changedByRole: assignedByRole,
       changedById: assignedById,
       remarks: "Technician assigned",
     }, tx);
+    await tx(
+      `INSERT INTO complaint_assignments
+         (complaint_id, technician_id, assigned_by_role, assigned_by_id, status, remarks)
+       VALUES (?, ?, ?, ?, 'Assigned', ?)`,
+      [complaintId, technicianId, assignedByRole, assignedById, `Assigned for ${workType}`]
+    );
     if (existingTask.rowCount) {
       await tx(
         "UPDATE tasks SET technician_id = ?, work_type = ?, due_at = ?, status = 'Assigned', payable_amount = ? WHERE id = ?",
@@ -4661,9 +4790,49 @@ app.post("/complaints/:id/assign-technician", asyncRoute(async (req, res) => {
       entityId: complaintId,
     });
   }
+  await createNotification({
+    recipientRole: "Front Desk",
+    type: "technician_assigned",
+    title: "Technician assigned to complaint",
+    message: `${ctx?.complaint_no || "Complaint"} assigned to ${techRow.rows[0]?.name || "technician"}.`,
+    entityType: "complaint",
+    entityId: complaintId,
+  });
   res.json({
     complaint: complaintRow.rows[0],
     task: taskResult.rowCount ? taskResult.rows[0] : null,
+  });
+}));
+
+app.get("/complaints/:id/audit", asyncRoute(async (req, res) => {
+  await ensureWorkflowAuditSchema();
+  const complaintId = await resolveComplaintId(req.params.id);
+  if (!complaintId) {
+    return res.status(400).json({ error: "Complaint id is required." });
+  }
+  const [history, messages, assignments] = await Promise.all([
+    query(
+      `SELECT * FROM status_history WHERE complaint_id = ? ORDER BY created_at ASC LIMIT 200`,
+      [complaintId]
+    ),
+    query(
+      `SELECT * FROM messages_or_comments WHERE complaint_id = ? ORDER BY created_at ASC LIMIT 200`,
+      [complaintId]
+    ),
+    query(
+      `SELECT ca.*, tech.name AS technician_name
+       FROM complaint_assignments ca
+       LEFT JOIN technicians tech ON tech.id = ca.technician_id
+       WHERE ca.complaint_id = ?
+       ORDER BY ca.assigned_at DESC
+       LIMIT 50`,
+      [complaintId]
+    ),
+  ]);
+  res.json({
+    statusHistory: history.rows,
+    messages: messages.rows,
+    assignments: assignments.rows,
   });
 }));
 
@@ -4820,11 +4989,21 @@ app.post("/complaints", asyncRoute(async (req, res) => {
     resolvedDealerId = dealerLookup.rows[0]?.dealer_id || resolvedDealerId;
   }
 
+  if (!isStaffCreator && !resolvedWarrantyId) {
+    return res.status(400).json({ error: "Select an active warranty product before creating a complaint." });
+  }
+  if (!isStaffCreator && !resolvedDealerId) {
+    return res.status(400).json({
+      error: "This product is not linked to a dealer. Warranty must be activated from your purchase dealer.",
+    });
+  }
+
+  const initialStatus = "Created";
   await ensureWorkflowAuditSchema();
   await query(
     `INSERT INTO complaints
-     (complaint_no, warranty_id, customer_id, dealer_id, problem_type, description, priority, product_name, model_no, warranty_start_date, warranty_end_date, warranty_status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     (complaint_no, warranty_id, customer_id, dealer_id, problem_type, description, priority, product_name, model_no, warranty_start_date, warranty_end_date, warranty_status, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       cleanComplaintNo,
       resolvedWarrantyId,
@@ -4837,7 +5016,8 @@ app.post("/complaints", asyncRoute(async (req, res) => {
       cleanModelNo,
       cleanWarrantyStartDate,
       cleanWarrantyEndDate,
-      cleanWarrantyStatus
+      cleanWarrantyStatus,
+      initialStatus
     ]
   );
   const result = await query("SELECT * FROM complaints WHERE complaint_no = ? LIMIT 1", [cleanComplaintNo]);
@@ -4846,7 +5026,7 @@ app.post("/complaints", asyncRoute(async (req, res) => {
     await recordStatusHistory({
       complaintId: saved.id,
       oldStatus: null,
-      newStatus: saved.status || "Open",
+      newStatus: initialStatus,
       changedByRole: creatorRole || "Customer",
       changedById: resolvedCustomerId,
       remarks: "Complaint created",
