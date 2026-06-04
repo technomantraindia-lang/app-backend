@@ -1305,7 +1305,9 @@ app.get("/admin/dashboard", asyncRoute(async (_req, res) => {
     query("SELECT COUNT(*) AS total FROM complaints WHERE status IN ('Closed', 'Completed') AND DATE(created_at) = CURDATE()"),
     query("SELECT COUNT(*) AS total FROM technicians WHERE approval_status = 'Pending'"),
     query("SELECT COUNT(*) AS total FROM serial_numbers WHERE qr_status = 'Not Printed' OR dispatch_status = 'Pending'"),
-    query("SELECT COUNT(*) AS total FROM quotations WHERE status = 'Pending Admin Approval'"),
+    query(
+      "SELECT COUNT(*) AS total FROM quotations WHERE status IN ('Pending Front Desk Review', 'Pending Admin Approval')"
+    ),
     query("SELECT COALESCE(SUM(amount), 0) AS total FROM payments WHERE status = 'Pending'")
   ]);
 
@@ -2063,6 +2065,8 @@ app.get("/quotations", asyncRoute(async (req, res) => {
   if (queue === "customer_decision") {
     clauses.push("q.status IN ('Accepted by Customer', 'Rejected by Customer')");
     clauses.push("(q.frontdesk_instruction IS NULL OR q.frontdesk_instruction = '')");
+  } else if (queue === "frontdesk_review" || status === "Pending Front Desk Review") {
+    clauses.push("q.status IN ('Pending Front Desk Review', 'Pending Admin Approval')");
   } else if (status) {
     clauses.push("q.status = ?");
     params.push(status);
@@ -2236,23 +2240,51 @@ app.post("/quotations", asyncRoute(async (req, res) => {
   }
 
   const quotationNo = await getNextQuotationNo();
-  await query(
-    `INSERT INTO quotations
-     (quotation_no, complaint_id, technician_id, spare_part_amount, service_charge, visit_charge, tax_amount, discount_amount, total_amount, technician_remarks, status, sent_to_frontdesk_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending Front Desk Review', NOW())`,
-    [
-      quotationNo,
-      complaintId,
-      technicianId,
-      sparePartAmount,
-      serviceCharge,
-      visitCharge,
-      taxAmount,
-      discountAmount,
-      totalAmount,
-      technicianRemarks
-    ]
+  const hasSentToFdCol = await query(
+    `SELECT COLUMN_NAME
+     FROM INFORMATION_SCHEMA.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE()
+       AND TABLE_NAME = 'quotations'
+       AND COLUMN_NAME = 'sent_to_frontdesk_at'
+     LIMIT 1`
   );
+  if (hasSentToFdCol.rowCount) {
+    await query(
+      `INSERT INTO quotations
+       (quotation_no, complaint_id, technician_id, spare_part_amount, service_charge, visit_charge, tax_amount, discount_amount, total_amount, technician_remarks, status, sent_to_frontdesk_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending Front Desk Review', NOW())`,
+      [
+        quotationNo,
+        complaintId,
+        technicianId,
+        sparePartAmount,
+        serviceCharge,
+        visitCharge,
+        taxAmount,
+        discountAmount,
+        totalAmount,
+        technicianRemarks
+      ]
+    );
+  } else {
+    await query(
+      `INSERT INTO quotations
+       (quotation_no, complaint_id, technician_id, spare_part_amount, service_charge, visit_charge, tax_amount, discount_amount, total_amount, technician_remarks, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending Front Desk Review')`,
+      [
+        quotationNo,
+        complaintId,
+        technicianId,
+        sparePartAmount,
+        serviceCharge,
+        visitCharge,
+        taxAmount,
+        discountAmount,
+        totalAmount,
+        technicianRemarks
+      ]
+    );
+  }
 
   await withTransaction(async (tx) => {
     await tx("UPDATE complaints SET status = ? WHERE id = ?", ["Quotation Review", complaintId]);
