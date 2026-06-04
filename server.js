@@ -244,7 +244,7 @@ const COMPLAINT_LATEST_TASK_FIELDS = `
        t.completed_at AS task_completed_at,
        t.resolution_notes AS task_resolution_notes,
        t.created_at AS task_created_at,
-       fb.id AS feedback_id,
+       fb.complaint_id AS feedback_id,
        fb.rating AS feedback_rating,
        fb.remarks AS feedback_remarks,
        fb.created_at AS feedback_at`;
@@ -803,7 +803,7 @@ async function getTechnicianRankMap(runQuery = query) {
   const result = await runQuery(
     `SELECT
        t.id,
-       COUNT(f.id) AS review_count,
+       COUNT(f.complaint_id) AS review_count,
        ROUND(AVG(f.rating), 2) AS avg_rating
      FROM technicians t
      INNER JOIN feedback f ON f.technician_id = t.id
@@ -1760,7 +1760,7 @@ app.get("/technicians/:id/rating", asyncRoute(async (req, res) => {
   const summary = await getTechnicianRatingSummary(technicianId);
   const recent = await query(
     `SELECT
-       f.id,
+       f.complaint_id AS id,
        f.rating,
        f.remarks,
        f.created_at,
@@ -2110,6 +2110,7 @@ app.patch("/quotations/:id/admin-decision", asyncRoute(async (req, res) => {
 }));
 
 app.get("/dealers/:id/dashboard", asyncRoute(async (req, res) => {
+  await ensureFeedbackSchema();
   const dealerKey = cleanString(req.params.id);
   if (!dealerKey) {
     return res.status(400).json({ error: "Dealer id is required." });
@@ -2143,6 +2144,7 @@ app.get("/dealers/:id/dashboard", asyncRoute(async (req, res) => {
      LEFT JOIN serial_numbers s ON s.id = w.serial_id
      LEFT JOIN products p ON p.id = s.product_id
      ${COMPLAINT_LATEST_TASK_JOIN}
+     ${COMPLAINT_FEEDBACK_JOIN}
      WHERE COALESCE(w.dealer_id, s.dealer_id) = ?
      ORDER BY c.created_at DESC
      LIMIT 3`,
@@ -2924,6 +2926,7 @@ app.post("/warranties/dealer/activate-from-qr", asyncRoute(async (req, res) => {
 
 /** List complaints (staff panels). Customers should use `/complaints/customer/:customerId`. */
 app.get("/complaints", asyncRoute(async (_req, res) => {
+  await ensureFeedbackSchema();
   const result = await query(
     `SELECT
        c.*,
@@ -2947,6 +2950,7 @@ app.get("/complaints", asyncRoute(async (_req, res) => {
      LEFT JOIN products p ON p.id = s.product_id
      LEFT JOIN dealers d ON d.id = COALESCE(w.dealer_id, s.dealer_id)
      ${COMPLAINT_LATEST_TASK_JOIN}
+     ${COMPLAINT_FEEDBACK_JOIN}
      ORDER BY c.created_at DESC
      LIMIT 800`
   );
@@ -3771,6 +3775,7 @@ app.get("/complaints/customer/:customerId", asyncRoute(async (req, res) => {
 }));
 
 app.get("/complaints/dealer/:dealerId", asyncRoute(async (req, res) => {
+  await ensureFeedbackSchema();
   const dealerKey = cleanString(req.params.dealerId);
   const dealer = await resolveDealerRecord(dealerKey);
   if (!dealer) {
@@ -3800,6 +3805,7 @@ app.get("/complaints/dealer/:dealerId", asyncRoute(async (req, res) => {
      LEFT JOIN products p ON p.id = s.product_id
      LEFT JOIN dealers d ON d.id = COALESCE(w.dealer_id, s.dealer_id)
      ${COMPLAINT_LATEST_TASK_JOIN}
+     ${COMPLAINT_FEEDBACK_JOIN}
      WHERE COALESCE(w.dealer_id, s.dealer_id) = ?
      ORDER BY c.created_at DESC`,
     [dealerId]
