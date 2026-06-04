@@ -138,6 +138,7 @@ CREATE TABLE IF NOT EXISTS complaints (
   complaint_no VARCHAR(80) NOT NULL UNIQUE,
   warranty_id CHAR(36),
   customer_id CHAR(36),
+  dealer_id CHAR(36),
   problem_type VARCHAR(160) NOT NULL,
   description TEXT,
   priority VARCHAR(40) NOT NULL DEFAULT 'Normal',
@@ -149,8 +150,10 @@ CREATE TABLE IF NOT EXISTS complaints (
   status VARCHAR(40) NOT NULL DEFAULT 'Open',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   INDEX idx_complaints_customer_id (customer_id),
+  INDEX idx_complaints_dealer_id (dealer_id),
   CONSTRAINT fk_complaints_warranty FOREIGN KEY (warranty_id) REFERENCES warranties(id) ON DELETE SET NULL,
-  CONSTRAINT fk_complaints_customer FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE
+  CONSTRAINT fk_complaints_customer FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE,
+  CONSTRAINT fk_complaints_dealer FOREIGN KEY (dealer_id) REFERENCES dealers(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -188,6 +191,55 @@ CREATE TABLE IF NOT EXISTS quotations (
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT fk_quotations_complaint FOREIGN KEY (complaint_id) REFERENCES complaints(id) ON DELETE CASCADE,
   CONSTRAINT fk_quotations_technician FOREIGN KEY (technician_id) REFERENCES technicians(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS notifications (
+  id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
+  recipient_role VARCHAR(80),
+  customer_id CHAR(36),
+  user_id CHAR(36),
+  type VARCHAR(80) NOT NULL,
+  title VARCHAR(180) NOT NULL,
+  message TEXT,
+  entity_type VARCHAR(80),
+  entity_id CHAR(36),
+  read_at TIMESTAMP NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_notifications_customer (customer_id),
+  INDEX idx_notifications_user (user_id),
+  INDEX idx_notifications_role (recipient_role),
+  INDEX idx_notifications_created (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS status_history (
+  id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
+  complaint_id CHAR(36),
+  old_status VARCHAR(80),
+  new_status VARCHAR(80) NOT NULL,
+  changed_by_role VARCHAR(80),
+  changed_by_id CHAR(36),
+  remarks TEXT,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_status_history_complaint (complaint_id),
+  INDEX idx_status_history_created (created_at),
+  CONSTRAINT fk_status_history_complaint FOREIGN KEY (complaint_id) REFERENCES complaints(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS messages_or_comments (
+  id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
+  complaint_id CHAR(36),
+  quotation_id CHAR(36),
+  sender_role VARCHAR(80),
+  sender_id CHAR(36),
+  receiver_role VARCHAR(80),
+  receiver_id CHAR(36),
+  message TEXT NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_messages_complaint (complaint_id),
+  INDEX idx_messages_quotation (quotation_id),
+  INDEX idx_messages_created (created_at),
+  CONSTRAINT fk_messages_complaint FOREIGN KEY (complaint_id) REFERENCES complaints(id) ON DELETE CASCADE,
+  CONSTRAINT fk_messages_quotation FOREIGN KEY (quotation_id) REFERENCES quotations(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS payments (

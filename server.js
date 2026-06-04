@@ -114,17 +114,17 @@ async function getDealerDashboardStats(dealerId) {
     query("SELECT COUNT(*) AS total FROM serial_numbers WHERE dealer_id = ?", [dealerId]),
     query("SELECT COUNT(*) AS total FROM warranties WHERE dealer_id = ?", [dealerId]),
     query(
-      `SELECT COUNT(*) AS total ${DEALER_COMPLAINT_FROM} WHERE COALESCE(w.dealer_id, s.dealer_id) = ?`,
+      `SELECT COUNT(*) AS total ${DEALER_COMPLAINT_FROM} WHERE COALESCE(c.dealer_id, w.dealer_id, s.dealer_id) = ?`,
       [dealerId]
     ),
     query(
       `SELECT COUNT(*) AS total ${DEALER_COMPLAINT_FROM}
-       WHERE COALESCE(w.dealer_id, s.dealer_id) = ? AND ${COMPLAINT_OPEN_WHERE}`,
+       WHERE COALESCE(c.dealer_id, w.dealer_id, s.dealer_id) = ? AND ${COMPLAINT_OPEN_WHERE}`,
       [dealerId]
     ),
     query(
       `SELECT COUNT(*) AS total ${DEALER_COMPLAINT_FROM}
-       WHERE COALESCE(w.dealer_id, s.dealer_id) = ? AND ${COMPLAINT_SOLVED_WHERE}`,
+       WHERE COALESCE(c.dealer_id, w.dealer_id, s.dealer_id) = ? AND ${COMPLAINT_SOLVED_WHERE}`,
       [dealerId]
     ),
     query(
@@ -212,6 +212,8 @@ function complaintStatusForTaskStatus(taskStatus) {
   const s = cleanString(taskStatus);
   if (!s) return null;
   if (s === "Completed") return "Closed";
+  if (s === "Closed") return "Closed";
+  if (s === "On Hold") return "On Hold";
   if (s === "Rejected") return "Open";
   if (s === "Assigned") return "Awaiting Technician";
   if (
@@ -225,6 +227,77 @@ function complaintStatusForTaskStatus(taskStatus) {
     return "In Progress";
   }
   return null;
+}
+
+async function ensureWorkflowAuditSchema() {
+  await query(
+    `CREATE TABLE IF NOT EXISTS status_history (
+      id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
+      complaint_id CHAR(36),
+      old_status VARCHAR(80),
+      new_status VARCHAR(80) NOT NULL,
+      changed_by_role VARCHAR(80),
+      changed_by_id CHAR(36),
+      remarks TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_status_history_complaint (complaint_id),
+      INDEX idx_status_history_created (created_at),
+      CONSTRAINT fk_status_history_complaint FOREIGN KEY (complaint_id) REFERENCES complaints(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
+  );
+  await query(
+    `CREATE TABLE IF NOT EXISTS messages_or_comments (
+      id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
+      complaint_id CHAR(36),
+      quotation_id CHAR(36),
+      sender_role VARCHAR(80),
+      sender_id CHAR(36),
+      receiver_role VARCHAR(80),
+      receiver_id CHAR(36),
+      message TEXT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_messages_complaint (complaint_id),
+      INDEX idx_messages_quotation (quotation_id),
+      INDEX idx_messages_created (created_at),
+      CONSTRAINT fk_messages_complaint FOREIGN KEY (complaint_id) REFERENCES complaints(id) ON DELETE CASCADE,
+      CONSTRAINT fk_messages_quotation FOREIGN KEY (quotation_id) REFERENCES quotations(id) ON DELETE SET NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
+  );
+}
+
+async function recordStatusHistory({
+  complaintId,
+  oldStatus = null,
+  newStatus,
+  changedByRole = null,
+  changedById = null,
+  remarks = null,
+}, runQuery = query) {
+  if (!complaintId || !newStatus) return;
+  await runQuery(
+    `INSERT INTO status_history
+     (complaint_id, old_status, new_status, changed_by_role, changed_by_id, remarks)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [complaintId, oldStatus, newStatus, changedByRole, changedById, remarks]
+  );
+}
+
+async function createWorkflowMessage({
+  complaintId = null,
+  quotationId = null,
+  senderRole = null,
+  senderId = null,
+  receiverRole = null,
+  receiverId = null,
+  message,
+}, runQuery = query) {
+  if (!message) return;
+  await runQuery(
+    `INSERT INTO messages_or_comments
+     (complaint_id, quotation_id, sender_role, sender_id, receiver_role, receiver_id, message)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [complaintId, quotationId, senderRole, senderId, receiverRole, receiverId, message]
+  );
 }
 
 const COMPLAINT_LATEST_TASK_JOIN = `
@@ -390,7 +463,8 @@ async function getComplaintNotifyContext(complaintId, runQuery = query) {
        c.customer_id,
        c.status AS complaint_status,
        COALESCE(c.product_name, p.name) AS product_name,
-       COALESCE(w.dealer_id, s.dealer_id) AS dealer_id,
+       COALESCE(c.dealer_id, w.dealer_id, s.dealer_id) AS dealer_id,
+       du.id AS dealer_user_id,
        t.id AS task_id,
        t.technician_id,
        tech.user_id AS technician_user_id,
@@ -399,6 +473,8 @@ async function getComplaintNotifyContext(complaintId, runQuery = query) {
      LEFT JOIN warranties w ON w.id = c.warranty_id
      LEFT JOIN serial_numbers s ON s.id = w.serial_id
      LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN dealers d ON d.id = COALESCE(c.dealer_id, w.dealer_id, s.dealer_id)
+     LEFT JOIN users du ON du.role = 'Dealer' AND ${sqlNormalizeMobileColumn("du.mobile")} = ${sqlNormalizeMobileColumn("d.mobile")}
      LEFT JOIN tasks t ON t.complaint_id = c.id
      LEFT JOIN technicians tech ON tech.id = t.technician_id
      WHERE c.id = ?
@@ -473,6 +549,7 @@ async function fetchQuotationById(quotationId, runQuery = query) {
        q.*,
        c.complaint_no,
        c.customer_id,
+       c.status AS complaint_status,
        COALESCE(c.warranty_status, w.status) AS warranty_status,
        COALESCE(c.warranty_end_date, w.expiry_date) AS warranty_expiry,
        COALESCE(c.product_name, p.name) AS product_name,
@@ -815,6 +892,7 @@ async function ensureTechniciansSchema() {
 
 async function ensureComplaintsSchema() {
   const columns = [
+    ["dealer_id", "ALTER TABLE complaints ADD COLUMN dealer_id CHAR(36) NULL AFTER customer_id"],
     ["product_name", "ALTER TABLE complaints ADD COLUMN product_name VARCHAR(160) NULL AFTER priority"],
     ["model_no", "ALTER TABLE complaints ADD COLUMN model_no VARCHAR(120) NULL AFTER product_name"],
     ["warranty_start_date", "ALTER TABLE complaints ADD COLUMN warranty_start_date DATE NULL AFTER model_no"],
@@ -1983,14 +2061,23 @@ app.get("/quotations", asyncRoute(async (req, res) => {
 app.get("/notifications", asyncRoute(async (req, res) => {
   await ensureNotificationsSchema();
   const customerId = cleanString(req.query.customerId || req.query.customer_id);
+  const userId = cleanString(req.query.userId || req.query.user_id);
   const role = cleanString(req.query.role || req.query.recipientRole || req.query.recipient_role);
   const where = [];
   const params = [];
   if (customerId) {
     where.push("customer_id = ?");
     params.push(customerId);
-  }
-  if (role) {
+  } else if (role && ["Front Desk", "Admin"].includes(role)) {
+    where.push("recipient_role = ?");
+    params.push(role);
+  } else if (userId && role) {
+    where.push("(user_id = ? OR (user_id IS NULL AND recipient_role = ?))");
+    params.push(userId, role);
+  } else if (userId) {
+    where.push("user_id = ?");
+    params.push(userId);
+  } else if (role) {
     where.push("recipient_role = ?");
     params.push(role);
   }
@@ -2022,8 +2109,8 @@ app.get("/quotations/complaint/:complaintId", asyncRoute(async (req, res) => {
      FROM quotations q
      LEFT JOIN complaints c ON c.id = q.complaint_id
      LEFT JOIN warranties w ON w.id = c.warranty_id
-     LEFT JOIN products p ON p.id = s.product_id
      LEFT JOIN serial_numbers s ON s.id = w.serial_id
+     LEFT JOIN products p ON p.id = s.product_id
      LEFT JOIN technicians tech ON tech.id = q.technician_id
      WHERE q.complaint_id = ?
      ORDER BY q.created_at DESC
@@ -2060,6 +2147,7 @@ app.get("/quotations/customer/:customerId", asyncRoute(async (req, res) => {
 
 app.post("/quotations", asyncRoute(async (req, res) => {
   await ensureQuotationsSchema();
+  await ensureWorkflowAuditSchema();
   const complaintId = await resolveComplaintId(req.body.complaintId || req.body.complaint_id);
   const technicianId = cleanString(req.body.technicianId || req.body.technician_id);
   const sparePartAmount = Number(req.body.sparePartAmount ?? req.body.spare_part_amount ?? 0);
@@ -2128,12 +2216,30 @@ app.post("/quotations", asyncRoute(async (req, res) => {
     ]
   );
 
-  await query("UPDATE complaints SET status = ? WHERE id = ?", ["Quotation Review"]);
+  await withTransaction(async (tx) => {
+    await tx("UPDATE complaints SET status = ? WHERE id = ?", ["Quotation Review", complaintId]);
+    await recordStatusHistory({
+      complaintId,
+      oldStatus: complaint.complaint_status || null,
+      newStatus: "Quotation Review",
+      changedByRole: "Technician",
+      changedById: technicianId,
+      remarks: `Quotation ${quotationNo} submitted to Front Desk`,
+    }, tx);
+  });
 
   const saved = await fetchQuotationById(
     (await query("SELECT id FROM quotations WHERE quotation_no = ? LIMIT 1", [quotationNo])).rows[0]?.id
   );
   await ensureNotificationsSchema();
+  await createWorkflowMessage({
+    complaintId,
+    quotationId: saved?.id || null,
+    senderRole: "Technician",
+    senderId: technicianId,
+    receiverRole: "Front Desk",
+    message: `Quotation ${quotationNo} submitted for warranty review.`,
+  });
   await createNotification({
     recipientRole: "Front Desk",
     type: "quotation_review",
@@ -2147,6 +2253,8 @@ app.post("/quotations", asyncRoute(async (req, res) => {
 
 app.patch("/quotations/:id/customer-decision", asyncRoute(async (req, res) => {
   await ensureQuotationsSchema();
+  await ensureNotificationsSchema();
+  await ensureWorkflowAuditSchema();
   const quotationId = cleanString(req.params.id);
   const customerId = cleanString(req.body.customerId || req.body.customer_id);
   const decision = cleanString(req.body.decision);
@@ -2182,6 +2290,22 @@ app.patch("/quotations/:id/customer-decision", asyncRoute(async (req, res) => {
     );
     if (row.complaint_id) {
       await tx("UPDATE complaints SET status = ? WHERE id = ?", [nextComplaintStatus, row.complaint_id]);
+      await recordStatusHistory({
+        complaintId: row.complaint_id,
+        oldStatus: row.complaint_status || null,
+        newStatus: nextComplaintStatus,
+        changedByRole: "Customer",
+        changedById: customerId,
+        remarks: customerRemarks || `Quotation ${decision}`,
+      }, tx);
+      await createWorkflowMessage({
+        complaintId: row.complaint_id,
+        quotationId,
+        senderRole: "Customer",
+        senderId: customerId,
+        receiverRole: "Front Desk",
+        message: customerRemarks || `Customer ${decision.toLowerCase()} quotation ${row.quotation_no || ""}.`,
+      }, tx);
     }
   });
 
@@ -2224,6 +2348,7 @@ app.patch("/quotations/:id/customer-decision", asyncRoute(async (req, res) => {
 app.patch("/quotations/:id/admin-decision", asyncRoute(async (req, res) => {
   await ensureQuotationsSchema();
   await ensureNotificationsSchema();
+  await ensureWorkflowAuditSchema();
   const quotationId = cleanString(req.params.id);
   const decision = cleanString(req.body.decision);
   const remarks = cleanString(req.body.remarks) || null;
@@ -2253,6 +2378,21 @@ app.patch("/quotations/:id/admin-decision", asyncRoute(async (req, res) => {
       ]);
       if (row.complaint_id) {
         await tx("UPDATE complaints SET status = ? WHERE id = ?", ["Quotation Pending", row.complaint_id]);
+        await recordStatusHistory({
+          complaintId: row.complaint_id,
+          oldStatus: row.complaint_status || null,
+          newStatus: "Quotation Pending",
+          changedByRole: "Front Desk",
+          remarks: remarks || "Warranty expired; quotation sent to customer",
+        }, tx);
+        await createWorkflowMessage({
+          complaintId: row.complaint_id,
+          quotationId,
+          senderRole: "Front Desk",
+          receiverRole: "Customer",
+          receiverId: row.customer_id || null,
+          message: remarks || `Warranty expired. Quotation ${row.quotation_no || ""} sent to customer.`,
+        }, tx);
       }
       if (row.customer_id) {
         await createNotification({
@@ -2274,6 +2414,21 @@ app.patch("/quotations/:id/admin-decision", asyncRoute(async (req, res) => {
       ]);
       if (row.complaint_id) {
         await tx("UPDATE complaints SET status = ? WHERE id = ?", ["In Progress", row.complaint_id]);
+        await recordStatusHistory({
+          complaintId: row.complaint_id,
+          oldStatus: row.complaint_status || null,
+          newStatus: "In Progress",
+          changedByRole: "Front Desk",
+          remarks: remarks || "Warranty active; proceed with work",
+        }, tx);
+        await createWorkflowMessage({
+          complaintId: row.complaint_id,
+          quotationId,
+          senderRole: "Front Desk",
+          receiverRole: "Technician",
+          receiverId: row.technician_id || null,
+          message: remarks || "Warranty active. Proceed with work.",
+        }, tx);
       }
       if (row.customer_id) {
         await createNotification({
@@ -2287,11 +2442,56 @@ app.patch("/quotations/:id/admin-decision", asyncRoute(async (req, res) => {
       }
     });
   } else {
-    await query("UPDATE quotations SET status = ?, technician_remarks = COALESCE(?, technician_remarks) WHERE id = ?", [
-      "Rejected by Front Desk",
-      remarks,
-      quotationId
-    ]);
+    await withTransaction(async (tx) => {
+      await tx("UPDATE quotations SET status = ?, technician_remarks = COALESCE(?, technician_remarks) WHERE id = ?", [
+        "Rejected by Front Desk",
+        remarks,
+        quotationId
+      ]);
+      if (row.complaint_id) {
+        await recordStatusHistory({
+          complaintId: row.complaint_id,
+          oldStatus: row.complaint_status || null,
+          newStatus: row.complaint_status || "Quotation Review",
+          changedByRole: "Front Desk",
+          remarks: remarks || "Quotation rejected by Front Desk",
+        }, tx);
+        await createWorkflowMessage({
+          complaintId: row.complaint_id,
+          quotationId,
+          senderRole: "Front Desk",
+          receiverRole: "Technician",
+          receiverId: row.technician_id || null,
+          message: remarks || "Quotation rejected. Please revise or contact Front Desk.",
+        }, tx);
+      }
+    });
+  }
+  const ctx = row.complaint_id ? await getComplaintNotifyContext(row.complaint_id) : null;
+  if (decision === "Approved" && expired && ctx) {
+    await notifyTechnicianForComplaint(ctx, {
+      type: "quotation_sent_customer",
+      title: "Quotation sent to customer",
+      message: "Warranty is expired. Wait for customer approval before completing paid repair.",
+      entityType: "quotation",
+      entityId: quotationId,
+    });
+  } else if (decision === "Approved" && !expired && ctx) {
+    await notifyTechnicianForComplaint(ctx, {
+      type: "frontdesk_proceed",
+      title: "Proceed with work",
+      message: "Front Desk approved this complaint under warranty. Continue and complete the service.",
+      entityType: "complaint",
+      entityId: row.complaint_id,
+    });
+  } else if (ctx) {
+    await notifyTechnicianForComplaint(ctx, {
+      type: "frontdesk_hold",
+      title: "Hold or revise quotation",
+      message: remarks || "Front Desk rejected the quotation. Review and update the estimate.",
+      entityType: "quotation",
+      entityId: quotationId,
+    });
   }
   const updated = await fetchQuotationById(quotationId);
   res.json({ quotation: updated });
@@ -2327,13 +2527,13 @@ app.get("/dealers/:id/dashboard", asyncRoute(async (req, res) => {
        COALESCE(c.model_no, p.model_no) AS model_no,
        ${COMPLAINT_LATEST_TASK_FIELDS}
      FROM complaints c
-     INNER JOIN warranties w ON w.id = c.warranty_id
+     LEFT JOIN warranties w ON w.id = c.warranty_id
      LEFT JOIN customers cust ON cust.id = c.customer_id
      LEFT JOIN serial_numbers s ON s.id = w.serial_id
      LEFT JOIN products p ON p.id = s.product_id
      ${COMPLAINT_LATEST_TASK_JOIN}
      ${COMPLAINT_FEEDBACK_JOIN}
-     WHERE COALESCE(w.dealer_id, s.dealer_id) = ?
+     WHERE COALESCE(c.dealer_id, w.dealer_id, s.dealer_id) = ?
      ORDER BY c.created_at DESC
      LIMIT 3`,
     [dealerId]
@@ -2869,7 +3069,7 @@ app.get("/warranties/customer/:customerId", asyncRoute(async (req, res) => {
      FROM warranties w
      LEFT JOIN serial_numbers s ON s.id = w.serial_id
      LEFT JOIN products p ON p.id = s.product_id
-     LEFT JOIN dealers d ON d.id = COALESCE(w.dealer_id, s.dealer_id)
+     LEFT JOIN dealers d ON d.id = COALESCE(c.dealer_id, w.dealer_id, s.dealer_id)
      WHERE w.customer_id = ?
      ORDER BY w.created_at DESC`,
     [req.params.customerId]
@@ -3120,7 +3320,7 @@ async function activateWarrantyFromSerial({ customerId, serialNo, purchaseDate, 
      FROM warranties w
      LEFT JOIN serial_numbers s ON s.id = w.serial_id
      LEFT JOIN products p ON p.id = s.product_id
-     LEFT JOIN dealers d ON d.id = COALESCE(w.dealer_id, s.dealer_id)
+     LEFT JOIN dealers d ON d.id = COALESCE(c.dealer_id, w.dealer_id, s.dealer_id)
      LEFT JOIN customers cust ON cust.id = w.customer_id
      WHERE w.warranty_no = ?
      LIMIT 1`,
@@ -3754,7 +3954,9 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
     "Rescheduled",
     "Reached",
     "Inspection Started",
-    "Completed"
+    "On Hold",
+    "Completed",
+    "Closed"
   ];
   if (!allowed.includes(status)) {
     return res.status(400).json({ error: "Invalid task status." });
@@ -3775,10 +3977,17 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
     return res.status(400).json({ error: "Only new assignments can be rejected." });
   }
 
+  const complaintId = row.complaint_id;
+  const complaintBefore = complaintId
+    ? await query("SELECT status FROM complaints WHERE id = ? LIMIT 1", [complaintId])
+    : { rowCount: 0, rows: [] };
+  const oldComplaintStatus = complaintBefore.rows[0]?.status || null;
+
+  await ensureWorkflowAuditSchema();
   await withTransaction(async (tx) => {
     if (dueAt && (status === "Rescheduled" || status === "Scheduled")) {
       await tx("UPDATE tasks SET status = ?, due_at = ? WHERE id = ?", [status, dueAt, id]);
-    } else if (status === "Completed") {
+    } else if (status === "Completed" || status === "Closed") {
       await tx(
         "UPDATE tasks SET status = ?, completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP), resolution_notes = COALESCE(?, resolution_notes) WHERE id = ?",
         [status, resolutionNotes, id]
@@ -3788,12 +3997,26 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
     } else {
       await tx("UPDATE tasks SET status = ? WHERE id = ?", [status, id]);
     }
-    const complaintId = row.complaint_id;
     if (!complaintId) return;
     const nextComplaintStatus = complaintStatusForTaskStatus(status);
     if (nextComplaintStatus) {
       await tx("UPDATE complaints SET status = ? WHERE id = ?", [nextComplaintStatus, complaintId]);
+      await recordStatusHistory({
+        complaintId,
+        oldStatus: oldComplaintStatus,
+        newStatus: nextComplaintStatus,
+        changedByRole: "Technician",
+        changedById: technicianId || row.technician_id || null,
+        remarks: resolutionNotes || `Task marked ${status}`,
+      }, tx);
     }
+    await createWorkflowMessage({
+      complaintId,
+      senderRole: "Technician",
+      senderId: technicianId || row.technician_id || null,
+      receiverRole: "Front Desk",
+      message: resolutionNotes || `Task status changed to ${status}.`,
+    }, tx);
   });
 
   const taskResult = await query(
@@ -3804,27 +4027,44 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
     [id]
   );
 
-  if (["Accepted", "Rejected"].includes(status) && row.complaint_id) {
+  if (["Accepted", "Rejected", "On Hold", "Completed", "Closed"].includes(status) && row.complaint_id) {
     await ensureNotificationsSchema();
     const ctx = await getComplaintNotifyContext(row.complaint_id);
     if (ctx?.customer_id) {
       await createNotification({
         customerId: ctx.customer_id,
-        type: status === "Accepted" ? "technician_accepted" : "technician_rejected",
-        title: status === "Accepted" ? "Technician accepted your complaint" : "Technician declined assignment",
+        type: `technician_${status.toLowerCase().replace(/\s+/g, "_")}`,
+        title:
+          status === "Accepted"
+            ? "Technician accepted your complaint"
+            : status === "Rejected"
+              ? "Technician declined assignment"
+              : status === "Completed" || status === "Closed"
+                ? "Service completed"
+                : "Service put on hold",
         message:
           status === "Accepted"
             ? `${ctx.technician_name || "Technician"} accepted and will schedule a visit.`
-            : "Dealer will assign another technician.",
+            : status === "Rejected"
+              ? "Dealer will assign another technician."
+              : status === "Completed" || status === "Closed"
+                ? `Complaint ${ctx.complaint_no || ""} is marked ${status}.`
+                : `Complaint ${ctx.complaint_no || ""} is on hold. ${resolutionNotes || ""}`.trim(),
         entityType: "complaint",
         entityId: row.complaint_id,
       });
     }
     if (ctx?.dealer_id) {
       await createNotification({
+        userId: ctx.dealer_user_id || null,
         recipientRole: "Dealer",
         type: `task_${status.toLowerCase()}`,
-        title: status === "Accepted" ? "Technician accepted job" : "Technician rejected job",
+        title:
+          status === "Accepted"
+            ? "Technician accepted job"
+            : status === "Rejected"
+              ? "Technician rejected job"
+              : `Technician marked ${status}`,
         message: `${ctx.complaint_no || "Complaint"} — ${ctx.technician_name || "Technician"} ${status.toLowerCase()}.`,
         entityType: "complaint",
         entityId: row.complaint_id,
@@ -3833,7 +4073,12 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
     await createNotification({
       recipientRole: "Front Desk",
       type: `task_${status.toLowerCase()}`,
-      title: status === "Accepted" ? "Technician accepted" : "Technician rejected",
+      title:
+        status === "Accepted"
+          ? "Technician accepted"
+          : status === "Rejected"
+            ? "Technician rejected"
+            : `Technician marked ${status}`,
       message: `${ctx?.complaint_no || "Complaint"}: ${ctx?.technician_name || "Technician"} ${status}.`,
       entityType: "complaint",
       entityId: row.complaint_id,
@@ -4183,14 +4428,14 @@ app.get("/complaints/dealer/:dealerId", asyncRoute(async (req, res) => {
        d.name AS dealer_name,
        ${COMPLAINT_LATEST_TASK_FIELDS}
      FROM complaints c
-     INNER JOIN warranties w ON w.id = c.warranty_id
+     LEFT JOIN warranties w ON w.id = c.warranty_id
      LEFT JOIN customers cust ON cust.id = c.customer_id
      LEFT JOIN serial_numbers s ON s.id = w.serial_id
      LEFT JOIN products p ON p.id = s.product_id
-     LEFT JOIN dealers d ON d.id = COALESCE(w.dealer_id, s.dealer_id)
+     LEFT JOIN dealers d ON d.id = COALESCE(c.dealer_id, w.dealer_id, s.dealer_id)
      ${COMPLAINT_LATEST_TASK_JOIN}
      ${COMPLAINT_FEEDBACK_JOIN}
-     WHERE COALESCE(w.dealer_id, s.dealer_id) = ?
+     WHERE COALESCE(c.dealer_id, w.dealer_id, s.dealer_id) = ?
      ORDER BY c.created_at DESC`,
     [dealerId]
   );
@@ -4307,11 +4552,14 @@ app.delete("/complaints/:id", asyncRoute(handleComplaintDelete));
 app.post("/complaints/:id/delete", asyncRoute(handleComplaintDelete));
 
 app.post("/complaints/:id/assign-technician", asyncRoute(async (req, res) => {
+  await ensureWorkflowAuditSchema();
   const complaintKey = cleanString(req.params.id);
   const technicianId = cleanString(req.body.technicianId || req.body.technician_id);
   const workType = cleanString(req.body.workType || req.body.work_type) || "Warranty Repair";
   const dueAt = cleanString(req.body.dueAt || req.body.due_at) || null;
   const payableAmount = Number(req.body.payableAmount || req.body.payable_amount || 0);
+  const assignedByRole = cleanString(req.body.assignedByRole || req.body.assigned_by_role || req.body.requesterRole) || "Dealer";
+  const assignedById = cleanString(req.body.assignedById || req.body.assigned_by_id || req.body.userId || req.body.user_id) || null;
 
   const complaintId = await resolveComplaintId(complaintKey);
   if (!complaintId || !technicianId) {
@@ -4321,14 +4569,31 @@ app.post("/complaints/:id/assign-technician", asyncRoute(async (req, res) => {
   if (!complaint.rowCount) {
     return res.status(404).json({ error: "Complaint not found." });
   }
-  const technician = await query("SELECT id FROM technicians WHERE id = ? AND approval_status = 'Approved' LIMIT 1", [technicianId]);
+  const technician = await query("SELECT id, created_by_dealer_id FROM technicians WHERE id = ? AND approval_status = 'Approved' LIMIT 1", [technicianId]);
   if (!technician.rowCount) {
     return res.status(404).json({ error: "Approved technician not found." });
   }
+  const assignmentCtx = await getComplaintNotifyContext(complaintId);
+  if (
+    assignmentCtx?.dealer_id &&
+    technician.rows[0]?.created_by_dealer_id &&
+    String(technician.rows[0].created_by_dealer_id) !== String(assignmentCtx.dealer_id)
+  ) {
+    return res.status(403).json({ error: "Dealer can assign only technicians linked to this dealership." });
+  }
 
   const existingTask = await query("SELECT id FROM tasks WHERE complaint_id = ? ORDER BY created_at DESC LIMIT 1", [complaintId]);
+  const oldComplaintStatus = complaint.rows[0]?.status || null;
   await withTransaction(async (tx) => {
     await tx("UPDATE complaints SET status = 'Awaiting Technician' WHERE id = ?", [complaintId]);
+    await recordStatusHistory({
+      complaintId,
+      oldStatus: oldComplaintStatus,
+      newStatus: "Awaiting Technician",
+      changedByRole: assignedByRole,
+      changedById: assignedById,
+      remarks: "Technician assigned",
+    }, tx);
     if (existingTask.rowCount) {
       await tx(
         "UPDATE tasks SET technician_id = ?, work_type = ?, due_at = ?, status = 'Assigned', payable_amount = ? WHERE id = ?",
@@ -4340,6 +4605,14 @@ app.post("/complaints/:id/assign-technician", asyncRoute(async (req, res) => {
         [`TASK-${Date.now()}`, complaintId, technicianId, workType, dueAt, Number.isFinite(payableAmount) ? payableAmount : 0]
       );
     }
+    await createWorkflowMessage({
+      complaintId,
+      senderRole: assignedByRole,
+      senderId: assignedById,
+      receiverRole: "Technician",
+      receiverId: technicianId,
+      message: `Complaint assigned for ${workType}.`,
+    }, tx);
   });
 
   const taskResult = await query(
@@ -4377,6 +4650,7 @@ app.post("/complaints/:id/assign-technician", asyncRoute(async (req, res) => {
   }
   if (ctx?.dealer_id) {
     await createNotification({
+      userId: ctx.dealer_user_id || null,
       recipientRole: "Dealer",
       type: "technician_assigned",
       title: "Technician assigned",
@@ -4509,6 +4783,7 @@ app.post("/complaints", asyncRoute(async (req, res) => {
   }
 
   let resolvedWarrantyId = typeof warrantyId === "string" && warrantyId.trim() ? warrantyId.trim() : null;
+  let resolvedDealerId = actingDealerId || null;
   if (resolvedWarrantyId) {
     if (creatorRole === "Dealer") {
       const warrantyCheck = await query(
@@ -4532,16 +4807,27 @@ app.post("/complaints", asyncRoute(async (req, res) => {
         return res.status(400).json({ error: "Selected warranty does not belong to this customer." });
       }
     }
+    const dealerLookup = await query(
+      `SELECT COALESCE(w.dealer_id, s.dealer_id) AS dealer_id
+       FROM warranties w
+       LEFT JOIN serial_numbers s ON s.id = w.serial_id
+       WHERE w.id = ?
+       LIMIT 1`,
+      [resolvedWarrantyId]
+    );
+    resolvedDealerId = dealerLookup.rows[0]?.dealer_id || resolvedDealerId;
   }
 
+  await ensureWorkflowAuditSchema();
   await query(
     `INSERT INTO complaints
-     (complaint_no, warranty_id, customer_id, problem_type, description, priority, product_name, model_no, warranty_start_date, warranty_end_date, warranty_status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     (complaint_no, warranty_id, customer_id, dealer_id, problem_type, description, priority, product_name, model_no, warranty_start_date, warranty_end_date, warranty_status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       cleanComplaintNo,
       resolvedWarrantyId,
       resolvedCustomerId,
+      resolvedDealerId,
       cleanProblemType,
       typeof description === "string" && description.trim() ? description.trim() : null,
       typeof priority === "string" && priority.trim() ? priority.trim() : "Normal",
@@ -4554,6 +4840,16 @@ app.post("/complaints", asyncRoute(async (req, res) => {
   );
   const result = await query("SELECT * FROM complaints WHERE complaint_no = ? LIMIT 1", [cleanComplaintNo]);
   const saved = result.rows[0];
+  if (saved?.id) {
+    await recordStatusHistory({
+      complaintId: saved.id,
+      oldStatus: null,
+      newStatus: saved.status || "Open",
+      changedByRole: creatorRole || "Customer",
+      changedById: resolvedCustomerId,
+      remarks: "Complaint created",
+    });
+  }
   await ensureNotificationsSchema();
   const ctx = saved?.id ? await getComplaintNotifyContext(saved.id) : null;
   if (resolvedCustomerId) {
@@ -4568,6 +4864,7 @@ app.post("/complaints", asyncRoute(async (req, res) => {
   }
   if (ctx?.dealer_id) {
     await createNotification({
+      userId: ctx.dealer_user_id || null,
       recipientRole: "Dealer",
       type: "new_complaint",
       title: "New customer complaint",
@@ -4614,6 +4911,7 @@ try {
   await ensureTasksSchema();
   await ensureQuotationsSchema();
   await ensureNotificationsSchema();
+  await ensureWorkflowAuditSchema();
 } catch (error) {
   console.warn("Runtime schema check skipped:", error?.message || error);
 }
