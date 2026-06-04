@@ -2975,6 +2975,8 @@ app.post("/warranties/dealer/activate-from-qr", asyncRoute(async (req, res) => {
   const invoiceNo = cleanString(req.body.invoiceNo || req.body.invoice_no);
   const password = typeof req.body.password === "string" ? req.body.password : "";
   const { name, mobile, email, address, city, state, pincode } = req.body;
+  const cleanMobile = normalizeMobileValue(mobile);
+  const cleanEmail = normalizeEmail(email);
 
   if (!dealerId) {
     return res.status(400).json({ error: "Dealer id is required." });
@@ -2986,9 +2988,6 @@ app.post("/warranties/dealer/activate-from-qr", asyncRoute(async (req, res) => {
 
   if (!serialNo) {
     return res.status(400).json({ error: "Serial number is required after scanning product QR." });
-  }
-  if (!password || password.length < 8) {
-    return res.status(400).json({ error: "Customer login password must be at least 8 characters." });
   }
   if (productId) {
     const serialCheck = await query(
@@ -3003,10 +3002,39 @@ app.post("/warranties/dealer/activate-from-qr", asyncRoute(async (req, res) => {
     }
   }
 
+  const existingCustomer = cleanMobile.length >= 10
+    ? await query(
+        `SELECT
+           c.id,
+           c.user_id,
+           u.password_hash,
+           u.email
+         FROM customers c
+         LEFT JOIN users u ON u.id = c.user_id
+         WHERE ${sqlNormalizeMobileColumn("c.mobile")} = ?
+         LIMIT 1`,
+        [cleanMobile]
+      )
+    : { rowCount: 0, rows: [] };
+  const hasExistingLogin = Boolean(
+    existingCustomer.rowCount &&
+      existingCustomer.rows[0]?.user_id &&
+      existingCustomer.rows[0]?.password_hash &&
+      String(existingCustomer.rows[0].password_hash).trim()
+  );
+  if (!hasExistingLogin) {
+    if (!cleanEmail) {
+      return res.status(400).json({ error: "Login Email ID is required for a new customer account." });
+    }
+    if (!password || password.length < 8) {
+      return res.status(400).json({ error: "Customer login password must be at least 8 characters." });
+    }
+  }
+
   const customer = await findOrCreateCustomer({
     name,
     mobile,
-    email,
+    email: cleanEmail || null,
     address,
     city,
     state,
