@@ -1831,10 +1831,13 @@ app.get("/technicians", asyncRoute(async (req, res) => {
        t.*,
        u.email,
        u.status AS user_status,
+       d.name AS dealer_name,
+       d.dealer_no AS dealer_no,
        (SELECT COUNT(*) FROM feedback f WHERE f.technician_id = t.id) AS review_count,
        (SELECT ROUND(AVG(f.rating), 2) FROM feedback f WHERE f.technician_id = t.id) AS avg_rating
      FROM technicians t
      LEFT JOIN users u ON u.id = t.user_id
+     LEFT JOIN dealers d ON d.id = t.created_by_dealer_id
      ${where}
      ORDER BY t.created_at DESC
      LIMIT 800`,
@@ -1858,27 +1861,91 @@ app.patch("/technicians/:id/approval", asyncRoute(async (req, res) => {
     return res.status(400).json({ error: "Status must be Approved or Rejected." });
   }
 
-  const existing = await query("SELECT id, user_id FROM technicians WHERE id = ? LIMIT 1", [technicianId]);
+  const dealerId = cleanString(req.body.dealerId || req.body.dealer_id);
+  const existing = await query(
+    "SELECT id, user_id, created_by_dealer_id FROM technicians WHERE id = ? LIMIT 1",
+    [technicianId]
+  );
   if (!existing.rowCount) {
     return res.status(404).json({ error: "Technician not found." });
   }
 
+  let finalDealerId = existing.rows[0].created_by_dealer_id || null;
+  if (status === "Approved") {
+    if (dealerId) {
+      const dealer = await resolveDealerRecord(dealerId);
+      if (!dealer) {
+        return res.status(400).json({ error: "Dealer not found." });
+      }
+      finalDealerId = dealer.id;
+    }
+    if (!finalDealerId) {
+      return res.status(400).json({
+        error: "Select a dealer before approving. Technician must belong to a dealership.",
+      });
+    }
+  }
+
   await withTransaction(async (tx) => {
-    await tx("UPDATE technicians SET approval_status = ? WHERE id = ?", [status, technicianId]);
+    if (status === "Approved") {
+      await tx(
+        "UPDATE technicians SET approval_status = ?, created_by_dealer_id = ? WHERE id = ?",
+        [status, finalDealerId, technicianId]
+      );
+    } else {
+      await tx("UPDATE technicians SET approval_status = ? WHERE id = ?", [status, technicianId]);
+    }
     if (existing.rows[0].user_id) {
       await tx("UPDATE users SET status = ? WHERE id = ?", [status === "Approved" ? "Active" : "Rejected", existing.rows[0].user_id]);
     }
   });
 
   const result = await query(
-    `SELECT t.*, u.email, u.status AS user_status
+    `SELECT t.*, u.email, u.status AS user_status, d.name AS dealer_name, d.dealer_no AS dealer_no
      FROM technicians t
      LEFT JOIN users u ON u.id = t.user_id
+     LEFT JOIN dealers d ON d.id = t.created_by_dealer_id
      WHERE t.id = ?
      LIMIT 1`,
     [technicianId]
   );
   res.json({ technician: result.rows[0] });
+}));
+
+app.patch("/technicians/:id/dealer", asyncRoute(async (req, res) => {
+  const requesterRole = cleanString(req.body.requesterRole);
+  const dealerId = cleanString(req.body.dealerId || req.body.dealer_id);
+  const technicianId = cleanString(req.params.id);
+
+  if (requesterRole !== "Admin") {
+    return res.status(403).json({ error: "Only Admin can assign technicians to a dealer." });
+  }
+  if (!dealerId) {
+    return res.status(400).json({ error: "dealerId is required." });
+  }
+
+  const dealer = await resolveDealerRecord(dealerId);
+  if (!dealer) {
+    return res.status(400).json({ error: "Dealer not found." });
+  }
+
+  const existing = await query("SELECT id FROM technicians WHERE id = ? LIMIT 1", [technicianId]);
+  if (!existing.rowCount) {
+    return res.status(404).json({ error: "Technician not found." });
+  }
+
+  await query("UPDATE technicians SET created_by_dealer_id = ? WHERE id = ?", [dealer.id, technicianId]);
+
+  const result = await query(
+    `SELECT t.*, u.email, u.status AS user_status, d.name AS dealer_name, d.dealer_no AS dealer_no
+     FROM technicians t
+     LEFT JOIN users u ON u.id = t.user_id
+     LEFT JOIN dealers d ON d.id = t.created_by_dealer_id
+     WHERE t.id = ?
+     LIMIT 1`,
+    [technicianId]
+  );
+  res.json({ technician: result.rows[0], dealer: { id: dealer.id, name: dealer.name, dealer_no: dealer.dealer_no } });
 }));
 
 app.get("/dealers", asyncRoute(async (_req, res) => {
@@ -2913,9 +2980,12 @@ app.get("/dealers/:id/created-technicians", asyncRoute(async (req, res) => {
     `SELECT
        t.*,
        u.email,
-       u.status AS user_status
+       u.status AS user_status,
+       d.name AS dealer_name,
+       d.dealer_no AS dealer_no
      FROM technicians t
      LEFT JOIN users u ON u.id = t.user_id
+     LEFT JOIN dealers d ON d.id = t.created_by_dealer_id
      WHERE t.created_by_dealer_id = ?
      ORDER BY t.created_at DESC
      LIMIT 500`,
