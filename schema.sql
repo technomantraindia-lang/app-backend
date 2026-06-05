@@ -189,6 +189,8 @@ CREATE TABLE IF NOT EXISTS quotations (
   customer_decided_at TIMESTAMP NULL,
   frontdesk_instruction VARCHAR(40),
   frontdesk_instructed_at TIMESTAMP NULL,
+  customer_payment_status VARCHAR(40) NOT NULL DEFAULT 'Pending',
+  customer_paid_at TIMESTAMP NULL,
   sent_to_frontdesk_at TIMESTAMP NULL,
   status VARCHAR(60) NOT NULL DEFAULT 'Pending Customer Approval',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,

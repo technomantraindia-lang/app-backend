@@ -381,6 +381,8 @@ const COMPLAINT_LATEST_QUOTATION_FIELDS = `
        qt.total_amount AS quotation_total,
        qt.technician_remarks AS quotation_technician_remarks,
        qt.customer_remarks AS quotation_customer_remarks,
+       qt.customer_payment_status AS quotation_payment_status,
+       qt.customer_paid_at AS quotation_paid_at,
        qt.created_at AS quotation_created_at`;
 
 function isWarrantyExpiredStatus(status, expiryDate) {
@@ -440,7 +442,9 @@ async function ensureQuotationsSchema() {
     ["customer_decided_at", "ALTER TABLE quotations ADD COLUMN customer_decided_at TIMESTAMP NULL AFTER customer_remarks"],
     ["frontdesk_instruction", "ALTER TABLE quotations ADD COLUMN frontdesk_instruction VARCHAR(40) NULL AFTER customer_decided_at"],
     ["frontdesk_instructed_at", "ALTER TABLE quotations ADD COLUMN frontdesk_instructed_at TIMESTAMP NULL AFTER frontdesk_instruction"],
-    ["sent_to_frontdesk_at", "ALTER TABLE quotations ADD COLUMN sent_to_frontdesk_at TIMESTAMP NULL AFTER status"]
+    ["sent_to_frontdesk_at", "ALTER TABLE quotations ADD COLUMN sent_to_frontdesk_at TIMESTAMP NULL AFTER status"],
+    ["customer_payment_status", "ALTER TABLE quotations ADD COLUMN customer_payment_status VARCHAR(40) NOT NULL DEFAULT 'Pending' AFTER frontdesk_instructed_at"],
+    ["customer_paid_at", "ALTER TABLE quotations ADD COLUMN customer_paid_at TIMESTAMP NULL AFTER customer_payment_status"]
   ];
   for (const [columnName, ddl] of columns) {
     const found = await query(
@@ -1605,9 +1609,11 @@ app.post("/accounts", asyncRoute(async (req, res) => {
 
   if (cleanRole === "Technician") {
     const cleanPincode = cleanString(pincode) || null;
+    const technicianApproval =
+      cleanCreatedByRole === "Dealer" || cleanCreatedByRole === "Admin" ? "Approved" : "Pending";
     await query(
-      "INSERT INTO technicians (user_id, name, mobile, city, pincode, service_areas, approval_status, created_by_dealer_id) VALUES (?, ?, ?, ?, ?, ?, 'Pending', ?)",
-      [userId, cleanName, cleanMobile, city || null, cleanPincode, serviceAreas || null, creatorDealerId]
+      "INSERT INTO technicians (user_id, name, mobile, city, pincode, service_areas, approval_status, created_by_dealer_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      [userId, cleanName, cleanMobile, city || null, cleanPincode, serviceAreas || null, technicianApproval, creatorDealerId]
     );
     const result = await query("SELECT * FROM technicians WHERE user_id = ? LIMIT 1", [userId]);
     technician = result.rows[0] || null;
@@ -2445,6 +2451,115 @@ app.patch("/quotations/:id/customer-decision", asyncRoute(async (req, res) => {
 
   const updated = await fetchQuotationById(quotationId);
   res.json({ quotation: updated });
+}));
+
+/** Customer pays accepted quotation after technician completes the repair. */
+app.post("/quotations/:id/customer-payment", asyncRoute(async (req, res) => {
+  await ensureQuotationsSchema();
+  await ensureNotificationsSchema();
+  await ensureWorkflowAuditSchema();
+  const quotationId = cleanString(req.params.id);
+  const customerId = cleanString(req.body.customerId || req.body.customer_id);
+  const paymentMode = cleanString(req.body.paymentMode || req.body.payment_mode) || "UPI";
+  const transactionRef = cleanString(req.body.transactionRef || req.body.transaction_ref) || null;
+
+  if (!quotationId || !customerId) {
+    return res.status(400).json({ error: "Quotation id and customerId are required." });
+  }
+
+  const row = await fetchQuotationById(quotationId);
+  if (!row) {
+    return res.status(404).json({ error: "Quotation not found." });
+  }
+  if (String(row.customer_id) !== customerId) {
+    return res.status(403).json({ error: "This quotation does not belong to your account." });
+  }
+  if (row.status !== "Accepted by Customer") {
+    return res.status(400).json({ error: "Payment is allowed only after you accept the quotation." });
+  }
+  if (String(row.customer_payment_status || "").toLowerCase() === "paid") {
+    return res.status(409).json({ error: "This quotation is already paid." });
+  }
+  if (!row.complaint_id) {
+    return res.status(400).json({ error: "Complaint not linked to this quotation." });
+  }
+
+  const complaintRow = await query(
+    `SELECT c.status AS complaint_status, t.status AS task_status, t.completed_at
+     FROM complaints c
+     LEFT JOIN tasks t ON t.id = (
+       SELECT t2.id FROM tasks t2 WHERE t2.complaint_id = c.id ORDER BY t2.created_at DESC LIMIT 1
+     )
+     WHERE c.id = ?
+     LIMIT 1`,
+    [row.complaint_id]
+  );
+  if (!complaintRow.rowCount) {
+    return res.status(404).json({ error: "Complaint not found." });
+  }
+  const taskStatus = String(complaintRow.rows[0].task_status || "").toLowerCase();
+  const complaintStatus = String(complaintRow.rows[0].complaint_status || "").toLowerCase();
+  const jobCompleted =
+    taskStatus === "completed" ||
+    taskStatus === "closed" ||
+    complaintStatus.includes("completed") ||
+    complaintStatus.includes("closed") ||
+    complaintStatus.includes("solved");
+  if (!jobCompleted) {
+    return res.status(400).json({
+      error: "Payment opens only after the technician marks the repair as completed.",
+    });
+  }
+
+  const amount = Number(row.total_amount || 0);
+  if (amount <= 0) {
+    return res.status(400).json({ error: "Quotation amount is invalid." });
+  }
+
+  await withTransaction(async (tx) => {
+    await tx(
+      `UPDATE quotations
+       SET customer_payment_status = 'Paid', customer_paid_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [quotationId]
+    );
+    await recordStatusHistory({
+      complaintId: row.complaint_id,
+      oldStatus: complaintRow.rows[0].complaint_status || null,
+      newStatus: complaintRow.rows[0].complaint_status || "Customer Accepted",
+      changedByRole: "Customer",
+      changedById: customerId,
+      remarks: `Quotation paid via ${paymentMode}${transactionRef ? ` (${transactionRef})` : ""}`,
+    }, tx);
+    await createWorkflowMessage({
+      complaintId: row.complaint_id,
+      quotationId,
+      senderRole: "Customer",
+      senderId: customerId,
+      receiverRole: "Front Desk",
+      message: `Customer paid ${row.quotation_no || "quotation"} — Rs ${amount.toFixed(2)} via ${paymentMode}.`,
+    }, tx);
+  });
+
+  await createNotification({
+    recipientRole: "Front Desk",
+    type: "quotation_paid",
+    title: "Customer paid repair quotation",
+    message: `${row.quotation_no || "Quotation"} — Rs ${amount.toFixed(2)} received from customer.`,
+    entityType: "quotation",
+    entityId: quotationId,
+  });
+  await createNotification({
+    customerId,
+    type: "quotation_paid",
+    title: "Payment successful",
+    message: `Thank you. Rs ${amount.toFixed(2)} paid for ${row.quotation_no || "repair quotation"}.`,
+    entityType: "quotation",
+    entityId: quotationId,
+  });
+
+  const updated = await fetchQuotationById(quotationId);
+  res.json({ quotation: updated, paid: true, amount });
 }));
 
 /** Front Desk sends final Proceed / Hold instruction to technician after customer quotation decision. */
