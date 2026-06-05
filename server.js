@@ -1948,6 +1948,136 @@ app.patch("/technicians/:id/dealer", asyncRoute(async (req, res) => {
   res.json({ technician: result.rows[0], dealer: { id: dealer.id, name: dealer.name, dealer_no: dealer.dealer_no } });
 }));
 
+const PAYMENT_LEDGER_TASK_JOIN = `
+     FROM tasks t
+     LEFT JOIN complaints c ON c.id = t.complaint_id
+     LEFT JOIN customers cust ON cust.id = c.customer_id
+     LEFT JOIN payments pay ON pay.task_id = t.id`;
+
+async function ensurePaymentForCompletedTask(taskId, tx) {
+  const taskResult = await tx(
+    "SELECT technician_id, payable_amount FROM tasks WHERE id = ? LIMIT 1",
+    [taskId]
+  );
+  if (!taskResult.rowCount || !taskResult.rows[0].technician_id) {
+    return;
+  }
+  const existing = await tx("SELECT id FROM payments WHERE task_id = ? LIMIT 1", [taskId]);
+  if (existing.rowCount) {
+    return;
+  }
+  const amount = Number(taskResult.rows[0].payable_amount || 0);
+  await tx(
+    "INSERT INTO payments (technician_id, task_id, amount, status) VALUES (?, ?, ?, 'Pending')",
+    [taskResult.rows[0].technician_id, taskId, Number.isFinite(amount) ? amount : 0]
+  );
+}
+
+app.get("/technicians/:id/payment-ledger", asyncRoute(async (req, res) => {
+  const technicianId = cleanString(req.params.id);
+  const month = cleanString(req.query.month || req.query.paymentMonth);
+  const existing = await query("SELECT id, name FROM technicians WHERE id = ? LIMIT 1", [technicianId]);
+  if (!existing.rowCount) {
+    return res.status(404).json({ error: "Technician not found." });
+  }
+
+  await query(
+    `INSERT INTO payments (technician_id, task_id, amount, status)
+     SELECT t.technician_id, t.id, COALESCE(t.payable_amount, 0), 'Pending'
+     FROM tasks t
+     WHERE t.technician_id = ?
+       AND LOWER(TRIM(COALESCE(t.status, ''))) IN ('completed', 'closed')
+       AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.task_id = t.id)`,
+    [technicianId]
+  );
+
+  const where = ["t.technician_id = ?", "LOWER(TRIM(COALESCE(t.status, ''))) IN ('completed', 'closed')"];
+  const params = [technicianId];
+  if (month && month !== "All") {
+    where.push("DATE_FORMAT(COALESCE(t.completed_at, t.created_at), '%Y-%m') = ?");
+    params.push(month);
+  }
+
+  const entries = await query(
+    `SELECT
+       t.id AS task_id,
+       t.task_no,
+       t.work_type,
+       t.status AS task_status,
+       t.payable_amount,
+       t.completed_at,
+       t.created_at,
+       c.complaint_no,
+       cust.name AS customer_name,
+       pay.id AS payment_id,
+       COALESCE(pay.status, 'Pending') AS payment_status,
+       COALESCE(pay.amount, t.payable_amount, 0) AS payment_amount,
+       pay.paid_at
+     ${PAYMENT_LEDGER_TASK_JOIN}
+     WHERE ${where.join(" AND ")}
+     ORDER BY COALESCE(t.completed_at, t.created_at) DESC
+     LIMIT 500`,
+    params
+  );
+
+  const summaryRows = await query(
+    `SELECT
+       COUNT(*) AS tasks_completed,
+       COALESCE(SUM(COALESCE(pay.amount, t.payable_amount, 0)), 0) AS total_payable,
+       COALESCE(SUM(
+         CASE WHEN LOWER(COALESCE(pay.status, 'Pending')) = 'paid'
+         THEN COALESCE(pay.amount, t.payable_amount, 0) ELSE 0 END
+       ), 0) AS paid_amount
+     ${PAYMENT_LEDGER_TASK_JOIN}
+     WHERE ${where.join(" AND ")}`,
+    params
+  );
+  const summaryRow = summaryRows.rows[0] || {};
+  const totalPayable = Number(summaryRow.total_payable || 0);
+  const paidAmount = Number(summaryRow.paid_amount || 0);
+
+  res.json({
+    technician: existing.rows[0],
+    month: month || "All",
+    summary: {
+      tasksCompleted: Number(summaryRow.tasks_completed || 0),
+      totalPayable,
+      paidAmount,
+      pendingBalance: Math.max(0, totalPayable - paidAmount),
+    },
+    entries: entries.rows,
+  });
+}));
+
+app.patch("/payments/:id", asyncRoute(async (req, res) => {
+  const paymentId = cleanString(req.params.id);
+  const requesterRole = cleanString(req.body.requesterRole);
+  const status = cleanString(req.body.status);
+  if (requesterRole !== "Admin") {
+    return res.status(403).json({ error: "Only Admin can update payment records." });
+  }
+  if (!["Pending", "Paid"].includes(status)) {
+    return res.status(400).json({ error: "Status must be Pending or Paid." });
+  }
+
+  const existing = await query("SELECT id FROM payments WHERE id = ? LIMIT 1", [paymentId]);
+  if (!existing.rowCount) {
+    return res.status(404).json({ error: "Payment record not found." });
+  }
+
+  if (status === "Paid") {
+    await query(
+      "UPDATE payments SET status = 'Paid', paid_at = COALESCE(paid_at, CURRENT_TIMESTAMP) WHERE id = ?",
+      [paymentId]
+    );
+  } else {
+    await query("UPDATE payments SET status = 'Pending', paid_at = NULL WHERE id = ?", [paymentId]);
+  }
+
+  const result = await query("SELECT * FROM payments WHERE id = ? LIMIT 1", [paymentId]);
+  res.json({ payment: result.rows[0] });
+}));
+
 app.get("/dealers", asyncRoute(async (_req, res) => {
   const result = await query(
     `SELECT
@@ -4401,6 +4531,7 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
         "UPDATE tasks SET status = ?, completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP), resolution_notes = COALESCE(?, resolution_notes) WHERE id = ?",
         [status, resolutionNotes, id]
       );
+      await ensurePaymentForCompletedTask(id, tx);
     } else if (resolutionNotes) {
       await tx("UPDATE tasks SET status = ?, resolution_notes = ? WHERE id = ?", [status, resolutionNotes, id]);
     } else {
