@@ -2336,6 +2336,9 @@ app.patch("/quotations/:id/customer-decision", asyncRoute(async (req, res) => {
   if (!["Accepted", "Rejected"].includes(decision)) {
     return res.status(400).json({ error: "decision must be Accepted or Rejected." });
   }
+  if (decision === "Rejected" && (!customerRemarks || customerRemarks.length < 3)) {
+    return res.status(400).json({ error: "Rejection reason is required (at least 3 characters)." });
+  }
 
   const row = await fetchQuotationById(quotationId);
   if (!row) {
@@ -2349,7 +2352,7 @@ app.patch("/quotations/:id/customer-decision", asyncRoute(async (req, res) => {
   }
 
   const nextStatus = decision === "Accepted" ? "Accepted by Customer" : "Rejected by Customer";
-  const nextComplaintStatus = decision === "Accepted" ? "Customer Accepted" : "Customer Rejected";
+  const nextComplaintStatus = decision === "Accepted" ? "Customer Accepted" : "Quotation Rejected";
 
   await withTransaction(async (tx) => {
     await tx(
@@ -2360,6 +2363,16 @@ app.patch("/quotations/:id/customer-decision", asyncRoute(async (req, res) => {
     );
     if (row.complaint_id) {
       await tx("UPDATE complaints SET status = ? WHERE id = ?", [nextComplaintStatus, row.complaint_id]);
+      if (decision === "Rejected") {
+        await tx(
+          `UPDATE tasks
+           SET status = 'Closed',
+               completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+               resolution_notes = COALESCE(?, resolution_notes)
+           WHERE complaint_id = ? AND technician_id IS NOT NULL`,
+          [`Customer rejected quotation: ${customerRemarks}`, row.complaint_id]
+        );
+      }
       await recordStatusHistory({
         complaintId: row.complaint_id,
         oldStatus: row.complaint_status || null,
@@ -2374,7 +2387,10 @@ app.patch("/quotations/:id/customer-decision", asyncRoute(async (req, res) => {
         senderRole: "Customer",
         senderId: customerId,
         receiverRole: "Front Desk",
-        message: customerRemarks || `Customer ${decision.toLowerCase()} quotation ${row.quotation_no || ""}.`,
+        message:
+          decision === "Rejected"
+            ? `Customer rejected quotation ${row.quotation_no || ""}. Reason: ${customerRemarks}`
+            : customerRemarks || `Customer accepted quotation ${row.quotation_no || ""}.`,
       }, tx);
     }
   });
@@ -2385,7 +2401,10 @@ app.patch("/quotations/:id/customer-decision", asyncRoute(async (req, res) => {
       recipientRole: "Front Desk",
       type: "quotation_customer_decision",
       title: decision === "Accepted" ? "Customer accepted quotation" : "Customer rejected quotation",
-      message: `${row.quotation_no || "Quotation"} — ${decision} by customer. Send final instruction to technician.`,
+      message:
+        decision === "Accepted"
+          ? `${row.quotation_no || "Quotation"} accepted by customer. Review and send final instruction to technician.`
+          : `${row.quotation_no || "Quotation"} rejected by customer. Reason: ${customerRemarks}`,
       entityType: "quotation",
       entityId: quotationId,
     });
@@ -2530,11 +2549,14 @@ app.patch("/quotations/:id/admin-decision", asyncRoute(async (req, res) => {
         quotationId
       ]);
       if (row.complaint_id) {
-        await tx("UPDATE complaints SET status = ? WHERE id = ?", ["Quotation Pending", row.complaint_id]);
+        await tx(
+          "UPDATE complaints SET status = ?, warranty_status = ? WHERE id = ?",
+          ["Warranty Expired", "Expired", row.complaint_id]
+        );
         await recordStatusHistory({
           complaintId: row.complaint_id,
           oldStatus: row.complaint_status || null,
-          newStatus: "Quotation Pending",
+          newStatus: "Warranty Expired",
           changedByRole: "Front Desk",
           remarks: remarks || "Warranty expired; quotation sent to customer",
         }, tx);
@@ -3621,7 +3643,8 @@ app.get("/complaints", asyncRoute(async (_req, res) => {
        COALESCE(c.model_no, p.model_no) AS model_no,
        d.dealer_no,
        d.name AS dealer_name,
-       ${COMPLAINT_LATEST_TASK_FIELDS}
+       ${COMPLAINT_LATEST_TASK_FIELDS},
+       ${COMPLAINT_LATEST_QUOTATION_FIELDS}
      FROM complaints c
      LEFT JOIN warranties w ON w.id = c.warranty_id
      LEFT JOIN customers cust ON cust.id = c.customer_id
@@ -3630,6 +3653,7 @@ app.get("/complaints", asyncRoute(async (_req, res) => {
      LEFT JOIN dealers d ON d.id = COALESCE(w.dealer_id, s.dealer_id)
      ${COMPLAINT_LATEST_TASK_JOIN}
      ${COMPLAINT_FEEDBACK_JOIN}
+     ${COMPLAINT_LATEST_QUOTATION_JOIN}
      ORDER BY c.created_at DESC
      LIMIT 800`
   );
@@ -4057,6 +4081,7 @@ app.get("/tasks", asyncRoute(async (req, res) => {
   if (technicianId) {
     where.push("t.technician_id = ?");
     params.push(technicianId);
+    where.push("(c.status IS NULL OR c.status NOT IN ('Quotation Rejected', 'Customer Rejected'))");
   }
   const sqlWhere = where.length ? `WHERE ${where.join(" AND ")}` : "";
   const result = await query(
@@ -4581,7 +4606,8 @@ app.get("/complaints/dealer/:dealerId", asyncRoute(async (req, res) => {
        COALESCE(c.model_no, p.model_no) AS model_no,
        d.dealer_no,
        d.name AS dealer_name,
-       ${COMPLAINT_LATEST_TASK_FIELDS}
+       ${COMPLAINT_LATEST_TASK_FIELDS},
+       ${COMPLAINT_LATEST_QUOTATION_FIELDS}
      FROM complaints c
      LEFT JOIN warranties w ON w.id = c.warranty_id
      LEFT JOIN customers cust ON cust.id = c.customer_id
@@ -4590,6 +4616,7 @@ app.get("/complaints/dealer/:dealerId", asyncRoute(async (req, res) => {
      LEFT JOIN dealers d ON d.id = COALESCE(c.dealer_id, w.dealer_id, s.dealer_id)
      ${COMPLAINT_LATEST_TASK_JOIN}
      ${COMPLAINT_FEEDBACK_JOIN}
+     ${COMPLAINT_LATEST_QUOTATION_JOIN}
      WHERE COALESCE(c.dealer_id, w.dealer_id, s.dealer_id) = ?
      ORDER BY c.created_at DESC`,
     [dealerId]
