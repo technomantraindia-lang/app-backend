@@ -184,6 +184,29 @@ function cleanString(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+/** 0 = no warranty period (product treated as expired). Years input is converted to months. */
+function resolveProductWarrantyMonths(body = {}) {
+  if (body.warrantyYears !== undefined || body.warranty_years !== undefined) {
+    const yearsRaw = cleanString(body.warrantyYears ?? body.warranty_years);
+    if (!yearsRaw) {
+      return 0;
+    }
+    const years = Number(yearsRaw);
+    return Number.isFinite(years) && years > 0 ? Math.round(years * 12) : 0;
+  }
+  const monthsRaw = body.warrantyMonths ?? body.warranty_months;
+  if (monthsRaw === "" || monthsRaw === null || monthsRaw === undefined) {
+    return 0;
+  }
+  const months = Number(monthsRaw);
+  return Number.isFinite(months) && months > 0 ? Math.round(months) : 0;
+}
+
+function productHasWarrantyCoverage(warrantyMonths) {
+  const months = Number(warrantyMonths);
+  return Number.isFinite(months) && months > 0;
+}
+
 /** Customer login accounts must have a customers row for lists and dashboard counts. */
 async function syncCustomerProfilesFromUsers(runQuery = query) {
   await runQuery(
@@ -2869,7 +2892,7 @@ app.get("/products/print-sticker", asyncRoute(async (req, res) => {
       <div class="brand">Hitaishi CRM</div>
       <div class="product">${escapeHtml(product.name)}</div>
       <div class="model">${escapeHtml(product.model_no)}</div>
-      <div class="meta">${escapeHtml(product.category || "Product")} · ${Number(product.warranty_months || 12)} months warranty</div>
+      <div class="meta">${escapeHtml(product.category || "Product")} · ${productHasWarrantyCoverage(product.warranty_months) ? `${Number(product.warranty_months)} months warranty` : "Warranty expired / not set"}</div>
       <a class="download" href="${qrUrl}">Download QR</a>
     </section>`;
   res.type("html").send(`<!doctype html>
@@ -3022,7 +3045,7 @@ app.post("/products", asyncRoute(async (req, res) => {
   const name = cleanString(req.body.name);
   const modelNo = cleanString(req.body.modelNo || req.body.model_no);
   const category = cleanString(req.body.category) || null;
-  const warrantyMonths = Number(req.body.warrantyMonths || req.body.warranty_months || 12);
+  const warrantyMonths = resolveProductWarrantyMonths(req.body);
 
   if (!name || !modelNo) {
     return res.status(400).json({ error: "Product name and model number are required." });
@@ -3035,7 +3058,7 @@ app.post("/products", asyncRoute(async (req, res) => {
 
   await query(
     "INSERT INTO products (name, model_no, category, warranty_months) VALUES (?, ?, ?, ?)",
-    [name, modelNo, category, Number.isFinite(warrantyMonths) && warrantyMonths > 0 ? warrantyMonths : 12]
+    [name, modelNo, category, warrantyMonths]
   );
   const result = await query("SELECT * FROM products WHERE model_no = ? LIMIT 1", [modelNo]);
   res.status(201).json({ product: result.rows[0] });
@@ -3046,7 +3069,7 @@ app.patch("/products/:id", asyncRoute(async (req, res) => {
   const name = cleanString(req.body.name);
   const modelNo = cleanString(req.body.modelNo || req.body.model_no);
   const category = cleanString(req.body.category) || null;
-  const warrantyMonths = Number(req.body.warrantyMonths || req.body.warranty_months || 12);
+  const warrantyMonths = resolveProductWarrantyMonths(req.body);
 
   if (!id || !name || !modelNo) {
     return res.status(400).json({ error: "Product id, name, and model number are required." });
@@ -3059,7 +3082,7 @@ app.patch("/products/:id", asyncRoute(async (req, res) => {
 
   const result = await query(
     "UPDATE products SET name = ?, model_no = ?, category = ?, warranty_months = ? WHERE id = ?",
-    [name, modelNo, category, Number.isFinite(warrantyMonths) && warrantyMonths > 0 ? warrantyMonths : 12, id]
+    [name, modelNo, category, warrantyMonths, id]
   );
   if (!result.affectedRows) {
     return res.status(404).json({ error: "Product not found." });
@@ -3446,28 +3469,51 @@ async function activateWarrantyFromSerial({ customerId, serialNo, purchaseDate, 
     throw err;
   }
 
-  const months = Number(row.warranty_months || 12);
+  const months = Number(row.warranty_months);
+  const hasWarranty = productHasWarrantyCoverage(months);
   const warrantyNo = existing.rowCount ? existing.rows[0].warranty_no : `WAR-${Date.now()}`;
   const startDate = purchaseDate || new Date().toISOString().slice(0, 10);
+  const warrantyStatus = hasWarranty ? "Active" : "Expired";
 
   if (existing.rowCount) {
+    if (hasWarranty) {
+      await query(
+        `UPDATE warranties
+         SET customer_id = ?,
+             dealer_id = COALESCE(dealer_id, ?),
+             start_date = COALESCE(start_date, ?),
+             expiry_date = COALESCE(expiry_date, DATE_ADD(?, INTERVAL ? MONTH)),
+             status = ?,
+             installation_status = CASE WHEN installation_status IS NULL OR installation_status = '' THEN 'Required' ELSE installation_status END
+         WHERE id = ?`,
+        [customerId, warrantyDealerId, startDate, startDate, months, warrantyStatus, existing.rows[0].id]
+      );
+    } else {
+      await query(
+        `UPDATE warranties
+         SET customer_id = ?,
+             dealer_id = COALESCE(dealer_id, ?),
+             start_date = COALESCE(start_date, ?),
+             expiry_date = COALESCE(expiry_date, DATE_SUB(?, INTERVAL 1 DAY)),
+             status = ?,
+             installation_status = CASE WHEN installation_status IS NULL OR installation_status = '' THEN 'Required' ELSE installation_status END
+         WHERE id = ?`,
+        [customerId, warrantyDealerId, startDate, startDate, warrantyStatus, existing.rows[0].id]
+      );
+    }
+  } else if (hasWarranty) {
     await query(
-      `UPDATE warranties
-       SET customer_id = ?,
-           dealer_id = COALESCE(dealer_id, ?),
-           start_date = COALESCE(start_date, ?),
-           expiry_date = COALESCE(expiry_date, DATE_ADD(?, INTERVAL ? MONTH)),
-           status = 'Active',
-           installation_status = CASE WHEN installation_status IS NULL OR installation_status = '' THEN 'Required' ELSE installation_status END
-       WHERE id = ?`,
-      [customerId, warrantyDealerId, startDate, startDate, months, existing.rows[0].id]
+      `INSERT INTO warranties
+       (warranty_no, customer_id, dealer_id, serial_id, start_date, expiry_date, status, installation_status)
+       VALUES (?, ?, ?, ?, ?, DATE_ADD(?, INTERVAL ? MONTH), ?, 'Required')`,
+      [warrantyNo, customerId, warrantyDealerId, row.id, startDate, startDate, months, warrantyStatus]
     );
   } else {
     await query(
       `INSERT INTO warranties
        (warranty_no, customer_id, dealer_id, serial_id, start_date, expiry_date, status, installation_status)
-       VALUES (?, ?, ?, ?, ?, DATE_ADD(?, INTERVAL ? MONTH), 'Active', 'Required')`,
-      [warrantyNo, customerId, warrantyDealerId, row.id, startDate, startDate, months]
+       VALUES (?, ?, ?, ?, ?, DATE_SUB(?, INTERVAL 1 DAY), ?, 'Required')`,
+      [warrantyNo, customerId, warrantyDealerId, row.id, startDate, startDate, warrantyStatus]
     );
   }
 
