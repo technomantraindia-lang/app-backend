@@ -57,9 +57,11 @@ CREATE TABLE IF NOT EXISTS product_categories (
   name VARCHAR(120) NOT NULL UNIQUE,
   model_prefix VARCHAR(100) NOT NULL DEFAULT '',
   model_number_width INT NOT NULL DEFAULT 1,
+  model_start_number BIGINT NOT NULL DEFAULT 1,
   next_model_number BIGINT NOT NULL,
   serial_prefix VARCHAR(100) NOT NULL DEFAULT '',
   serial_number_width INT NOT NULL DEFAULT 1,
+  serial_start_number BIGINT NOT NULL DEFAULT 1,
   next_serial_number BIGINT NOT NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

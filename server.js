@@ -909,6 +909,82 @@ function formatSequenceNumber(prefix, width, number) {
   return `${prefix}${String(number).padStart(width, "0")}`;
 }
 
+function categoryPrefixFromName(name) {
+  const cleaned = cleanString(name).replace(/[^A-Za-z0-9\s]/g, " ").trim();
+  if (!cleaned) {
+    return "C-";
+  }
+  const words = cleaned.split(/\s+/).filter(Boolean);
+  const code =
+    words.length >= 2
+      ? words.map((word) => word[0]).join("").toUpperCase()
+      : words[0].toUpperCase().slice(0, 3);
+  return `${code.slice(0, 4)}-`;
+}
+
+function applyCategorySequencePrefixes(name, model, serial) {
+  const categoryPrefix = categoryPrefixFromName(name);
+  return {
+    model: {
+      ...model,
+      prefix: model.prefix || categoryPrefix,
+    },
+    serial: {
+      ...serial,
+      prefix: serial.prefix || categoryPrefix,
+    },
+  };
+}
+
+function parseSequenceSuffix(fullValue, prefix, width) {
+  const value = cleanString(fullValue);
+  if (!value || !value.startsWith(prefix)) {
+    return null;
+  }
+  const suffix = value.slice(prefix.length);
+  if (!/^\d+$/.test(suffix) || suffix.length !== width) {
+    return null;
+  }
+  return Number.parseInt(suffix, 10);
+}
+
+async function resolveCategorySequenceNext(category, tx) {
+  const run = tx || query;
+  const startModel = Number(category.model_start_number ?? category.next_model_number ?? 1);
+  const startSerial = Number(category.serial_start_number ?? category.next_serial_number ?? 1);
+  const rows = await run(
+    `SELECT p.model_no, s.serial_no
+     FROM products p
+     LEFT JOIN serial_numbers s ON s.product_id = p.id
+     WHERE p.category_id = ?`,
+    [category.id]
+  );
+  if (!rows.rowCount) {
+    return {
+      modelNext: startModel,
+      serialNext: startSerial,
+      productCount: 0,
+    };
+  }
+  let maxModel = startModel - 1;
+  let maxSerial = startSerial - 1;
+  rows.rows.forEach((row) => {
+    const modelNum = parseSequenceSuffix(row.model_no, category.model_prefix, category.model_number_width);
+    const serialNum = parseSequenceSuffix(row.serial_no, category.serial_prefix, category.serial_number_width);
+    if (modelNum !== null) {
+      maxModel = Math.max(maxModel, modelNum);
+    }
+    if (serialNum !== null) {
+      maxSerial = Math.max(maxSerial, serialNum);
+    }
+  });
+  return {
+    modelNext: Math.max(startModel, maxModel + 1),
+    serialNext: Math.max(startSerial, maxSerial + 1),
+    productCount: rows.rowCount,
+  };
+}
+
 async function ensureProductCategoriesSchema() {
   await query(
     `CREATE TABLE IF NOT EXISTS product_categories (
@@ -916,13 +992,64 @@ async function ensureProductCategoriesSchema() {
        name VARCHAR(120) NOT NULL UNIQUE,
        model_prefix VARCHAR(100) NOT NULL DEFAULT '',
        model_number_width INT NOT NULL DEFAULT 1,
+       model_start_number BIGINT NOT NULL DEFAULT 1,
        next_model_number BIGINT NOT NULL,
        serial_prefix VARCHAR(100) NOT NULL DEFAULT '',
        serial_number_width INT NOT NULL DEFAULT 1,
+       serial_start_number BIGINT NOT NULL DEFAULT 1,
        next_serial_number BIGINT NOT NULL,
        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
   );
+  const categoryColumns = [
+    ["model_start_number", "ALTER TABLE product_categories ADD COLUMN model_start_number BIGINT NOT NULL DEFAULT 1 AFTER model_number_width"],
+    ["serial_start_number", "ALTER TABLE product_categories ADD COLUMN serial_start_number BIGINT NOT NULL DEFAULT 1 AFTER serial_number_width"],
+  ];
+  for (const [columnName, alterSql] of categoryColumns) {
+    const exists = await query(
+      `SELECT COLUMN_NAME
+       FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE()
+         AND TABLE_NAME = 'product_categories'
+         AND COLUMN_NAME = ?
+       LIMIT 1`,
+      [columnName]
+    );
+    if (!exists.rowCount) {
+      await query(alterSql);
+    }
+  }
+  const startModelExists = await query(
+    `SELECT COLUMN_NAME
+     FROM INFORMATION_SCHEMA.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE()
+       AND TABLE_NAME = 'product_categories'
+       AND COLUMN_NAME = 'model_start_number'
+     LIMIT 1`
+  );
+  if (startModelExists.rowCount) {
+    await query(
+      `UPDATE product_categories
+       SET model_start_number = COALESCE(NULLIF(model_start_number, 0), next_model_number),
+           serial_start_number = COALESCE(NULLIF(serial_start_number, 0), next_serial_number)
+       WHERE model_start_number = 1
+         AND serial_start_number = 1
+         AND (next_model_number <> 1 OR next_serial_number <> 1)`
+    );
+  }
+  const emptySerialPrefix = await query(
+    `SELECT id, name FROM product_categories WHERE TRIM(serial_prefix) = '' OR serial_prefix IS NULL`
+  );
+  for (const row of emptySerialPrefix.rows) {
+    const prefix = categoryPrefixFromName(row.name);
+    await query(
+      `UPDATE product_categories
+       SET serial_prefix = CASE WHEN TRIM(serial_prefix) = '' OR serial_prefix IS NULL THEN ? ELSE serial_prefix END,
+           model_prefix = CASE WHEN TRIM(model_prefix) = '' OR model_prefix IS NULL THEN ? ELSE model_prefix END
+       WHERE id = ?`,
+      [prefix, prefix, row.id]
+    );
+  }
   const categoryColumn = await query(
     `SELECT COLUMN_NAME
      FROM INFORMATION_SCHEMA.COLUMNS
@@ -3390,6 +3517,8 @@ app.get("/product-categories", asyncRoute(async (_req, res) => {
   const result = await query(
     `SELECT
        c.*,
+       CONCAT(c.model_prefix, LPAD(COALESCE(c.model_start_number, c.next_model_number), c.model_number_width, '0')) AS starting_model_no,
+       CONCAT(c.serial_prefix, LPAD(COALESCE(c.serial_start_number, c.next_serial_number), c.serial_number_width, '0')) AS starting_serial_no,
        CONCAT(c.model_prefix, LPAD(c.next_model_number, c.model_number_width, '0')) AS next_model_no,
        CONCAT(c.serial_prefix, LPAD(c.next_serial_number, c.serial_number_width, '0')) AS next_serial_no,
        COUNT(p.id) AS product_count
@@ -3408,12 +3537,24 @@ app.post("/product-categories", asyncRoute(async (req, res) => {
   }
   const model = parseSequenceSeed(req.body.modelStart || req.body.model_start, "Model starting number");
   const serial = parseSequenceSeed(req.body.serialStart || req.body.serial_start, "Serial starting number");
+  const sequences = applyCategorySequencePrefixes(name, model, serial);
   const id = crypto.randomUUID();
   await query(
     `INSERT INTO product_categories
-       (id, name, model_prefix, model_number_width, next_model_number, serial_prefix, serial_number_width, next_serial_number)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    [id, name, model.prefix, model.width, model.nextNumber, serial.prefix, serial.width, serial.nextNumber]
+       (id, name, model_prefix, model_number_width, model_start_number, next_model_number, serial_prefix, serial_number_width, serial_start_number, next_serial_number)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      id,
+      name,
+      sequences.model.prefix,
+      sequences.model.width,
+      sequences.model.nextNumber,
+      sequences.model.nextNumber,
+      sequences.serial.prefix,
+      sequences.serial.width,
+      sequences.serial.nextNumber,
+      sequences.serial.nextNumber,
+    ]
   );
   const result = await query("SELECT * FROM product_categories WHERE id = ? LIMIT 1", [id]);
   res.status(201).json({ category: result.rows[0] });
@@ -3658,18 +3799,21 @@ app.post("/products/bulk", asyncRoute(async (req, res) => {
       throw err;
     }
     const category = categoryResult.rows[0];
+    const sequence = await resolveCategorySequenceNext(category, run);
+    const modelBase = sequence.modelNext;
+    const serialBase = sequence.serialNext;
     const products = [];
 
     for (let index = 0; index < quantity; index += 1) {
       const modelNo = formatSequenceNumber(
         category.model_prefix,
         category.model_number_width,
-        Number(category.next_model_number) + index
+        modelBase + index
       );
       const serialNo = formatSequenceNumber(
         category.serial_prefix,
         category.serial_number_width,
-        Number(category.next_serial_number) + index
+        serialBase + index
       );
       const productId = crypto.randomUUID();
       const serialId = crypto.randomUUID();
@@ -3696,7 +3840,7 @@ app.post("/products/bulk", asyncRoute(async (req, res) => {
       `UPDATE product_categories
        SET next_model_number = ?, next_serial_number = ?
        WHERE id = ?`,
-      [Number(category.next_model_number) + quantity, Number(category.next_serial_number) + quantity, categoryId]
+      [modelBase + quantity, serialBase + quantity, categoryId]
     );
 
     return products;
