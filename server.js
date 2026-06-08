@@ -5403,6 +5403,48 @@ app.post("/dispatch/to-dealer", asyncRoute(async (req, res) => {
   });
 }));
 
+app.get("/dispatch/batches", asyncRoute(async (_req, res) => {
+  const result = await query(
+    `SELECT
+       s.batch_no,
+       s.dealer_id,
+       d.dealer_no,
+       d.name AS dealer_name,
+       MIN(s.dispatch_date) AS dispatch_date,
+       MAX(s.dispatched_at) AS dispatched_at,
+       MAX(s.invoice_no) AS invoice_no,
+       MAX(s.challan_no) AS challan_no,
+       COUNT(s.id) AS unit_count,
+       SUM(CASE WHEN s.qr_status = 'Printed' THEN 1 ELSE 0 END) AS qr_ready_count,
+       GROUP_CONCAT(DISTINCT p.name ORDER BY p.name SEPARATOR ', ') AS product_summary
+     FROM serial_numbers s
+     INNER JOIN dealers d ON d.id = s.dealer_id
+     LEFT JOIN products p ON p.id = s.product_id
+     WHERE s.dispatch_status = 'Dispatched'
+       AND s.batch_no IS NOT NULL
+       AND TRIM(s.batch_no) <> ''
+     GROUP BY s.batch_no, s.dealer_id, d.dealer_no, d.name
+     ORDER BY MAX(s.dispatched_at) DESC, s.batch_no DESC
+     LIMIT 200`
+  );
+  res.json({
+    batches: result.rows.map((row) => ({
+      batchNo: row.batch_no,
+      dealerId: row.dealer_id,
+      dealerNo: row.dealer_no,
+      dealerName: row.dealer_name,
+      dispatchDate: row.dispatch_date,
+      dispatchedAt: row.dispatched_at,
+      invoiceNo: row.invoice_no,
+      challanNo: row.challan_no,
+      unitCount: Number(row.unit_count || 0),
+      qrReadyCount: Number(row.qr_ready_count || 0),
+      productSummary: row.product_summary || "",
+      printSheetUrl: `/dispatch/qr-print-sheet?batchNo=${encodeURIComponent(row.batch_no)}`,
+    })),
+  });
+}));
+
 app.get("/dispatch/qr-print-sheet", asyncRoute(async (req, res) => {
   const batchNo = cleanString(req.query.batchNo || req.query.batch_no);
   const requested = cleanString(req.query.serials)
