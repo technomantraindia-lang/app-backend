@@ -207,6 +207,31 @@ function productHasWarrantyCoverage(warrantyMonths) {
   return Number.isFinite(months) && months > 0;
 }
 
+function parseSequenceSeed(value, label) {
+  const seed = cleanString(value);
+  const match = seed.match(/^(.*?)(\d+)$/);
+  if (!match) {
+    const error = new Error(`${label} must end with a number, for example MOD-001.`);
+    error.statusCode = 400;
+    throw error;
+  }
+  const number = Number(match[2]);
+  if (!Number.isSafeInteger(number) || number < 0) {
+    const error = new Error(`${label} has an invalid numeric value.`);
+    error.statusCode = 400;
+    throw error;
+  }
+  return {
+    prefix: match[1],
+    width: match[2].length,
+    nextNumber: number,
+  };
+}
+
+function formatSequenceValue(prefix, number, width) {
+  return `${prefix || ""}${String(number).padStart(Math.max(1, Number(width) || 1), "0")}`;
+}
+
 /** Customer login accounts must have a customers row for lists and dashboard counts. */
 async function syncCustomerProfilesFromUsers(runQuery = query) {
   await runQuery(
@@ -717,6 +742,37 @@ async function ensureProductsQrSchema() {
     if (!found.rowCount) {
       await query(ddl);
     }
+  }
+}
+
+async function ensureProductCategoriesSchema() {
+  await query(
+    `CREATE TABLE IF NOT EXISTS product_categories (
+       id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
+       name VARCHAR(120) NOT NULL UNIQUE,
+       model_prefix VARCHAR(100) NOT NULL DEFAULT '',
+       model_number_width INT NOT NULL DEFAULT 1,
+       next_model_number BIGINT NOT NULL,
+       serial_prefix VARCHAR(100) NOT NULL DEFAULT '',
+       serial_number_width INT NOT NULL DEFAULT 1,
+       next_serial_number BIGINT NOT NULL,
+       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
+  );
+  const categoryColumn = await query(
+    `SELECT COLUMN_NAME
+     FROM INFORMATION_SCHEMA.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE()
+       AND TABLE_NAME = 'products'
+       AND COLUMN_NAME = 'category_id'
+     LIMIT 1`
+  );
+  if (!categoryColumn.rowCount) {
+    await query("ALTER TABLE products ADD COLUMN category_id CHAR(36) NULL AFTER category");
+    await query("ALTER TABLE products ADD INDEX idx_products_category_id (category_id)");
+    await query(
+      "ALTER TABLE products ADD CONSTRAINT fk_products_category FOREIGN KEY (category_id) REFERENCES product_categories(id) ON DELETE SET NULL"
+    );
   }
 }
 
@@ -3181,8 +3237,61 @@ app.delete("/dealers/:id", asyncRoute(async (req, res) => {
   res.json({ ok: true });
 }));
 
+app.get("/product-categories", asyncRoute(async (_req, res) => {
+  const result = await query(
+    `SELECT
+       c.*,
+       CONCAT(c.model_prefix, LPAD(c.next_model_number, c.model_number_width, '0')) AS next_model_no,
+       CONCAT(c.serial_prefix, LPAD(c.next_serial_number, c.serial_number_width, '0')) AS next_serial_no,
+       COUNT(p.id) AS product_count
+     FROM product_categories c
+     LEFT JOIN products p ON p.category_id = c.id
+     GROUP BY c.id
+     ORDER BY c.name`
+  );
+  res.json({ categories: result.rows });
+}));
+
+app.post("/product-categories", asyncRoute(async (req, res) => {
+  const name = cleanString(req.body.name);
+  if (!name) {
+    return res.status(400).json({ error: "Category name is required." });
+  }
+  const model = parseSequenceSeed(req.body.modelStart || req.body.model_start, "Model starting number");
+  const serial = parseSequenceSeed(req.body.serialStart || req.body.serial_start, "Serial starting number");
+  const id = crypto.randomUUID();
+  await query(
+    `INSERT INTO product_categories
+       (id, name, model_prefix, model_number_width, next_model_number, serial_prefix, serial_number_width, next_serial_number)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [id, name, model.prefix, model.width, model.nextNumber, serial.prefix, serial.width, serial.nextNumber]
+  );
+  const result = await query("SELECT * FROM product_categories WHERE id = ? LIMIT 1", [id]);
+  res.status(201).json({ category: result.rows[0] });
+}));
+
+app.delete("/product-categories/:id", asyncRoute(async (req, res) => {
+  const id = cleanString(req.params.id);
+  const linked = await query("SELECT id FROM products WHERE category_id = ? LIMIT 1", [id]);
+  if (linked.rowCount) {
+    return res.status(409).json({ error: "Category is already used by products and cannot be deleted." });
+  }
+  const result = await query("DELETE FROM product_categories WHERE id = ?", [id]);
+  if (!result.affectedRows) {
+    return res.status(404).json({ error: "Category not found." });
+  }
+  res.json({ ok: true });
+}));
+
 app.get("/products", asyncRoute(async (_req, res) => {
-  const result = await query("SELECT * FROM products ORDER BY created_at DESC LIMIT 800");
+  const result = await query(
+    `SELECT
+       p.*,
+       (SELECT s.serial_no FROM serial_numbers s WHERE s.product_id = p.id ORDER BY s.created_at LIMIT 1) AS serial_no
+     FROM products p
+     ORDER BY p.created_at DESC
+     LIMIT 800`
+  );
   res.json({ products: result.rows });
 }));
 
@@ -3377,6 +3486,84 @@ app.post("/products", asyncRoute(async (req, res) => {
   );
   const result = await query("SELECT * FROM products WHERE model_no = ? LIMIT 1", [modelNo]);
   res.status(201).json({ product: result.rows[0] });
+}));
+
+app.post("/products/bulk", asyncRoute(async (req, res) => {
+  const name = cleanString(req.body.name);
+  const categoryId = cleanString(req.body.categoryId || req.body.category_id);
+  const quantity = Number(req.body.quantity);
+  const warrantyMonths = resolveProductWarrantyMonths(req.body);
+
+  if (!name || !categoryId) {
+    return res.status(400).json({ error: "Product name and category are required." });
+  }
+  if (!Number.isInteger(quantity) || quantity < 1 || quantity > 500) {
+    return res.status(400).json({ error: "Quantity must be a whole number between 1 and 500." });
+  }
+
+  const created = await withTransaction(async (tx) => {
+    const categoryResult = await tx(
+      "SELECT * FROM product_categories WHERE id = ? LIMIT 1 FOR UPDATE",
+      [categoryId]
+    );
+    if (!categoryResult.rowCount) {
+      const error = new Error("Selected category was not found.");
+      error.statusCode = 404;
+      throw error;
+    }
+    const category = categoryResult.rows[0];
+    const products = [];
+
+    for (let index = 0; index < quantity; index += 1) {
+      const modelNo = formatSequenceValue(
+        category.model_prefix,
+        Number(category.next_model_number) + index,
+        category.model_number_width
+      );
+      const serialNo = formatSequenceValue(
+        category.serial_prefix,
+        Number(category.next_serial_number) + index,
+        category.serial_number_width
+      );
+      const productId = crypto.randomUUID();
+      const serialId = crypto.randomUUID();
+      await tx(
+        `INSERT INTO products (id, name, model_no, category, category_id, warranty_months)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [productId, name, modelNo, category.name, category.id, warrantyMonths]
+      );
+      await tx(
+        `INSERT INTO serial_numbers
+           (id, product_id, serial_no, qr_status, qr_payload, dispatch_status)
+         VALUES (?, ?, ?, 'Not Printed', ?, 'Pending')`,
+        [serialId, productId, serialNo, serialQrPayload(serialNo)]
+      );
+      products.push({
+        id: productId,
+        name,
+        model_no: modelNo,
+        serial_no: serialNo,
+        category: category.name,
+        category_id: category.id,
+        warranty_months: warrantyMonths,
+      });
+    }
+
+    await tx(
+      `UPDATE product_categories
+       SET next_model_number = next_model_number + ?,
+           next_serial_number = next_serial_number + ?
+       WHERE id = ?`,
+      [quantity, quantity, category.id]
+    );
+    return products;
+  });
+
+  res.status(201).json({
+    products: created,
+    count: created.length,
+    message: `${created.length} product unit(s) created with sequential model and serial numbers.`,
+  });
 }));
 
 app.patch("/products/:id", asyncRoute(async (req, res) => {
@@ -5508,6 +5695,7 @@ app.use((error, _req, res, _next) => {
 
 try {
   await ensureSerialNumbersSchema();
+  await ensureProductCategoriesSchema();
   await ensureProductsQrSchema();
   await ensureComplaintsSchema();
   await ensureFeedbackSchema();

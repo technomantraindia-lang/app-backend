@@ -52,17 +52,32 @@ CREATE TABLE IF NOT EXISTS technicians (
   CONSTRAINT fk_technicians_created_by_dealer FOREIGN KEY (created_by_dealer_id) REFERENCES dealers(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS product_categories (
+  id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
+  name VARCHAR(120) NOT NULL UNIQUE,
+  model_prefix VARCHAR(100) NOT NULL DEFAULT '',
+  model_number_width INT NOT NULL DEFAULT 1,
+  next_model_number BIGINT NOT NULL,
+  serial_prefix VARCHAR(100) NOT NULL DEFAULT '',
+  serial_number_width INT NOT NULL DEFAULT 1,
+  next_serial_number BIGINT NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS products (
   id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
   name VARCHAR(180) NOT NULL,
   model_no VARCHAR(120) NOT NULL,
   category VARCHAR(120),
+  category_id CHAR(36),
   warranty_months INT NOT NULL DEFAULT 12,
   qr_status VARCHAR(40) NOT NULL DEFAULT 'Not Printed',
   qr_payload VARCHAR(255),
   qr_printed_at TIMESTAMP NULL,
   qr_locked TINYINT(1) NOT NULL DEFAULT 0,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_products_category_id (category_id),
+  CONSTRAINT fk_products_category FOREIGN KEY (category_id) REFERENCES product_categories(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS service_areas (
