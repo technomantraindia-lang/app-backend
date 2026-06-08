@@ -207,31 +207,6 @@ function productHasWarrantyCoverage(warrantyMonths) {
   return Number.isFinite(months) && months > 0;
 }
 
-function parseSequenceSeed(value, label) {
-  const seed = cleanString(value);
-  const match = seed.match(/^(.*?)(\d+)$/);
-  if (!match) {
-    const error = new Error(`${label} must end with a number, for example MOD-001.`);
-    error.statusCode = 400;
-    throw error;
-  }
-  const number = Number(match[2]);
-  if (!Number.isSafeInteger(number) || number < 0) {
-    const error = new Error(`${label} has an invalid numeric value.`);
-    error.statusCode = 400;
-    throw error;
-  }
-  return {
-    prefix: match[1],
-    width: match[2].length,
-    nextNumber: number,
-  };
-}
-
-function formatSequenceValue(prefix, number, width) {
-  return `${prefix || ""}${String(number).padStart(Math.max(1, Number(width) || 1), "0")}`;
-}
-
 /** Customer login accounts must have a customers row for lists and dashboard counts. */
 async function syncCustomerProfilesFromUsers(runQuery = query) {
   await runQuery(
@@ -679,6 +654,156 @@ function serialQrPayload(serialNo) {
   return `hitaishi://serial?serial=${encodeURIComponent(serialNo)}`;
 }
 
+function dispatchUnitQrPayload({ productId, productName, modelNo, serialNo, dealerId, dealerNo, dealerName }) {
+  const params = new URLSearchParams();
+  if (productId) params.set("productId", productId);
+  if (productName) params.set("name", productName);
+  if (modelNo) params.set("model", modelNo);
+  if (serialNo) params.set("serial", serialNo);
+  if (dealerId) params.set("dealerId", dealerId);
+  if (dealerNo) params.set("dealerNo", dealerNo);
+  if (dealerName) params.set("dealerName", dealerName);
+  return `hitaishi://unit?${params.toString()}`;
+}
+
+async function allocateDispatchSerialNumbers(product, quantity, tx) {
+  const modelBase = cleanString(product?.model_no).replace(/[^A-Za-z0-9]/g, "").toUpperCase() || "UNIT";
+  const prefix = `${modelBase}-`;
+  const escapedPrefix = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const latest = await tx(
+    `SELECT serial_no FROM serial_numbers WHERE serial_no LIKE ? ORDER BY serial_no DESC LIMIT 1`,
+    [`${prefix}%`]
+  );
+  let nextNum = 1;
+  if (latest.rowCount) {
+    const match = String(latest.rows[0].serial_no || "").match(new RegExp(`^${escapedPrefix}(\\d+)$`));
+    if (match) nextNum = Number(match[1]) + 1;
+  }
+  const serials = [];
+  for (let index = 0; index < quantity; index += 1) {
+    let candidateNum = nextNum + index;
+    let candidate = `${prefix}${String(candidateNum).padStart(5, "0")}`;
+    let guard = 0;
+    while (guard < 10000) {
+      const exists = await tx("SELECT id FROM serial_numbers WHERE serial_no = ? LIMIT 1", [candidate]);
+      if (!exists.rowCount) {
+        serials.push(candidate);
+        break;
+      }
+      candidateNum += 1;
+      candidate = `${prefix}${String(candidateNum).padStart(5, "0")}`;
+      guard += 1;
+    }
+    if (guard >= 10000) {
+      const err = new Error("Could not allocate unique serial numbers.");
+      err.statusCode = 500;
+      throw err;
+    }
+  }
+  return serials;
+}
+
+function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet") {
+  const pages = [];
+  for (let index = 0; index < rows.length; index += 9) {
+    pages.push(rows.slice(index, index + 9));
+  }
+  const pageHtml = pages
+    .map((chunk) => {
+      const cells = [];
+      for (let slot = 0; slot < 9; slot += 1) {
+        const serial = chunk[slot];
+        if (!serial) {
+          cells.push('<div class="cell empty"></div>');
+          continue;
+        }
+        const payload =
+          serial.qr_payload ||
+          dispatchUnitQrPayload({
+            productId: serial.product_id,
+            productName: serial.product_name,
+            modelNo: serial.model_no,
+            serialNo: serial.serial_no,
+            dealerId: serial.dealer_id,
+            dealerNo: serial.dealer_no,
+            dealerName: serial.dealer_name,
+          });
+        const qrUrl = `/serial-numbers/${encodeURIComponent(serial.serial_no)}/qr.svg?download=1`;
+        cells.push(`
+          <div class="cell">
+            ${qrSvg(payload, 118)}
+            <div class="brand">Hitaishi CRM</div>
+            <div class="serial">${escapeHtml(serial.serial_no)}</div>
+            <div class="product">${escapeHtml(serial.product_name || "Product")}</div>
+            <div class="meta">${escapeHtml(serial.model_no || "")}</div>
+            <div class="dealer">${escapeHtml(serial.dealer_no || "")} ${escapeHtml(serial.dealer_name || "")}</div>
+            <a class="download" href="${qrUrl}">Download QR</a>
+          </div>`);
+      }
+      return `<section class="page">${cells.join("")}</section>`;
+    })
+    .join("");
+
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>${escapeHtml(title)}</title>
+  <style>
+    @page { size: A4 portrait; margin: 8mm; }
+    * { box-sizing: border-box; }
+    body { font-family: Arial, sans-serif; margin: 0; color: #111827; background: #fff; }
+    .toolbar { padding: 12px 16px; border-bottom: 1px solid #d1d5db; }
+    .toolbar button { padding: 8px 14px; font-size: 14px; cursor: pointer; }
+    .hint { font-size: 12px; color: #4b5563; margin-top: 6px; }
+    .page {
+      width: 194mm;
+      min-height: 277mm;
+      margin: 0 auto;
+      padding: 2mm 0;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      grid-template-rows: repeat(3, 1fr);
+      gap: 3mm;
+      page-break-after: always;
+    }
+    .page:last-child { page-break-after: auto; }
+    .cell {
+      border: 1px solid #111827;
+      border-radius: 6px;
+      padding: 4mm 2mm;
+      text-align: center;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-start;
+      min-height: 88mm;
+      break-inside: avoid;
+    }
+    .cell.empty { border: 1px dashed #d1d5db; }
+    .brand { font-weight: 700; font-size: 11px; margin-top: 2mm; }
+    .serial { font-size: 13px; font-weight: 800; margin-top: 1mm; word-break: break-all; }
+    .product { font-size: 11px; font-weight: 700; margin-top: 1mm; }
+    .meta, .dealer { font-size: 10px; color: #374151; margin-top: 1mm; word-break: break-word; }
+    .download { display: inline-block; margin-top: 2mm; color: #0f3f6b; font-size: 10px; text-decoration: none; }
+    @media print {
+      .toolbar { display: none; }
+      .download { display: none; }
+      body { margin: 0; }
+      .page { margin: 0 auto; }
+    }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <button onclick="window.print()">Print / Save as PDF</button>
+    <div class="hint">A4 layout: 3 QR codes per row, 9 per page. Use Print → Save as PDF.</div>
+  </div>
+  <main>${pageHtml || "<p>No QR codes found for this dispatch.</p>"}</main>
+</body>
+</html>`;
+}
+
 function productQrPayload(product) {
   const productId = cleanString(product?.id || product?.product_id);
   const model = cleanString(product?.model_no || product?.modelNo);
@@ -745,6 +870,45 @@ async function ensureProductsQrSchema() {
   }
 }
 
+async function productHasActiveWarranty(productId) {
+  if (!productId) return false;
+  const result = await query(
+    `SELECT 1
+     FROM warranties w
+     INNER JOIN serial_numbers s ON s.id = w.serial_id
+     WHERE s.product_id = ?
+       AND w.customer_id IS NOT NULL
+       AND LOWER(TRIM(COALESCE(w.status, ''))) = 'active'
+     LIMIT 1`,
+    [productId]
+  );
+  return Boolean(result.rowCount);
+}
+
+function parseSequenceSeed(raw, label) {
+  const value = cleanString(raw);
+  if (!value) {
+    const err = new Error(`${label} is required.`);
+    err.statusCode = 400;
+    throw err;
+  }
+  const match = value.match(/^(.*?)(\d+)$/);
+  if (!match) {
+    const err = new Error(`${label} must end with a number (e.g. RO-001).`);
+    err.statusCode = 400;
+    throw err;
+  }
+  return {
+    prefix: match[1],
+    width: match[2].length,
+    nextNumber: Number.parseInt(match[2], 10),
+  };
+}
+
+function formatSequenceNumber(prefix, width, number) {
+  return `${prefix}${String(number).padStart(width, "0")}`;
+}
+
 async function ensureProductCategoriesSchema() {
   await query(
     `CREATE TABLE IF NOT EXISTS product_categories (
@@ -774,21 +938,6 @@ async function ensureProductCategoriesSchema() {
       "ALTER TABLE products ADD CONSTRAINT fk_products_category FOREIGN KEY (category_id) REFERENCES product_categories(id) ON DELETE SET NULL"
     );
   }
-}
-
-async function productHasActiveWarranty(productId) {
-  if (!productId) return false;
-  const result = await query(
-    `SELECT 1
-     FROM warranties w
-     INNER JOIN serial_numbers s ON s.id = w.serial_id
-     WHERE s.product_id = ?
-       AND w.customer_id IS NOT NULL
-       AND LOWER(TRIM(COALESCE(w.status, ''))) = 'active'
-     LIMIT 1`,
-    [productId]
-  );
-  return Boolean(result.rowCount);
 }
 
 async function lockProductQrAfterWarrantyActivation(productId) {
@@ -3289,7 +3438,7 @@ app.get("/products", asyncRoute(async (_req, res) => {
        p.*,
        (SELECT s.serial_no FROM serial_numbers s WHERE s.product_id = p.id ORDER BY s.created_at LIMIT 1) AS serial_no
      FROM products p
-     ORDER BY p.created_at DESC
+     ORDER BY p.created_at DESC, p.category ASC, p.name ASC, p.model_no ASC
      LIMIT 800`
   );
   res.json({ products: result.rows });
@@ -3491,7 +3640,7 @@ app.post("/products", asyncRoute(async (req, res) => {
 app.post("/products/bulk", asyncRoute(async (req, res) => {
   const name = cleanString(req.body.name);
   const categoryId = cleanString(req.body.categoryId || req.body.category_id);
-  const quantity = Number(req.body.quantity);
+  const quantity = Number(req.body.quantity || 1);
   const warrantyMonths = resolveProductWarrantyMonths(req.body);
 
   if (!name || !categoryId) {
@@ -3501,69 +3650,59 @@ app.post("/products/bulk", asyncRoute(async (req, res) => {
     return res.status(400).json({ error: "Quantity must be a whole number between 1 and 500." });
   }
 
-  const created = await withTransaction(async (tx) => {
-    const categoryResult = await tx(
-      "SELECT * FROM product_categories WHERE id = ? LIMIT 1 FOR UPDATE",
-      [categoryId]
-    );
+  const created = await withTransaction(async (run) => {
+    const categoryResult = await run("SELECT * FROM product_categories WHERE id = ? LIMIT 1 FOR UPDATE", [categoryId]);
     if (!categoryResult.rowCount) {
-      const error = new Error("Selected category was not found.");
-      error.statusCode = 404;
-      throw error;
+      const err = new Error("Category not found.");
+      err.statusCode = 404;
+      throw err;
     }
     const category = categoryResult.rows[0];
     const products = [];
 
     for (let index = 0; index < quantity; index += 1) {
-      const modelNo = formatSequenceValue(
+      const modelNo = formatSequenceNumber(
         category.model_prefix,
-        Number(category.next_model_number) + index,
-        category.model_number_width
+        category.model_number_width,
+        Number(category.next_model_number) + index
       );
-      const serialNo = formatSequenceValue(
+      const serialNo = formatSequenceNumber(
         category.serial_prefix,
-        Number(category.next_serial_number) + index,
-        category.serial_number_width
+        category.serial_number_width,
+        Number(category.next_serial_number) + index
       );
       const productId = crypto.randomUUID();
       const serialId = crypto.randomUUID();
-      await tx(
+
+      await run(
         `INSERT INTO products (id, name, model_no, category, category_id, warranty_months)
          VALUES (?, ?, ?, ?, ?, ?)`,
-        [productId, name, modelNo, category.name, category.id, warrantyMonths]
+        [productId, name, modelNo, category.name, categoryId, warrantyMonths]
       );
-      await tx(
-        `INSERT INTO serial_numbers
-           (id, product_id, serial_no, qr_status, qr_payload, dispatch_status)
-         VALUES (?, ?, ?, 'Not Printed', ?, 'Pending')`,
-        [serialId, productId, serialNo, serialQrPayload(serialNo)]
+      await run(
+        `INSERT INTO serial_numbers (id, product_id, serial_no, qr_status, dispatch_status)
+         VALUES (?, ?, ?, 'Not Printed', 'Pending')`,
+        [serialId, productId, serialNo]
       );
-      products.push({
-        id: productId,
-        name,
-        model_no: modelNo,
-        serial_no: serialNo,
-        category: category.name,
-        category_id: category.id,
-        warranty_months: warrantyMonths,
-      });
+
+      const row = await run(
+        `SELECT p.*, ? AS serial_no FROM products p WHERE p.id = ? LIMIT 1`,
+        [serialNo, productId]
+      );
+      products.push(row.rows[0]);
     }
 
-    await tx(
+    await run(
       `UPDATE product_categories
-       SET next_model_number = next_model_number + ?,
-           next_serial_number = next_serial_number + ?
+       SET next_model_number = ?, next_serial_number = ?
        WHERE id = ?`,
-      [quantity, quantity, category.id]
+      [Number(category.next_model_number) + quantity, Number(category.next_serial_number) + quantity, categoryId]
     );
+
     return products;
   });
 
-  res.status(201).json({
-    products: created,
-    count: created.length,
-    message: `${created.length} product unit(s) created with sequential model and serial numbers.`,
-  });
+  res.status(201).json({ products: created, count: created.length });
 }));
 
 app.patch("/products/:id", asyncRoute(async (req, res) => {
@@ -3595,10 +3734,19 @@ app.patch("/products/:id", asyncRoute(async (req, res) => {
 
 app.delete("/products/:id", asyncRoute(async (req, res) => {
   const id = cleanString(req.params.id);
-  const linked = await query("SELECT id FROM serial_numbers WHERE product_id = ? LIMIT 1", [id]);
-  if (linked.rowCount) {
-    return res.status(409).json({ error: "Product is linked with serial numbers. Edit it instead of deleting." });
+  const activeWarranty = await query(
+    `SELECT s.id
+     FROM serial_numbers s
+     INNER JOIN warranties w ON w.serial_id = s.id
+     WHERE s.product_id = ?
+       AND w.customer_id IS NOT NULL
+     LIMIT 1`,
+    [id]
+  );
+  if (activeWarranty.rowCount) {
+    return res.status(409).json({ error: "Product is linked with warranties and cannot be deleted." });
   }
+  await query("DELETE FROM serial_numbers WHERE product_id = ?", [id]);
   const result = await query("DELETE FROM products WHERE id = ?", [id]);
   if (!result.affectedRows) {
     return res.status(404).json({ error: "Product not found." });
@@ -4513,41 +4661,7 @@ app.get("/serial-numbers/print-stickers", asyncRoute(async (req, res) => {
     params
   );
 
-  const cards = result.rows.map((serial) => {
-    const payload = serial.qr_payload || serialQrPayload(serial.serial_no);
-    const qrUrl = `/serial-numbers/${encodeURIComponent(serial.serial_no)}/qr.svg?download=1`;
-    return `
-      <section class="label">
-        ${qrSvg(payload, 150)}
-        <div class="brand">Hitaishi CRM</div>
-        <div class="serial">${escapeHtml(serial.serial_no)}</div>
-        <div>${escapeHtml(serial.product_name || "Product")} ${escapeHtml(serial.model_no || "")}</div>
-        <div>${escapeHtml(serial.dealer_no || "")} ${escapeHtml(serial.dealer_name || "")}</div>
-        <a class="download" href="${qrUrl}">Download QR</a>
-      </section>`;
-  }).join("");
-
-  res.type("html").send(`<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>Hitaishi QR Stickers</title>
-  <style>
-    body { font-family: Arial, sans-serif; margin: 16px; color: #111827; }
-    .toolbar { margin-bottom: 16px; }
-    .sheet { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px; }
-    .label { border: 1px solid #111827; border-radius: 8px; padding: 10px; text-align: center; break-inside: avoid; }
-    .brand { font-weight: 700; margin-top: 4px; }
-    .serial { font-size: 18px; font-weight: 800; margin-top: 4px; }
-    .download { display: inline-block; margin-top: 6px; color: #0f3f6b; font-size: 12px; }
-    @media print { .toolbar, .download { display: none; } body { margin: 0; } .label { border-color: #000; } }
-  </style>
-</head>
-<body>
-  <div class="toolbar"><button onclick="window.print()">Print Stickers</button></div>
-  <main class="sheet">${cards || "<p>No printed QR serials found.</p>"}</main>
-</body>
-</html>`);
+  res.type("html").send(buildDispatchQrPrintHtml(result.rows, "Serial QR Print Sheet"));
 }));
 
 app.get("/serial-numbers/:serialNo/qr.svg", asyncRoute(async (req, res) => {
@@ -5059,6 +5173,265 @@ app.delete("/serial-numbers/:serialNo", asyncRoute(async (req, res) => {
     return res.status(404).json({ error: "Serial number not found." });
   }
   res.json({ ok: true });
+}));
+
+async function fetchAvailableSerialUnits({ categoryId, productName, productId, limit, tx }) {
+  const run = tx || query;
+  const clauses = ["s.dealer_id IS NULL", "s.dispatch_status = 'Pending'"];
+  const params = [];
+  if (categoryId) {
+    clauses.push("p.category_id = ?");
+    params.push(categoryId);
+  }
+  if (productName) {
+    clauses.push("p.name = ?");
+    params.push(productName);
+  }
+  if (productId) {
+    clauses.push("p.id = ?");
+    params.push(productId);
+  }
+  params.push(limit);
+  const result = await run(
+    `SELECT s.*, p.name AS product_name, p.model_no, p.id AS product_id, p.category_id
+     FROM serial_numbers s
+     INNER JOIN products p ON p.id = s.product_id
+     WHERE ${clauses.join(" AND ")}
+     ORDER BY p.model_no ASC, s.serial_no ASC
+     LIMIT ?`,
+    params
+  );
+  return result.rows;
+}
+
+app.get("/dispatch/availability", asyncRoute(async (req, res) => {
+  const categoryId = cleanString(req.query.categoryId || req.query.category_id);
+  const categoriesResult = await query(
+    `SELECT
+       c.id,
+       c.name,
+       COUNT(s.id) AS available_count
+     FROM product_categories c
+     LEFT JOIN products p ON p.category_id = c.id
+     LEFT JOIN serial_numbers s
+       ON s.product_id = p.id
+      AND s.dealer_id IS NULL
+      AND s.dispatch_status = 'Pending'
+     GROUP BY c.id, c.name
+     ORDER BY c.name ASC`
+  );
+
+  if (!categoryId) {
+    return res.json({
+      categories: categoriesResult.rows.map((row) => ({
+        id: row.id,
+        name: row.name,
+        availableCount: Number(row.available_count || 0),
+      })),
+    });
+  }
+
+  const category = categoriesResult.rows.find((row) => row.id === categoryId);
+  if (!category) {
+    return res.status(404).json({ error: "Category not found." });
+  }
+
+  const linesResult = await query(
+    `SELECT
+       p.name AS product_name,
+       COUNT(s.id) AS available_count,
+       MIN(p.model_no) AS first_model,
+       MAX(p.model_no) AS last_model
+     FROM products p
+     INNER JOIN serial_numbers s
+       ON s.product_id = p.id
+      AND s.dealer_id IS NULL
+      AND s.dispatch_status = 'Pending'
+     WHERE p.category_id = ?
+     GROUP BY p.name
+     ORDER BY p.name ASC`,
+    [categoryId]
+  );
+
+  res.json({
+    category: {
+      id: category.id,
+      name: category.name,
+      availableCount: Number(category.available_count || 0),
+    },
+    productLines: linesResult.rows.map((row) => ({
+      productName: row.product_name,
+      availableCount: Number(row.available_count || 0),
+      firstModel: row.first_model,
+      lastModel: row.last_model,
+    })),
+  });
+}));
+
+app.post("/dispatch/to-dealer", asyncRoute(async (req, res) => {
+  const dealerId = cleanString(req.body.dealerId || req.body.dealer_id);
+  const dealerNo = cleanString(req.body.dealerNo || req.body.dealer_no);
+  const categoryId = cleanString(req.body.categoryId || req.body.category_id);
+  const invoiceNo = cleanString(req.body.invoiceNo || req.body.invoice_no) || null;
+  const challanNo = cleanString(req.body.challanNo || req.body.challan_no) || null;
+  const dispatchDate = cleanDate(req.body.dispatchDate || req.body.dispatch_date);
+  const batchNo = cleanString(req.body.batchNo || req.body.batch_no) || `DSP-${Date.now()}`;
+
+  if (!dealerId && !dealerNo) {
+    return res.status(400).json({ error: "Select a dealer to dispatch products." });
+  }
+
+  const dealer = dealerId
+    ? await resolveDealerRecord(dealerId)
+    : (await query("SELECT * FROM dealers WHERE LOWER(TRIM(dealer_no)) = LOWER(?) AND status = 'Active' LIMIT 1", [dealerNo])).rows[0] || null;
+  if (!dealer) {
+    return res.status(400).json({ error: "Active dealer not found." });
+  }
+
+  let dispatchItems = Array.isArray(req.body.items)
+    ? req.body.items
+        .map((item) => ({
+          productName: cleanString(item.productName || item.product_name || item.name),
+          quantity: Number(item.quantity),
+        }))
+        .filter((item) => item.productName && Number.isInteger(item.quantity) && item.quantity > 0)
+    : [];
+
+  let resolvedCategoryId = categoryId;
+
+  if (!dispatchItems.length) {
+    const productId = cleanString(req.body.productId || req.body.product_id);
+    const productName = cleanString(req.body.productName || req.body.product_name);
+    const modelNo = cleanString(req.body.modelNo || req.body.model_no);
+    const quantity = Number(req.body.quantity);
+    if (!productId && !productName && !modelNo) {
+      return res.status(400).json({ error: "Select a category and product quantities to dispatch." });
+    }
+    if (!Number.isInteger(quantity) || quantity < 1 || quantity > 500) {
+      return res.status(400).json({ error: "Quantity must be a whole number between 1 and 500." });
+    }
+    const product = await resolveProductFromMaster({ productId, productName, modelNo });
+    dispatchItems = [{ productName: product.name, quantity }];
+    if (!resolvedCategoryId && product.category_id) {
+      resolvedCategoryId = cleanString(product.category_id);
+    }
+  }
+
+  if (!resolvedCategoryId) {
+    return res.status(400).json({ error: "Select a product category." });
+  }
+
+  const categoryResult = await query("SELECT id, name FROM product_categories WHERE id = ? LIMIT 1", [resolvedCategoryId]);
+  if (!categoryResult.rowCount) {
+    return res.status(404).json({ error: "Category not found." });
+  }
+
+  const totalRequested = dispatchItems.reduce((sum, item) => sum + item.quantity, 0);
+  if (totalRequested < 1 || totalRequested > 500) {
+    return res.status(400).json({ error: "Total dispatch quantity must be between 1 and 500." });
+  }
+
+  const dispatchedSerialNos = await withTransaction(async (tx) => {
+    const serialNos = [];
+    for (const item of dispatchItems) {
+      const units = await fetchAvailableSerialUnits({
+        categoryId: resolvedCategoryId,
+        productName: item.productName,
+        limit: item.quantity,
+        tx,
+      });
+      if (units.length < item.quantity) {
+        const err = new Error(
+          `Only ${units.length} unit(s) available for ${item.productName}. ${item.quantity} requested.`
+        );
+        err.statusCode = 409;
+        throw err;
+      }
+      for (const unit of units) {
+        const qrPayload = dispatchUnitQrPayload({
+          productId: unit.product_id,
+          productName: unit.product_name,
+          modelNo: unit.model_no,
+          serialNo: unit.serial_no,
+          dealerId: dealer.id,
+          dealerNo: dealer.dealer_no,
+          dealerName: dealer.name,
+        });
+        await tx(
+          `UPDATE serial_numbers
+           SET dealer_id = ?,
+               invoice_no = ?,
+               challan_no = ?,
+               batch_no = ?,
+               dispatch_date = ?,
+               qr_status = 'Printed',
+               qr_payload = ?,
+               qr_printed_at = NOW(),
+               dispatch_status = 'Dispatched',
+               dispatched_at = NOW()
+           WHERE id = ?`,
+          [dealer.id, invoiceNo, challanNo, batchNo, dispatchDate, qrPayload, unit.id]
+        );
+        serialNos.push(unit.serial_no);
+      }
+    }
+    return serialNos;
+  });
+
+  const detail = await query(
+    `SELECT s.*, p.name AS product_name, p.model_no, d.dealer_no, d.name AS dealer_name
+     FROM serial_numbers s
+     LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN dealers d ON d.id = s.dealer_id
+     WHERE s.batch_no = ?
+     ORDER BY s.serial_no ASC`,
+    [batchNo]
+  );
+
+  const productSummary = [...new Set(detail.rows.map((row) => row.product_name))].join(", ");
+  res.status(201).json({
+    batchNo,
+    category: categoryResult.rows[0],
+    dealer: { id: dealer.id, dealer_no: dealer.dealer_no, name: dealer.name },
+    count: dispatchedSerialNos.length,
+    items: dispatchItems,
+    serials: detail.rows,
+    serialNumbers: detail.rows.map((row) => row.serial_no),
+    printSheetUrl: `/dispatch/qr-print-sheet?batchNo=${encodeURIComponent(batchNo)}`,
+    message: `${dispatchedSerialNos.length} unit(s) dispatched to ${dealer.name}. QR codes are ready to print.`,
+    productSummary,
+  });
+}));
+
+app.get("/dispatch/qr-print-sheet", asyncRoute(async (req, res) => {
+  const batchNo = cleanString(req.query.batchNo || req.query.batch_no);
+  const requested = cleanString(req.query.serials)
+    .split(",")
+    .map(cleanSerialNo)
+    .filter(Boolean);
+  const clauses = [];
+  const params = [];
+  if (batchNo) {
+    clauses.push("s.batch_no = ?");
+    params.push(batchNo);
+  } else if (requested.length) {
+    clauses.push(`s.serial_no IN (${requested.map(() => "?").join(",")})`);
+    params.push(...requested);
+  } else {
+    return res.status(400).json({ error: "batchNo or serials query is required." });
+  }
+  const result = await query(
+    `SELECT s.*, p.name AS product_name, p.model_no, d.dealer_no, d.name AS dealer_name
+     FROM serial_numbers s
+     LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN dealers d ON d.id = s.dealer_id
+     WHERE ${clauses.join(" AND ")}
+     ORDER BY s.serial_no ASC
+     LIMIT 500`,
+    params
+  );
+  const title = batchNo ? `Dispatch QR Sheet · ${batchNo}` : "Dispatch QR Sheet";
+  res.type("html").send(buildDispatchQrPrintHtml(result.rows, title));
 }));
 
 app.post("/dispatch-mapping", asyncRoute(async (req, res) => {

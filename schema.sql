@@ -69,15 +69,13 @@ CREATE TABLE IF NOT EXISTS products (
   name VARCHAR(180) NOT NULL,
   model_no VARCHAR(120) NOT NULL,
   category VARCHAR(120),
-  category_id CHAR(36),
+  category_id CHAR(36) NULL,
   warranty_months INT NOT NULL DEFAULT 12,
   qr_status VARCHAR(40) NOT NULL DEFAULT 'Not Printed',
   qr_payload VARCHAR(255),
   qr_printed_at TIMESTAMP NULL,
   qr_locked TINYINT(1) NOT NULL DEFAULT 0,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  INDEX idx_products_category_id (category_id),
-  CONSTRAINT fk_products_category FOREIGN KEY (category_id) REFERENCES product_categories(id) ON DELETE SET NULL
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS service_areas (
