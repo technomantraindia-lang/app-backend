@@ -848,12 +848,37 @@ function productFromPayload(value) {
   };
 }
 
+function parseInstallationRequired(value, fallback = false) {
+  if (value === undefined || value === null || value === "") {
+    return Boolean(fallback);
+  }
+  if (value === true || value === 1 || value === "1") {
+    return true;
+  }
+  if (value === false || value === 0 || value === "0") {
+    return false;
+  }
+  const normalized = String(value).trim().toLowerCase();
+  if (["yes", "true", "required", "y"].includes(normalized)) {
+    return true;
+  }
+  if (["no", "false", "not required", "n"].includes(normalized)) {
+    return false;
+  }
+  return Boolean(fallback);
+}
+
+function installationStatusFromRequired(required) {
+  return parseInstallationRequired(required) ? "Required" : "Not Required";
+}
+
 async function ensureProductsQrSchema() {
   const columns = [
     ["qr_status", "ALTER TABLE products ADD COLUMN qr_status VARCHAR(40) NOT NULL DEFAULT 'Not Printed' AFTER warranty_months"],
     ["qr_payload", "ALTER TABLE products ADD COLUMN qr_payload VARCHAR(255) NULL AFTER qr_status"],
     ["qr_printed_at", "ALTER TABLE products ADD COLUMN qr_printed_at TIMESTAMP NULL AFTER qr_payload"],
     ["qr_locked", "ALTER TABLE products ADD COLUMN qr_locked TINYINT(1) NOT NULL DEFAULT 0 AFTER qr_printed_at"],
+    ["installation_required", "ALTER TABLE products ADD COLUMN installation_required TINYINT(1) NOT NULL DEFAULT 0 AFTER warranty_months"],
   ];
   for (const [columnName, ddl] of columns) {
     const found = await query(
@@ -1181,7 +1206,8 @@ async function ensureSerialNumbersSchema() {
     ["dispatch_date", "ALTER TABLE serial_numbers ADD COLUMN dispatch_date DATE NULL AFTER batch_no"],
     ["qr_payload", "ALTER TABLE serial_numbers ADD COLUMN qr_payload VARCHAR(255) NULL AFTER qr_status"],
     ["qr_printed_at", "ALTER TABLE serial_numbers ADD COLUMN qr_printed_at TIMESTAMP NULL AFTER qr_payload"],
-    ["dispatched_at", "ALTER TABLE serial_numbers ADD COLUMN dispatched_at TIMESTAMP NULL AFTER dispatch_status"]
+    ["dispatched_at", "ALTER TABLE serial_numbers ADD COLUMN dispatched_at TIMESTAMP NULL AFTER dispatch_status"],
+    ["installation_required", "ALTER TABLE serial_numbers ADD COLUMN installation_required TINYINT(1) NOT NULL DEFAULT 0 AFTER dispatched_at"]
   ];
 
   for (const [columnName, ddl] of columns) {
@@ -1511,6 +1537,30 @@ async function resolveComplaintId(identifier, runQuery = query) {
     [key, key]
   );
   return result.rowCount ? result.rows[0].id : null;
+}
+
+async function resolveWarrantyId(identifier, runQuery = query) {
+  const key = cleanString(identifier);
+  if (!key) {
+    return null;
+  }
+  const result = await runQuery(
+    "SELECT id FROM warranties WHERE id = ? OR warranty_no = ? LIMIT 1",
+    [key, key]
+  );
+  return result.rowCount ? result.rows[0].id : null;
+}
+
+async function resolveInstallationPayable({ productCategory, modelNo, city }) {
+  await ensureWorkTypeCostsSchema();
+  const result = await query(
+    `SELECT *
+     FROM work_type_costs
+     WHERE LOWER(TRIM(work_type)) = 'installation'
+       AND LOWER(TRIM(COALESCE(status, 'Active'))) = 'active'`
+  );
+  const best = resolveWorkTypeCostRule(result.rows, { productCategory, modelNo, city });
+  return Number(best?.payable_amount || 0);
 }
 
 async function isComplaintSolvedInDb(complaintId, runQuery = query) {
@@ -4051,6 +4101,7 @@ app.post("/products/bulk", asyncRoute(async (req, res) => {
   const categoryId = cleanString(req.body.categoryId || req.body.category_id);
   const quantity = Number(req.body.quantity || 1);
   const warrantyMonths = resolveProductWarrantyMonths(req.body);
+  const installationRequired = parseInstallationRequired(req.body.installationRequired ?? req.body.installation_required);
 
   if (!name || !categoryId) {
     return res.status(400).json({ error: "Product name and category are required." });
@@ -4087,9 +4138,9 @@ app.post("/products/bulk", asyncRoute(async (req, res) => {
       const serialId = crypto.randomUUID();
 
       await run(
-        `INSERT INTO products (id, name, model_no, category, category_id, warranty_months)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [productId, name, modelNo, category.name, categoryId, warrantyMonths]
+        `INSERT INTO products (id, name, model_no, category, category_id, warranty_months, installation_required)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [productId, name, modelNo, category.name, categoryId, warrantyMonths, installationRequired ? 1 : 0]
       );
       await run(
         `INSERT INTO serial_numbers (id, product_id, serial_no, qr_status, dispatch_status)
@@ -4515,10 +4566,12 @@ async function activateWarrantyFromSerial({ customerId, serialNo, purchaseDate, 
        s.dealer_id,
        s.qr_status,
        s.qr_payload,
+       s.installation_required AS serial_installation_required,
        p.id AS product_id,
        p.name AS product_name,
        p.model_no,
-       p.warranty_months
+       p.warranty_months,
+       p.installation_required AS product_installation_required
      FROM serial_numbers s
      LEFT JOIN products p ON p.id = s.product_id
      WHERE LOWER(TRIM(s.serial_no)) = LOWER(TRIM(?))
@@ -4583,6 +4636,9 @@ async function activateWarrantyFromSerial({ customerId, serialNo, purchaseDate, 
   const warrantyNo = existing.rowCount ? existing.rows[0].warranty_no : `WAR-${Date.now()}`;
   const startDate = purchaseDate || new Date().toISOString().slice(0, 10);
   const warrantyStatus = hasWarranty ? "Active" : "Expired";
+  const installationStatus = installationStatusFromRequired(
+    row.serial_installation_required ?? row.product_installation_required
+  );
 
   if (existing.rowCount) {
     if (hasWarranty) {
@@ -4593,9 +4649,9 @@ async function activateWarrantyFromSerial({ customerId, serialNo, purchaseDate, 
              start_date = COALESCE(start_date, ?),
              expiry_date = COALESCE(expiry_date, DATE_ADD(?, INTERVAL ? MONTH)),
              status = ?,
-             installation_status = CASE WHEN installation_status IS NULL OR installation_status = '' THEN 'Required' ELSE installation_status END
+             installation_status = CASE WHEN installation_status IS NULL OR installation_status = '' THEN ? ELSE installation_status END
          WHERE id = ?`,
-        [customerId, warrantyDealerId, startDate, startDate, months, warrantyStatus, existing.rows[0].id]
+        [customerId, warrantyDealerId, startDate, startDate, months, warrantyStatus, installationStatus, existing.rows[0].id]
       );
     } else {
       await query(
@@ -4605,24 +4661,24 @@ async function activateWarrantyFromSerial({ customerId, serialNo, purchaseDate, 
              start_date = COALESCE(start_date, ?),
              expiry_date = COALESCE(expiry_date, DATE_SUB(?, INTERVAL 1 DAY)),
              status = ?,
-             installation_status = CASE WHEN installation_status IS NULL OR installation_status = '' THEN 'Required' ELSE installation_status END
+             installation_status = CASE WHEN installation_status IS NULL OR installation_status = '' THEN ? ELSE installation_status END
          WHERE id = ?`,
-        [customerId, warrantyDealerId, startDate, startDate, warrantyStatus, existing.rows[0].id]
+        [customerId, warrantyDealerId, startDate, startDate, warrantyStatus, installationStatus, existing.rows[0].id]
       );
     }
   } else if (hasWarranty) {
     await query(
       `INSERT INTO warranties
        (warranty_no, customer_id, dealer_id, serial_id, start_date, expiry_date, status, installation_status)
-       VALUES (?, ?, ?, ?, ?, DATE_ADD(?, INTERVAL ? MONTH), ?, 'Required')`,
-      [warrantyNo, customerId, warrantyDealerId, row.id, startDate, startDate, months, warrantyStatus]
+       VALUES (?, ?, ?, ?, ?, DATE_ADD(?, INTERVAL ? MONTH), ?, ?)`,
+      [warrantyNo, customerId, warrantyDealerId, row.id, startDate, startDate, months, warrantyStatus, installationStatus]
     );
   } else {
     await query(
       `INSERT INTO warranties
        (warranty_no, customer_id, dealer_id, serial_id, start_date, expiry_date, status, installation_status)
-       VALUES (?, ?, ?, ?, ?, DATE_SUB(?, INTERVAL 1 DAY), ?, 'Required')`,
-      [warrantyNo, customerId, warrantyDealerId, row.id, startDate, startDate, warrantyStatus]
+       VALUES (?, ?, ?, ?, ?, DATE_SUB(?, INTERVAL 1 DAY), ?, ?)`,
+      [warrantyNo, customerId, warrantyDealerId, row.id, startDate, startDate, warrantyStatus, installationStatus]
     );
   }
 
@@ -4778,6 +4834,215 @@ app.post("/warranties/dealer/activate-from-qr", asyncRoute(async (req, res) => {
     actingDealerId: dealerId,
   });
   res.status(201).json({ customer, warranty });
+}));
+
+app.post("/warranties/:id/assign-installation", asyncRoute(async (req, res) => {
+  await ensureWorkflowAuditSchema();
+  await ensureComplaintsSchema();
+  const warrantyId = await resolveWarrantyId(req.params.id);
+  const dealerId = cleanString(req.body.dealerId || req.body.dealer_id);
+  const technicianId = cleanString(req.body.technicianId || req.body.technician_id);
+  const dueAt = cleanString(req.body.dueAt || req.body.due_at) || null;
+  const assignedById = cleanString(req.body.assignedById || req.body.assigned_by_id || req.body.userId || req.body.user_id) || null;
+
+  if (!warrantyId) {
+    return res.status(404).json({ error: "Warranty not found." });
+  }
+  if (!dealerId || !technicianId) {
+    return res.status(400).json({ error: "Dealer and technician are required." });
+  }
+  if (!dueAt) {
+    return res.status(400).json({ error: "Installation visit date and time are required." });
+  }
+
+  const warrantyRow = await query(
+    `SELECT
+       w.*,
+       s.serial_no,
+       p.name AS product_name,
+       p.model_no,
+       p.category AS product_category,
+       cust.name AS customer_name,
+       cust.mobile AS customer_mobile,
+       cust.city AS customer_city
+     FROM warranties w
+     LEFT JOIN serial_numbers s ON s.id = w.serial_id
+     LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN customers cust ON cust.id = w.customer_id
+     WHERE w.id = ?
+     LIMIT 1`,
+    [warrantyId]
+  );
+  if (!warrantyRow.rowCount) {
+    return res.status(404).json({ error: "Warranty not found." });
+  }
+  const warranty = warrantyRow.rows[0];
+  const warrantyDealerId = String(warranty.dealer_id || "");
+  if (!warrantyDealerId || warrantyDealerId !== String(dealerId)) {
+    return res.status(403).json({ error: "This warranty does not belong to your dealership." });
+  }
+  if (!warranty.customer_id) {
+    return res.status(400).json({ error: "Customer must be registered on this warranty before installation assignment." });
+  }
+  const installStatus = String(warranty.installation_status || "").trim();
+  if (installStatus === "Not Required") {
+    return res.status(400).json({ error: "Installation is not required for this product." });
+  }
+  if (installStatus === "Completed") {
+    return res.status(400).json({ error: "Installation is already completed for this warranty." });
+  }
+
+  const activeInstallTask = await query(
+    `SELECT t.id, t.status
+     FROM tasks t
+     INNER JOIN complaints c ON c.id = t.complaint_id
+     WHERE c.warranty_id = ?
+       AND LOWER(TRIM(t.work_type)) = 'installation'
+       AND LOWER(TRIM(COALESCE(t.status, ''))) NOT IN ('completed', 'closed', 'rejected', 'cancelled')
+     ORDER BY t.created_at DESC
+     LIMIT 1`,
+    [warrantyId]
+  );
+  if (activeInstallTask.rowCount) {
+    return res.status(409).json({ error: "An installation job is already assigned for this warranty." });
+  }
+
+  const technician = await query(
+    "SELECT id, user_id, name, created_by_dealer_id FROM technicians WHERE id = ? AND approval_status = 'Approved' LIMIT 1",
+    [technicianId]
+  );
+  if (!technician.rowCount) {
+    return res.status(404).json({ error: "Approved technician not found." });
+  }
+  if (String(technician.rows[0].created_by_dealer_id || "") !== String(dealerId)) {
+    return res.status(403).json({ error: "Dealer can assign only technicians linked to this dealership." });
+  }
+
+  const payableAmount = await resolveInstallationPayable({
+    productCategory: warranty.product_category,
+    modelNo: warranty.model_no,
+    city: warranty.customer_city,
+  });
+
+  let complaintId = null;
+  const existingComplaint = await query(
+    `SELECT id, complaint_no, status
+     FROM complaints
+     WHERE warranty_id = ?
+       AND LOWER(TRIM(problem_type)) = 'product installation'
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [warrantyId]
+  );
+  if (existingComplaint.rowCount) {
+    complaintId = existingComplaint.rows[0].id;
+  }
+
+  const complaintNo = existingComplaint.rowCount
+    ? existingComplaint.rows[0].complaint_no
+    : `CMP-${Date.now()}`;
+  const taskNo = `TASK-${Date.now()}`;
+
+  await withTransaction(async (tx) => {
+    if (!complaintId) {
+      await tx(
+        `INSERT INTO complaints
+           (complaint_no, warranty_id, customer_id, dealer_id, problem_type, description, priority, product_name, model_no, warranty_start_date, warranty_end_date, warranty_status, status)
+         VALUES (?, ?, ?, ?, 'Product Installation', ?, 'Normal', ?, ?, ?, ?, ?, 'Assigned to Technician')`,
+        [
+          complaintNo,
+          warrantyId,
+          warranty.customer_id,
+          dealerId,
+          "Install product at customer location. No quotation required — technician payout is fixed by Admin.",
+          warranty.product_name,
+          warranty.model_no,
+          warranty.start_date,
+          warranty.expiry_date,
+          warranty.status,
+        ]
+      );
+      const created = await tx("SELECT id FROM complaints WHERE complaint_no = ? LIMIT 1", [complaintNo]);
+      complaintId = created.rows[0]?.id;
+      await recordStatusHistory({
+        complaintId,
+        oldStatus: null,
+        newStatus: "Assigned to Technician",
+        changedByRole: "Dealer",
+        changedById: assignedById,
+        remarks: "Installation job created",
+      }, tx);
+    } else {
+      await tx("UPDATE complaints SET status = 'Assigned to Technician' WHERE id = ?", [complaintId]);
+      await recordStatusHistory({
+        complaintId,
+        oldStatus: existingComplaint.rows[0].status,
+        newStatus: "Assigned to Technician",
+        changedByRole: "Dealer",
+        changedById: assignedById,
+        remarks: "Installation technician reassigned",
+      }, tx);
+    }
+
+    await tx(
+      `INSERT INTO complaint_assignments
+         (complaint_id, technician_id, assigned_by_role, assigned_by_id, status, remarks)
+       VALUES (?, ?, 'Dealer', ?, 'Assigned', 'Installation assignment')`,
+      [complaintId, technicianId, assignedById]
+    );
+    await tx(
+      `INSERT INTO tasks (task_no, complaint_id, technician_id, work_type, due_at, status, payable_amount)
+       VALUES (?, ?, ?, 'Installation', ?, 'Assigned', ?)`,
+      [taskNo, complaintId, technicianId, dueAt, payableAmount]
+    );
+    await tx("UPDATE warranties SET installation_status = 'Assigned' WHERE id = ?", [warrantyId]);
+    await createWorkflowMessage({
+      complaintId,
+      senderRole: "Dealer",
+      senderId: assignedById,
+      receiverRole: "Technician",
+      receiverId: technicianId,
+      message: "Installation job assigned. Visit customer and complete installation — no quotation needed.",
+    }, tx);
+  });
+
+  const taskResult = await query(
+    `SELECT ${TASK_DETAIL_SELECT}
+     ${TASK_DETAIL_JOINS}
+     WHERE t.complaint_id = ?
+     ORDER BY t.created_at DESC
+     LIMIT 1`,
+    [complaintId]
+  );
+  await ensureNotificationsSchema();
+  if (technician.rows[0]?.user_id) {
+    await createNotification({
+      userId: technician.rows[0].user_id,
+      recipientRole: "Technician",
+      type: "installation_assigned",
+      title: "New installation job",
+      message: `Install ${warranty.product_name || "product"} at ${warranty.customer_name || "customer"}. Accept in Alerts.`,
+      entityType: "task",
+      entityId: taskResult.rows[0]?.id || null,
+    });
+  }
+  if (warranty.customer_id) {
+    await createNotification({
+      customerId: warranty.customer_id,
+      type: "installation_scheduled",
+      title: "Installation scheduled",
+      message: `A technician will visit for ${warranty.product_name || "your product"} installation.`,
+      entityType: "warranty",
+      entityId: warrantyId,
+    });
+  }
+
+  res.status(201).json({
+    task: taskResult.rows[0] || null,
+    complaintNo,
+    payableAmount,
+    message: `${technician.rows[0].name} assigned for installation. Technician payout: Rs ${payableAmount.toFixed(0)} (Admin fixed).`,
+  });
 }));
 
 /** List complaints (staff panels). Customers should use `/complaints/customer/:customerId`. */
@@ -5261,11 +5526,19 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
   if (!allowed.includes(status)) {
     return res.status(400).json({ error: "Invalid task status." });
   }
-  const existing = await query("SELECT id, complaint_id, technician_id, status FROM tasks WHERE id = ? LIMIT 1", [id]);
+  const existing = await query(
+    `SELECT t.id, t.complaint_id, t.technician_id, t.status, t.work_type, c.warranty_id
+     FROM tasks t
+     LEFT JOIN complaints c ON c.id = t.complaint_id
+     WHERE t.id = ?
+     LIMIT 1`,
+    [id]
+  );
   if (!existing.rowCount) {
     return res.status(404).json({ error: "Task not found." });
   }
   const row = existing.rows[0];
+  const isInstallationTask = String(row.work_type || "").trim().toLowerCase() === "installation";
   if (technicianId && String(row.technician_id) !== technicianId) {
     return res.status(403).json({ error: "This task is not assigned to you." });
   }
@@ -5293,10 +5566,19 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
         [status, resolutionNotes, id]
       );
       await ensurePaymentForCompletedTask(id, tx);
+      if (isInstallationTask && row.warranty_id) {
+        await tx("UPDATE warranties SET installation_status = 'Completed' WHERE id = ?", [row.warranty_id]);
+      }
     } else if (resolutionNotes) {
       await tx("UPDATE tasks SET status = ?, resolution_notes = ? WHERE id = ?", [status, resolutionNotes, id]);
     } else {
       await tx("UPDATE tasks SET status = ? WHERE id = ?", [status, id]);
+    }
+    if (status === "Rejected" && isInstallationTask && row.warranty_id) {
+      await tx("UPDATE warranties SET installation_status = 'Required' WHERE id = ?", [row.warranty_id]);
+    }
+    if (status === "Accepted" && isInstallationTask && row.warranty_id) {
+      await tx("UPDATE warranties SET installation_status = 'In Progress' WHERE id = ?", [row.warranty_id]);
     }
     if (!complaintId) return;
     const nextComplaintStatus = complaintStatusForTaskStatus(status);
@@ -5665,6 +5947,7 @@ async function fetchAvailableSerialUnits({ categoryId, productName, productId, l
 }
 
 app.get("/dispatch/availability", asyncRoute(async (req, res) => {
+  await ensureProductsQrSchema();
   const categoryId = cleanString(req.query.categoryId || req.query.category_id);
   const categoriesResult = await query(
     `SELECT
@@ -5701,7 +5984,8 @@ app.get("/dispatch/availability", asyncRoute(async (req, res) => {
        p.name AS product_name,
        COUNT(s.id) AS available_count,
        MIN(p.model_no) AS first_model,
-       MAX(p.model_no) AS last_model
+       MAX(p.model_no) AS last_model,
+       MAX(COALESCE(p.installation_required, 0)) AS installation_required
      FROM products p
      INNER JOIN serial_numbers s
        ON s.product_id = p.id
@@ -5724,11 +6008,14 @@ app.get("/dispatch/availability", asyncRoute(async (req, res) => {
       availableCount: Number(row.available_count || 0),
       firstModel: row.first_model,
       lastModel: row.last_model,
+      installationRequired: Boolean(Number(row.installation_required || 0)),
     })),
   });
 }));
 
 app.post("/dispatch/to-dealer", asyncRoute(async (req, res) => {
+  await ensureSerialNumbersSchema();
+  await ensureProductsQrSchema();
   const dealerId = cleanString(req.body.dealerId || req.body.dealer_id);
   const dealerNo = cleanString(req.body.dealerNo || req.body.dealer_no);
   const categoryId = cleanString(req.body.categoryId || req.body.category_id);
@@ -5753,6 +6040,10 @@ app.post("/dispatch/to-dealer", asyncRoute(async (req, res) => {
         .map((item) => ({
           productName: cleanString(item.productName || item.product_name || item.name),
           quantity: Number(item.quantity),
+          installationRequired: parseInstallationRequired(
+            item.installationRequired ?? item.installation_required,
+            false
+          ),
         }))
         .filter((item) => item.productName && Number.isInteger(item.quantity) && item.quantity > 0)
     : [];
@@ -5828,9 +6119,19 @@ app.post("/dispatch/to-dealer", asyncRoute(async (req, res) => {
                qr_payload = ?,
                qr_printed_at = NOW(),
                dispatch_status = 'Dispatched',
-               dispatched_at = NOW()
+               dispatched_at = NOW(),
+               installation_required = ?
            WHERE id = ?`,
-          [dealer.id, invoiceNo, challanNo, batchNo, dispatchDate, qrPayload, unit.id]
+          [
+            dealer.id,
+            invoiceNo,
+            challanNo,
+            batchNo,
+            dispatchDate,
+            qrPayload,
+            item.installationRequired ? 1 : 0,
+            unit.id,
+          ]
         );
         serialNos.push(unit.serial_no);
       }
