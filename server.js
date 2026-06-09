@@ -1613,6 +1613,31 @@ async function resolveWarrantyId(identifier, runQuery = query) {
   return result.rowCount ? result.rows[0].id : null;
 }
 
+async function resolveTaskId(identifier, runQuery = query) {
+  const key = cleanString(identifier);
+  if (!key) {
+    return null;
+  }
+  const byId = await runQuery("SELECT id FROM tasks WHERE id = ? LIMIT 1", [key]);
+  if (byId.rowCount) {
+    return byId.rows[0].id;
+  }
+  const byTaskNo = await runQuery("SELECT id FROM tasks WHERE task_no = ? LIMIT 1", [key]);
+  if (byTaskNo.rowCount) {
+    return byTaskNo.rows[0].id;
+  }
+  const byComplaint = await runQuery(
+    `SELECT t.id
+     FROM tasks t
+     INNER JOIN complaints c ON c.id = t.complaint_id
+     WHERE c.complaint_no = ?
+     ORDER BY t.created_at DESC
+     LIMIT 1`,
+    [key]
+  );
+  return byComplaint.rowCount ? byComplaint.rows[0].id : null;
+}
+
 async function resolveInstallationPayable({ productCategory, modelNo, city }) {
   await ensureWorkTypeCostsSchema();
   const result = await query(
@@ -5982,16 +6007,16 @@ app.get("/tasks", asyncRoute(async (req, res) => {
 }));
 
 app.get("/tasks/:id", asyncRoute(async (req, res) => {
-  const id = cleanString(req.params.id);
-  if (!id) {
-    return res.status(400).json({ error: "Task id is required." });
+  const taskId = await resolveTaskId(req.params.id);
+  if (!taskId) {
+    return res.status(404).json({ error: "Task not found." });
   }
   const result = await query(
     `SELECT ${TASK_DETAIL_SELECT}
      ${TASK_DETAIL_JOINS}
      WHERE t.id = ?
      LIMIT 1`,
-    [id]
+    [taskId]
   );
   if (!result.rowCount) {
     return res.status(404).json({ error: "Task not found." });
@@ -6001,12 +6026,12 @@ app.get("/tasks/:id", asyncRoute(async (req, res) => {
 
 app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
   await ensureTasksSchema();
-  const id = cleanString(req.params.id);
+  const taskId = await resolveTaskId(req.params.id);
   const status = cleanString(req.body?.status);
   const dueAt = cleanString(req.body?.dueAt || req.body?.due_at) || null;
   const technicianId = cleanString(req.body?.technicianId || req.body?.technician_id);
   const resolutionNotes = cleanString(req.body?.resolutionNotes || req.body?.resolution_notes) || null;
-  if (!id || !status) {
+  if (!taskId || !status) {
     return res.status(400).json({ error: "Task id and status are required." });
   }
   const allowed = [
@@ -6028,6 +6053,7 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
     return res.status(400).json({ error: "Invalid task status." });
   }
   status = normalizedStatus;
+  const id = taskId;
   const existing = await query(
     `SELECT t.id, t.complaint_id, t.technician_id, t.status, t.work_type, c.warranty_id
      FROM tasks t
@@ -6181,15 +6207,16 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
 app.post("/tasks/:id/mark-unrepairable", asyncRoute(async (req, res) => {
   await ensureTasksSchema();
   await ensureWorkflowAuditSchema();
-  const id = cleanString(req.params.id);
+  const taskId = await resolveTaskId(req.params.id);
   const technicianId = cleanString(req.body.technicianId || req.body.technician_id);
   const resolutionNotes = cleanString(req.body.resolutionNotes || req.body.resolution_notes);
-  if (!id) {
-    return res.status(400).json({ error: "Task id is required." });
+  if (!taskId) {
+    return res.status(404).json({ error: "Task not found." });
   }
   if (!resolutionNotes) {
     return res.status(400).json({ error: "Explain why the product cannot be repaired." });
   }
+  const id = taskId;
   const existing = await query(
     `SELECT t.id, t.complaint_id, t.technician_id, t.status, t.work_type
      FROM tasks t
