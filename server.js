@@ -71,6 +71,13 @@ async function resolveDealerRecord(idOrUserId) {
   if (byProfile.rowCount) {
     return byProfile.rows[0];
   }
+  const byDealerNo = await query(
+    "SELECT * FROM dealers WHERE LOWER(TRIM(dealer_no)) = LOWER(?) LIMIT 1",
+    [key]
+  );
+  if (byDealerNo.rowCount) {
+    return byDealerNo.rows[0];
+  }
   const userResult = await query("SELECT * FROM users WHERE id = ? AND role = 'Dealer' LIMIT 1", [key]);
   if (!userResult.rowCount) {
     return null;
