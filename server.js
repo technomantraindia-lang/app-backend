@@ -6023,9 +6023,11 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
     "Completed",
     "Closed"
   ];
-  if (!allowed.includes(status)) {
+  const normalizedStatus = allowed.find((item) => item.toLowerCase() === status.toLowerCase());
+  if (!normalizedStatus) {
     return res.status(400).json({ error: "Invalid task status." });
   }
+  status = normalizedStatus;
   const existing = await query(
     `SELECT t.id, t.complaint_id, t.technician_id, t.status, t.work_type, c.warranty_id
      FROM tasks t
@@ -6174,6 +6176,99 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
   }
 
   res.json({ task: taskResult.rowCount ? taskResult.rows[0] : null });
+}));
+
+app.post("/tasks/:id/mark-unrepairable", asyncRoute(async (req, res) => {
+  await ensureTasksSchema();
+  await ensureWorkflowAuditSchema();
+  const id = cleanString(req.params.id);
+  const technicianId = cleanString(req.body.technicianId || req.body.technician_id);
+  const resolutionNotes = cleanString(req.body.resolutionNotes || req.body.resolution_notes);
+  if (!id) {
+    return res.status(400).json({ error: "Task id is required." });
+  }
+  if (!resolutionNotes) {
+    return res.status(400).json({ error: "Explain why the product cannot be repaired." });
+  }
+  const existing = await query(
+    `SELECT t.id, t.complaint_id, t.technician_id, t.status, t.work_type
+     FROM tasks t
+     WHERE t.id = ?
+     LIMIT 1`,
+    [id]
+  );
+  if (!existing.rowCount) {
+    return res.status(404).json({ error: "Task not found." });
+  }
+  const row = existing.rows[0];
+  if (technicianId && String(row.technician_id) !== technicianId) {
+    return res.status(403).json({ error: "This task is not assigned to you." });
+  }
+  const current = String(row.status || "");
+  if (["Completed", "Closed", "Unrepairable", "Rejected"].includes(current)) {
+    return res.status(400).json({ error: `Task cannot be marked unrepairable from status ${current}.` });
+  }
+  if (String(row.work_type || "").trim().toLowerCase() === "installation") {
+    return res.status(400).json({ error: "Installation jobs cannot use cannot-repair. Complete or reject the job." });
+  }
+  const complaintId = row.complaint_id;
+  const complaintBefore = complaintId
+    ? await query("SELECT status FROM complaints WHERE id = ? LIMIT 1", [complaintId])
+    : { rowCount: 0, rows: [] };
+  const oldComplaintStatus = complaintBefore.rows[0]?.status || null;
+
+  await withTransaction(async (tx) => {
+    await tx(
+      "UPDATE tasks SET status = 'Unrepairable', resolution_notes = ? WHERE id = ?",
+      [resolutionNotes, id]
+    );
+    if (!complaintId) return;
+    await tx("UPDATE complaints SET status = 'Awaiting Dealer Action' WHERE id = ?", [complaintId]);
+    await recordStatusHistory({
+      complaintId,
+      oldStatus: oldComplaintStatus,
+      newStatus: "Awaiting Dealer Action",
+      changedByRole: "Technician",
+      changedById: technicianId || row.technician_id || null,
+      remarks: resolutionNotes,
+    }, tx);
+    await createWorkflowMessage({
+      complaintId,
+      senderRole: "Technician",
+      senderId: technicianId || row.technician_id || null,
+      receiverRole: "Dealer",
+      message: `Product cannot be repaired. Send to dealer for Replace/Return. ${resolutionNotes}`,
+    }, tx);
+  });
+
+  const taskResult = await query(
+    `SELECT ${TASK_DETAIL_SELECT}
+     ${TASK_DETAIL_JOINS}
+     WHERE t.id = ?
+     LIMIT 1`,
+    [id]
+  );
+
+  if (complaintId) {
+    await ensureNotificationsSchema();
+    const ctx = await getComplaintNotifyContext(complaintId);
+    if (ctx?.dealer_id) {
+      await createNotification({
+        userId: ctx.dealer_user_id || null,
+        recipientRole: "Dealer",
+        type: "task_unrepairable",
+        title: "Product cannot be repaired",
+        message: `${ctx.complaint_no || "Complaint"} — technician could not repair. Open Replace/Return.`,
+        entityType: "complaint",
+        entityId: complaintId,
+      });
+    }
+  }
+
+  res.json({
+    task: taskResult.rowCount ? taskResult.rows[0] : null,
+    message: "Marked as cannot repair. Dealer will process Replace/Return.",
+  });
 }));
 
 async function dealerWarrantyReportRows(req) {
