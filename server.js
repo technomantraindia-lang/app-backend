@@ -4234,8 +4234,9 @@ async function activateWarrantyFromSerial({ customerId, serialNo, purchaseDate, 
     throw err;
   }
   const product = productRow.rows[0];
-  if (product.qr_status !== "Printed") {
-    const err = new Error("Product QR is not generated yet. Ask admin to print product QR sticker.");
+  const unitQrReady = String(row.qr_status || "") === "Printed" && Boolean(row.qr_payload);
+  if (product.qr_status !== "Printed" && !unitQrReady) {
+    const err = new Error("Unit QR is not generated yet. Ask admin to generate and print dispatch QR stickers.");
     err.statusCode = 400;
     throw err;
   }
@@ -5542,7 +5543,7 @@ app.post("/dispatch/to-dealer", asyncRoute(async (req, res) => {
     serials: detail.rows,
     serialNumbers: detail.rows.map((row) => row.serial_no),
     printSheetUrl: `/dispatch/qr-print-sheet?batchNo=${encodeURIComponent(batchNo)}`,
-    message: `${dispatchedSerialNos.length} unit(s) dispatched to ${dealer.name}. QR codes are ready to print.`,
+    message: `${dispatchedSerialNos.length} QR code(s) generated for ${dealer.name}. Open Dispatch QR Print to print stickers.`,
     productSummary,
   });
 }));
