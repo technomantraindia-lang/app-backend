@@ -110,9 +110,10 @@ const COMPLAINT_OPEN_WHERE = `
   )`;
 
 async function getDealerDashboardStats(dealerId) {
-  const [serials, warranties, totalComplaints, openComplaints, solvedComplaints, pendingScan] = await Promise.all([
+  const [serials, warranties, totalComplaints, openComplaints, solvedComplaints, pendingScan, pendingInstallation] =
+    await Promise.all([
     query("SELECT COUNT(*) AS total FROM serial_numbers WHERE dealer_id = ?", [dealerId]),
-    query("SELECT COUNT(*) AS total FROM warranties WHERE dealer_id = ?", [dealerId]),
+    query("SELECT COUNT(*) AS total FROM warranties WHERE dealer_id = ? AND customer_id IS NOT NULL", [dealerId]),
     query(
       `SELECT COUNT(*) AS total ${DEALER_COMPLAINT_FROM} WHERE COALESCE(c.dealer_id, w.dealer_id, s.dealer_id) = ?`,
       [dealerId]
@@ -130,10 +131,23 @@ async function getDealerDashboardStats(dealerId) {
     query(
       `SELECT COUNT(*) AS total
        FROM serial_numbers s
-       LEFT JOIN warranties w ON w.serial_id = s.id
-       WHERE s.dealer_id = ? AND w.id IS NULL`,
+       WHERE s.dealer_id = ?
+         AND NOT EXISTS (
+           SELECT 1
+           FROM warranties w
+           WHERE w.serial_id = s.id
+             AND w.customer_id IS NOT NULL
+         )`,
       [dealerId]
-    )
+    ),
+    query(
+      `SELECT COUNT(*) AS total
+       FROM warranties w
+       WHERE w.dealer_id = ?
+         AND w.customer_id IS NOT NULL
+         AND LOWER(TRIM(COALESCE(w.installation_status, ''))) = 'required'`,
+      [dealerId]
+    ),
   ]);
   const count = (result) => Number(result.rows[0]?.total || 0);
   const productsSold = count(warranties);
@@ -148,7 +162,10 @@ async function getDealerDashboardStats(dealerId) {
     complaintsOpen: openProblems,
     solvedProblems,
     complaintsSolved: solvedProblems,
-    pendingScan: count(pendingScan)
+    pendingScan: count(pendingScan),
+    assignedProducts: count(pendingScan),
+    pendingInstallation: count(pendingInstallation),
+    productsSold,
   };
 }
 
@@ -3692,6 +3709,120 @@ app.get("/dealers/:id/dashboard", asyncRoute(async (req, res) => {
     dealer,
     stats,
     complaints: complaints.rows
+  });
+}));
+
+app.get("/dealers/:id/assigned-products", asyncRoute(async (req, res) => {
+  const dealer = await resolveDealerRecord(req.params.id);
+  if (!dealer) {
+    return res.status(404).json({ error: "Dealer not found." });
+  }
+  const dealerId = dealer.id;
+  const result = await query(
+    `SELECT
+       s.id,
+       s.serial_no,
+       s.qr_status,
+       s.qr_payload,
+       s.dispatch_status,
+       s.batch_no,
+       s.invoice_no,
+       s.challan_no,
+       s.dispatch_date,
+       s.dispatched_at,
+       s.installation_required,
+       s.created_at,
+       p.id AS product_id,
+       p.name AS product_name,
+       p.model_no,
+       p.category AS product_category
+     FROM serial_numbers s
+     LEFT JOIN products p ON p.id = s.product_id
+     WHERE s.dealer_id = ?
+       AND NOT EXISTS (
+         SELECT 1
+         FROM warranties w
+         WHERE w.serial_id = s.id
+           AND w.customer_id IS NOT NULL
+       )
+     ORDER BY COALESCE(s.dispatched_at, s.created_at) DESC, s.serial_no ASC
+     LIMIT 800`,
+    [dealerId]
+  );
+  res.json({
+    dealer: { id: dealer.id, name: dealer.name, dealer_no: dealer.dealer_no },
+    summary: { totalAssigned: result.rows.length },
+    products: result.rows,
+  });
+}));
+
+app.get("/dealers/:id/sold-products", asyncRoute(async (req, res) => {
+  const dealer = await resolveDealerRecord(req.params.id);
+  if (!dealer) {
+    return res.status(404).json({ error: "Dealer not found." });
+  }
+  const dealerId = dealer.id;
+  const result = await query(
+    `SELECT
+       w.id AS warranty_id,
+       w.warranty_no,
+       w.status AS warranty_status,
+       w.installation_status,
+       w.start_date,
+       w.expiry_date,
+       w.created_at,
+       cust.id AS customer_id,
+       cust.name AS customer_name,
+       cust.mobile AS customer_mobile,
+       cust.city AS customer_city,
+       s.serial_no,
+       s.installation_required AS serial_installation_required,
+       p.name AS product_name,
+       p.model_no,
+       p.category AS product_category,
+       (
+         SELECT t.status
+         FROM tasks t
+         INNER JOIN complaints c ON c.id = t.complaint_id
+         WHERE c.warranty_id = w.id
+           AND LOWER(TRIM(t.work_type)) = 'installation'
+         ORDER BY t.created_at DESC
+         LIMIT 1
+       ) AS installation_task_status,
+       (
+         SELECT tech.name
+         FROM tasks t
+         INNER JOIN complaints c ON c.id = t.complaint_id
+         LEFT JOIN technicians tech ON tech.id = t.technician_id
+         WHERE c.warranty_id = w.id
+           AND LOWER(TRIM(t.work_type)) = 'installation'
+         ORDER BY t.created_at DESC
+         LIMIT 1
+       ) AS installation_technician_name
+     FROM warranties w
+     INNER JOIN customers cust ON cust.id = w.customer_id
+     LEFT JOIN serial_numbers s ON s.id = w.serial_id
+     LEFT JOIN products p ON p.id = s.product_id
+     WHERE w.dealer_id = ?
+     ORDER BY w.created_at DESC
+     LIMIT 500`,
+    [dealerId]
+  );
+  const products = result.rows.map((row) => {
+    const installStatus = String(row.installation_status || "").trim();
+    const needsTechnician = installStatus.toLowerCase() === "required";
+    return {
+      ...row,
+      needsTechnicianAssignment: needsTechnician,
+    };
+  });
+  res.json({
+    dealer: { id: dealer.id, name: dealer.name, dealer_no: dealer.dealer_no },
+    summary: {
+      totalSold: products.length,
+      pendingInstallation: products.filter((row) => row.needsTechnicianAssignment).length,
+    },
+    products,
   });
 }));
 
