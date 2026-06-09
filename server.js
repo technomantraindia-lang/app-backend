@@ -1268,6 +1268,88 @@ async function ensureTechniciansSchema() {
   }
 }
 
+async function ensureWorkTypeCostsSchema() {
+  const columns = [
+    ["service_charge", "ALTER TABLE work_type_costs ADD COLUMN service_charge DECIMAL(10, 2) NOT NULL DEFAULT 0 AFTER payable_amount"],
+    ["visit_charge", "ALTER TABLE work_type_costs ADD COLUMN visit_charge DECIMAL(10, 2) NOT NULL DEFAULT 0 AFTER service_charge"],
+    ["tax_amount", "ALTER TABLE work_type_costs ADD COLUMN tax_amount DECIMAL(10, 2) NOT NULL DEFAULT 0 AFTER visit_charge"],
+    ["discount_amount", "ALTER TABLE work_type_costs ADD COLUMN discount_amount DECIMAL(10, 2) NOT NULL DEFAULT 0 AFTER tax_amount"],
+  ];
+  for (const [columnName, ddl] of columns) {
+    const found = await query(
+      `SELECT COLUMN_NAME
+       FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE()
+         AND TABLE_NAME = 'work_type_costs'
+         AND COLUMN_NAME = ?
+       LIMIT 1`,
+      [columnName]
+    );
+    if (!found.rowCount) {
+      await query(ddl);
+    }
+  }
+  await query(
+    `UPDATE work_type_costs
+     SET service_charge = payable_amount
+     WHERE service_charge = 0 AND payable_amount > 0`
+  );
+}
+
+function resolveWorkTypeCostRule(rows, { productCategory, modelNo, city }) {
+  const scoreRule = (row) => {
+    const ruleCategory = cleanString(row.product_category);
+    const ruleModel = cleanString(row.model_no);
+    const ruleCity = cleanString(row.city);
+    if (ruleCategory && (!productCategory || ruleCategory.toLowerCase() !== productCategory.toLowerCase())) {
+      return -1;
+    }
+    if (ruleModel && (!modelNo || ruleModel.toLowerCase() !== modelNo.toLowerCase())) {
+      return -1;
+    }
+    if (ruleCity && (!city || ruleCity.toLowerCase() !== city.toLowerCase())) {
+      return -1;
+    }
+    let score = 0;
+    if (ruleCategory) score += 4;
+    if (ruleModel) score += 2;
+    if (ruleCity) score += 1;
+    return score;
+  };
+
+  let best = null;
+  let bestScore = -1;
+  for (const row of rows) {
+    const score = scoreRule(row);
+    if (score > bestScore) {
+      bestScore = score;
+      best = row;
+    }
+  }
+  if (!best && rows.length) {
+    best =
+      rows.find((row) => !cleanString(row.product_category) && !cleanString(row.model_no) && !cleanString(row.city)) ||
+      rows[0];
+  }
+  return best;
+}
+
+function mapWorkTypeCostCharges(row) {
+  const serviceCharge = Number(row?.service_charge ?? 0);
+  const visitCharge = Number(row?.visit_charge ?? 0);
+  const taxAmount = Number(row?.tax_amount ?? 0);
+  const discountAmount = Number(row?.discount_amount ?? 0);
+  const payableAmount = Number(row?.payable_amount ?? 0);
+  return {
+    serviceCharge: serviceCharge > 0 ? serviceCharge : payableAmount,
+    visitCharge,
+    taxAmount,
+    discountAmount,
+    payableAmount,
+    ruleId: row?.id || null,
+  };
+}
+
 async function ensureComplaintsSchema() {
   const columns = [
     ["dealer_id", "ALTER TABLE complaints ADD COLUMN dealer_id CHAR(36) NULL AFTER customer_id"],
@@ -2280,11 +2362,65 @@ app.patch("/technicians/:id/dealer", asyncRoute(async (req, res) => {
   res.json({ technician: result.rows[0], dealer: { id: dealer.id, name: dealer.name, dealer_no: dealer.dealer_no } });
 }));
 
+async function ensurePaymentsSchema() {
+  await query(
+    `CREATE TABLE IF NOT EXISTS payments (
+      id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
+      technician_id CHAR(36),
+      task_id CHAR(36),
+      amount DECIMAL(10, 2) NOT NULL,
+      status VARCHAR(40) NOT NULL DEFAULT 'Pending',
+      paid_at TIMESTAMP NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT fk_payments_technician FOREIGN KEY (technician_id) REFERENCES technicians(id) ON DELETE CASCADE,
+      CONSTRAINT fk_payments_task FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE SET NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
+  );
+  const columns = [
+    ["payment_mode", "ALTER TABLE payments ADD COLUMN payment_mode VARCHAR(40) NULL AFTER paid_at"],
+    ["transaction_ref", "ALTER TABLE payments ADD COLUMN transaction_ref VARCHAR(120) NULL AFTER payment_mode"],
+    ["admin_remarks", "ALTER TABLE payments ADD COLUMN admin_remarks TEXT NULL AFTER transaction_ref"],
+  ];
+  for (const [columnName, ddl] of columns) {
+    const found = await query(
+      `SELECT COLUMN_NAME
+       FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE()
+         AND TABLE_NAME = 'payments'
+         AND COLUMN_NAME = ?
+       LIMIT 1`,
+      [columnName]
+    );
+    if (!found.rowCount) {
+      await query(ddl);
+    }
+  }
+}
+
 const PAYMENT_LEDGER_TASK_JOIN = `
      FROM tasks t
      LEFT JOIN complaints c ON c.id = t.complaint_id
      LEFT JOIN customers cust ON cust.id = c.customer_id
      LEFT JOIN payments pay ON pay.task_id = t.id`;
+
+async function syncCompletedTaskPayments(technicianId = null) {
+  const params = [];
+  let techFilter = "";
+  if (technicianId) {
+    techFilter = "AND t.technician_id = ?";
+    params.push(technicianId);
+  }
+  await query(
+    `INSERT INTO payments (technician_id, task_id, amount, status)
+     SELECT t.technician_id, t.id, COALESCE(t.payable_amount, 0), 'Pending'
+     FROM tasks t
+     WHERE t.technician_id IS NOT NULL
+       AND LOWER(TRIM(COALESCE(t.status, ''))) IN ('completed', 'closed')
+       AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.task_id = t.id)
+       ${techFilter}`,
+    params
+  );
+}
 
 async function ensurePaymentForCompletedTask(taskId, tx) {
   const taskResult = await tx(
@@ -2305,7 +2441,50 @@ async function ensurePaymentForCompletedTask(taskId, tx) {
   );
 }
 
+app.get("/payments/dashboard", asyncRoute(async (req, res) => {
+  await ensurePaymentsSchema();
+  const month =
+    cleanString(req.query.month || req.query.paymentMonth) ||
+    new Date().toISOString().slice(0, 7);
+
+  await syncCompletedTaskPayments();
+
+  const statsRows = await query(
+    `SELECT
+       COALESCE(SUM(COALESCE(pay.amount, t.payable_amount, 0)), 0) AS total_payable,
+       COALESCE(SUM(
+         CASE WHEN LOWER(COALESCE(pay.status, 'Pending')) = 'paid'
+         THEN COALESCE(pay.amount, t.payable_amount, 0) ELSE 0 END
+       ), 0) AS paid_amount,
+       COUNT(DISTINCT CASE
+         WHEN LOWER(COALESCE(pay.status, 'Pending')) <> 'paid' THEN t.technician_id
+       END) AS technicians_pending,
+       COALESCE(SUM(
+         CASE WHEN LOWER(COALESCE(pay.status, 'Pending')) <> 'paid' THEN 1 ELSE 0 END
+       ), 0) AS tasks_on_hold
+     ${PAYMENT_LEDGER_TASK_JOIN}
+     WHERE LOWER(TRIM(COALESCE(t.status, ''))) IN ('completed', 'closed')
+       AND DATE_FORMAT(COALESCE(t.completed_at, t.created_at), '%Y-%m') = ?`,
+    [month]
+  );
+  const row = statsRows.rows[0] || {};
+  const totalPayable = Number(row.total_payable || 0);
+  const paidAmount = Number(row.paid_amount || 0);
+
+  res.json({
+    month,
+    summary: {
+      totalPayable,
+      paidAmount,
+      pendingAmount: Math.max(0, totalPayable - paidAmount),
+      techniciansPendingPayment: Number(row.technicians_pending || 0),
+      tasksOnHold: Number(row.tasks_on_hold || 0),
+    },
+  });
+}));
+
 app.get("/technicians/:id/payment-ledger", asyncRoute(async (req, res) => {
+  await ensurePaymentsSchema();
   const technicianId = cleanString(req.params.id);
   const month = cleanString(req.query.month || req.query.paymentMonth);
   const existing = await query("SELECT id, name FROM technicians WHERE id = ? LIMIT 1", [technicianId]);
@@ -2313,15 +2492,7 @@ app.get("/technicians/:id/payment-ledger", asyncRoute(async (req, res) => {
     return res.status(404).json({ error: "Technician not found." });
   }
 
-  await query(
-    `INSERT INTO payments (technician_id, task_id, amount, status)
-     SELECT t.technician_id, t.id, COALESCE(t.payable_amount, 0), 'Pending'
-     FROM tasks t
-     WHERE t.technician_id = ?
-       AND LOWER(TRIM(COALESCE(t.status, ''))) IN ('completed', 'closed')
-       AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.task_id = t.id)`,
-    [technicianId]
-  );
+  await syncCompletedTaskPayments(technicianId);
 
   const where = ["t.technician_id = ?", "LOWER(TRIM(COALESCE(t.status, ''))) IN ('completed', 'closed')"];
   const params = [technicianId];
@@ -2381,10 +2552,84 @@ app.get("/technicians/:id/payment-ledger", asyncRoute(async (req, res) => {
   });
 }));
 
+app.post("/payments/settle", asyncRoute(async (req, res) => {
+  await ensurePaymentsSchema();
+  const requesterRole = cleanString(req.body.requesterRole);
+  if (requesterRole !== "Admin") {
+    return res.status(403).json({ error: "Only Admin can settle technician payments." });
+  }
+
+  const technicianId = cleanString(req.body.technicianId);
+  const month = cleanString(req.body.month || req.body.paymentMonth);
+  const paymentDate = cleanString(req.body.paymentDate || req.body.paidAt);
+  const paymentMode = cleanString(req.body.paymentMode || req.body.payment_mode) || "UPI";
+  const transactionRef = cleanString(req.body.transactionRef || req.body.transactionId || req.body.utr);
+  const adminRemarks = cleanString(req.body.adminRemarks || req.body.remarks);
+  const receiptNote = cleanString(req.body.receiptNote || req.body.receiptReference);
+
+  if (!technicianId) {
+    return res.status(400).json({ error: "Technician is required." });
+  }
+  if (!month || month === "All") {
+    return res.status(400).json({ error: "Payment month is required." });
+  }
+
+  const tech = await query("SELECT id, name FROM technicians WHERE id = ? LIMIT 1", [technicianId]);
+  if (!tech.rowCount) {
+    return res.status(404).json({ error: "Technician not found." });
+  }
+
+  await syncCompletedTaskPayments(technicianId);
+
+  const pendingRows = await query(
+    `SELECT pay.id
+     ${PAYMENT_LEDGER_TASK_JOIN}
+     WHERE t.technician_id = ?
+       AND LOWER(TRIM(COALESCE(t.status, ''))) IN ('completed', 'closed')
+       AND DATE_FORMAT(COALESCE(t.completed_at, t.created_at), '%Y-%m') = ?
+       AND LOWER(COALESCE(pay.status, 'Pending')) <> 'paid'`,
+    [technicianId, month]
+  );
+
+  if (!pendingRows.rowCount) {
+    return res.status(400).json({ error: "No pending payments found for this technician and month." });
+  }
+
+  const paidAtSql = paymentDate ? "?" : "CURRENT_TIMESTAMP";
+  const paidAtParams = paymentDate ? [paymentDate] : [];
+  const remarksParts = [adminRemarks, receiptNote ? `Receipt: ${receiptNote}` : ""].filter(Boolean);
+  const combinedRemarks = remarksParts.join(" | ") || null;
+
+  for (const row of pendingRows.rows) {
+    await query(
+      `UPDATE payments
+       SET status = 'Paid',
+           paid_at = ${paidAtSql},
+           payment_mode = ?,
+           transaction_ref = ?,
+           admin_remarks = ?
+       WHERE id = ?`,
+      [...paidAtParams, paymentMode, transactionRef || null, combinedRemarks, row.id]
+    );
+  }
+
+  res.json({
+    message: `${pendingRows.rowCount} payment record(s) marked as paid and settled.`,
+    technician: tech.rows[0],
+    month,
+    settledCount: pendingRows.rowCount,
+  });
+}));
+
 app.patch("/payments/:id", asyncRoute(async (req, res) => {
+  await ensurePaymentsSchema();
   const paymentId = cleanString(req.params.id);
   const requesterRole = cleanString(req.body.requesterRole);
   const status = cleanString(req.body.status);
+  const paymentMode = cleanString(req.body.paymentMode || req.body.payment_mode);
+  const transactionRef = cleanString(req.body.transactionRef || req.body.transactionId);
+  const adminRemarks = cleanString(req.body.adminRemarks || req.body.remarks);
+  const paymentDate = cleanString(req.body.paymentDate || req.body.paidAt);
   if (requesterRole !== "Admin") {
     return res.status(403).json({ error: "Only Admin can update payment records." });
   }
@@ -2398,12 +2643,25 @@ app.patch("/payments/:id", asyncRoute(async (req, res) => {
   }
 
   if (status === "Paid") {
+    const paidAtSql = paymentDate ? "?" : "COALESCE(paid_at, CURRENT_TIMESTAMP)";
+    const params = paymentDate
+      ? [paymentMode || null, transactionRef || null, adminRemarks || null, paymentDate, paymentId]
+      : [paymentMode || null, transactionRef || null, adminRemarks || null, paymentId];
     await query(
-      "UPDATE payments SET status = 'Paid', paid_at = COALESCE(paid_at, CURRENT_TIMESTAMP) WHERE id = ?",
-      [paymentId]
+      `UPDATE payments
+       SET status = 'Paid',
+           payment_mode = COALESCE(?, payment_mode),
+           transaction_ref = COALESCE(?, transaction_ref),
+           admin_remarks = COALESCE(?, admin_remarks),
+           paid_at = ${paidAtSql}
+       WHERE id = ?`,
+      params
     );
   } else {
-    await query("UPDATE payments SET status = 'Pending', paid_at = NULL WHERE id = ?", [paymentId]);
+    await query(
+      "UPDATE payments SET status = 'Pending', paid_at = NULL, payment_mode = NULL, transaction_ref = NULL WHERE id = ?",
+      [paymentId]
+    );
   }
 
   const result = await query("SELECT * FROM payments WHERE id = ? LIMIT 1", [paymentId]);
@@ -3694,7 +3952,17 @@ app.get("/products/:productId/scan", asyncRoute(async (req, res) => {
   }
   const product = result.rows[0];
   if (product.qr_status !== "Printed") {
-    return res.status(400).json({ error: "Product QR is not generated yet." });
+    const unitQrWhere = dealerId
+      ? "product_id = ? AND dealer_id = ? AND qr_status = 'Printed'"
+      : "product_id = ? AND qr_status = 'Printed'";
+    const unitQrParams = dealerId ? [product.id, dealerId] : [product.id];
+    const unitQr = await query(
+      `SELECT id FROM serial_numbers WHERE ${unitQrWhere} LIMIT 1`,
+      unitQrParams
+    );
+    if (!unitQr.rowCount) {
+      return res.status(400).json({ error: "QR is not generated yet. Ask admin to generate dispatch QR stickers." });
+    }
   }
   if (Number(product.qr_locked) === 1 || await productHasActiveWarranty(product.id)) {
     return res.status(409).json({ error: "Already scanned this QR code. Warranty is already active." });
@@ -3958,6 +4226,7 @@ app.delete("/service-areas/:id", asyncRoute(async (req, res) => {
 }));
 
 app.get("/work-type-costs", asyncRoute(async (_req, res) => {
+  await ensureWorkTypeCostsSchema();
   const result = await query(
     `SELECT c.*, t.name AS technician_name
      FROM work_type_costs c
@@ -3968,12 +4237,43 @@ app.get("/work-type-costs", asyncRoute(async (_req, res) => {
   res.json({ costs: result.rows });
 }));
 
+app.get("/work-type-costs/resolve", asyncRoute(async (req, res) => {
+  await ensureWorkTypeCostsSchema();
+  const workType = cleanString(req.query.workType || req.query.work_type) || "Paid Repair";
+  const productCategory = cleanString(req.query.productCategory || req.query.product_category) || null;
+  const modelNo = cleanString(req.query.modelNo || req.query.model_no) || null;
+  const city = cleanString(req.query.city) || null;
+  const result = await query(
+    `SELECT *
+     FROM work_type_costs
+     WHERE status = 'Active' AND LOWER(TRIM(work_type)) = LOWER(TRIM(?))
+     ORDER BY created_at DESC
+     LIMIT 200`,
+    [workType]
+  );
+  const best = resolveWorkTypeCostRule(result.rows, { productCategory, modelNo, city });
+  const charges = mapWorkTypeCostCharges(best);
+  res.json({
+    workType,
+    productCategory,
+    modelNo,
+    city,
+    ...charges,
+    matched: Boolean(best),
+  });
+}));
+
 app.post("/work-type-costs", asyncRoute(async (req, res) => {
+  await ensureWorkTypeCostsSchema();
   const workType = cleanString(req.body.workType || req.body.work_type);
   const productCategory = cleanString(req.body.productCategory || req.body.product_category) || null;
   const modelNo = cleanString(req.body.modelNo || req.body.model_no) || null;
   const city = cleanString(req.body.city) || null;
   const payableAmount = Number(req.body.payableAmount || req.body.payable_amount || 0);
+  const serviceCharge = Number(req.body.serviceCharge ?? req.body.service_charge ?? payableAmount ?? 0);
+  const visitCharge = Number(req.body.visitCharge ?? req.body.visit_charge ?? 0);
+  const taxAmount = Number(req.body.taxAmount ?? req.body.tax_amount ?? 0);
+  const discountAmount = Number(req.body.discountAmount ?? req.body.discount_amount ?? 0);
   const defaultTimeframeHours = Number(req.body.defaultTimeframeHours || req.body.default_timeframe_hours || 24);
   const effectiveDate = cleanString(req.body.effectiveDate || req.body.effective_date) || null;
   const status = cleanString(req.body.status) || "Active";
@@ -3984,14 +4284,18 @@ app.post("/work-type-costs", asyncRoute(async (req, res) => {
 
   await query(
     `INSERT INTO work_type_costs
-     (work_type, product_category, model_no, city, payable_amount, default_timeframe_hours, effective_date, status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+     (work_type, product_category, model_no, city, payable_amount, service_charge, visit_charge, tax_amount, discount_amount, default_timeframe_hours, effective_date, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       workType,
       productCategory,
       modelNo,
       city,
       Number.isFinite(payableAmount) ? payableAmount : 0,
+      Number.isFinite(serviceCharge) ? serviceCharge : 0,
+      Number.isFinite(visitCharge) ? visitCharge : 0,
+      Number.isFinite(taxAmount) ? taxAmount : 0,
+      Number.isFinite(discountAmount) ? discountAmount : 0,
       Number.isFinite(defaultTimeframeHours) && defaultTimeframeHours > 0 ? defaultTimeframeHours : 24,
       effectiveDate,
       status
@@ -4002,12 +4306,17 @@ app.post("/work-type-costs", asyncRoute(async (req, res) => {
 }));
 
 app.patch("/work-type-costs/:id", asyncRoute(async (req, res) => {
+  await ensureWorkTypeCostsSchema();
   const id = cleanString(req.params.id);
   const workType = cleanString(req.body.workType || req.body.work_type);
   const productCategory = cleanString(req.body.productCategory || req.body.product_category) || null;
   const modelNo = cleanString(req.body.modelNo || req.body.model_no) || null;
   const city = cleanString(req.body.city) || null;
   const payableAmount = Number(req.body.payableAmount || req.body.payable_amount || 0);
+  const serviceCharge = Number(req.body.serviceCharge ?? req.body.service_charge ?? payableAmount ?? 0);
+  const visitCharge = Number(req.body.visitCharge ?? req.body.visit_charge ?? 0);
+  const taxAmount = Number(req.body.taxAmount ?? req.body.tax_amount ?? 0);
+  const discountAmount = Number(req.body.discountAmount ?? req.body.discount_amount ?? 0);
   const defaultTimeframeHours = Number(req.body.defaultTimeframeHours || req.body.default_timeframe_hours || 24);
   const effectiveDate = cleanString(req.body.effectiveDate || req.body.effective_date) || null;
   const status = cleanString(req.body.status) || "Active";
@@ -4018,7 +4327,7 @@ app.patch("/work-type-costs/:id", asyncRoute(async (req, res) => {
 
   const result = await query(
     `UPDATE work_type_costs
-     SET work_type = ?, product_category = ?, model_no = ?, city = ?, payable_amount = ?, default_timeframe_hours = ?, effective_date = ?, status = ?
+     SET work_type = ?, product_category = ?, model_no = ?, city = ?, payable_amount = ?, service_charge = ?, visit_charge = ?, tax_amount = ?, discount_amount = ?, default_timeframe_hours = ?, effective_date = ?, status = ?
      WHERE id = ?`,
     [
       workType,
@@ -4026,6 +4335,10 @@ app.patch("/work-type-costs/:id", asyncRoute(async (req, res) => {
       modelNo,
       city,
       Number.isFinite(payableAmount) ? payableAmount : 0,
+      Number.isFinite(serviceCharge) ? serviceCharge : 0,
+      Number.isFinite(visitCharge) ? visitCharge : 0,
+      Number.isFinite(taxAmount) ? taxAmount : 0,
+      Number.isFinite(discountAmount) ? discountAmount : 0,
       Number.isFinite(defaultTimeframeHours) && defaultTimeframeHours > 0 ? defaultTimeframeHours : 24,
       effectiveDate,
       status,
@@ -4201,6 +4514,7 @@ async function activateWarrantyFromSerial({ customerId, serialNo, purchaseDate, 
        s.serial_no,
        s.dealer_id,
        s.qr_status,
+       s.qr_payload,
        p.id AS product_id,
        p.name AS product_name,
        p.model_no,
@@ -4234,7 +4548,7 @@ async function activateWarrantyFromSerial({ customerId, serialNo, purchaseDate, 
     throw err;
   }
   const product = productRow.rows[0];
-  const unitQrReady = String(row.qr_status || "") === "Printed" && Boolean(row.qr_payload);
+  const unitQrReady = String(row.qr_status || "") === "Printed";
   if (product.qr_status !== "Printed" && !unitQrReady) {
     const err = new Error("Unit QR is not generated yet. Ask admin to generate and print dispatch QR stickers.");
     err.statusCode = 400;
@@ -4850,6 +5164,7 @@ const TASK_DETAIL_SELECT = `
        cust.pincode AS customer_pincode,
        COALESCE(c.product_name, p.name) AS product_name,
        COALESCE(c.model_no, p.model_no) AS model_no,
+       p.category AS product_category,
        s.serial_no,
        w.warranty_no,
        COALESCE(c.warranty_start_date, w.start_date) AS warranty_start,
@@ -6260,6 +6575,8 @@ try {
   await ensureComplaintsSchema();
   await ensureFeedbackSchema();
   await ensureTasksSchema();
+  await ensureWorkTypeCostsSchema();
+  await ensurePaymentsSchema();
   await ensureQuotationsSchema();
   await ensureNotificationsSchema();
   await ensureWorkflowAuditSchema();
