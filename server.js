@@ -262,6 +262,7 @@ function complaintStatusForTaskStatus(taskStatus) {
   if (s === "Closed") return "Closed";
   if (s === "On Hold") return "On Hold";
   if (s === "Rejected") return "Technician Rejected";
+  if (s === "Unrepairable") return "Awaiting Dealer Action";
   if (s === "Assigned") return "Assigned to Technician";
   if (s === "Accepted") return "Technician Accepted";
   if (
@@ -688,6 +689,15 @@ function dispatchUnitQrPayload({ productId, productName, modelNo, serialNo, deal
   if (dealerNo) params.set("dealerNo", dealerNo);
   if (dealerName) params.set("dealerName", dealerName);
   return `hitaishi://unit?${params.toString()}`;
+}
+
+function replaceReturnQrPayload({ caseId, caseNo, serialNo, actionType }) {
+  const params = new URLSearchParams();
+  if (caseId) params.set("caseId", caseId);
+  if (caseNo) params.set("caseNo", caseNo);
+  if (serialNo) params.set("serial", serialNo);
+  if (actionType) params.set("action", actionType);
+  return `hitaishi://replace-return?${params.toString()}`;
 }
 
 async function allocateDispatchSerialNumbers(product, quantity, tx) {
@@ -1426,6 +1436,34 @@ async function ensureComplaintsSchema() {
   }
 }
 
+async function ensureReplaceReturnSchema() {
+  await query(
+    `CREATE TABLE IF NOT EXISTS replace_return_cases (
+      id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
+      case_no VARCHAR(80) NOT NULL UNIQUE,
+      complaint_id CHAR(36) NOT NULL,
+      task_id CHAR(36),
+      warranty_id CHAR(36),
+      customer_id CHAR(36),
+      dealer_id CHAR(36) NOT NULL,
+      serial_id CHAR(36),
+      action_type VARCHAR(40) NOT NULL,
+      problem_details TEXT NOT NULL,
+      technician_remarks TEXT,
+      status VARCHAR(60) NOT NULL DEFAULT 'Pending Admin Scan',
+      qr_status VARCHAR(40) NOT NULL DEFAULT 'Not Printed',
+      qr_payload VARCHAR(255),
+      qr_printed_at TIMESTAMP NULL,
+      admin_scanned_at TIMESTAMP NULL,
+      admin_scanned_by CHAR(36),
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_rr_dealer (dealer_id),
+      INDEX idx_rr_status (status),
+      INDEX idx_rr_complaint (complaint_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
+  );
+}
+
 async function ensureFeedbackSchema() {
   await query(
     `CREATE TABLE IF NOT EXISTS feedback (
@@ -1773,6 +1811,7 @@ app.get("/dealers/next-number", asyncRoute(async (_req, res) => {
 
 app.get("/admin/dashboard", asyncRoute(async (_req, res) => {
   await syncCustomerProfilesFromUsers();
+  await ensureReplaceReturnSchema();
   const [
     totalCustomers,
     totalTechnicians,
@@ -1793,7 +1832,8 @@ app.get("/admin/dashboard", asyncRoute(async (_req, res) => {
     pendingTechnicians,
     pendingSerials,
     pendingQuotationApprovals,
-    pendingPayable
+    pendingPayable,
+    pendingReplaceReturn
   ] = await Promise.all([
     query("SELECT COUNT(*) AS total FROM customers"),
     query("SELECT COUNT(*) AS total FROM technicians"),
@@ -1823,7 +1863,10 @@ app.get("/admin/dashboard", asyncRoute(async (_req, res) => {
     query(
       "SELECT COUNT(*) AS total FROM quotations WHERE status IN ('Pending Front Desk Review', 'Pending Admin Approval')"
     ),
-    query("SELECT COALESCE(SUM(amount), 0) AS total FROM payments WHERE status = 'Pending'")
+    query("SELECT COALESCE(SUM(amount), 0) AS total FROM payments WHERE status = 'Pending'"),
+    query(
+      `SELECT COUNT(*) AS total FROM replace_return_cases WHERE status = 'Pending Admin Scan'`
+    ).catch(() => ({ rows: [{ total: 0 }] }))
   ]);
 
   const count = (result) => Number(result.rows?.[0]?.total || 0);
@@ -1848,7 +1891,8 @@ app.get("/admin/dashboard", asyncRoute(async (_req, res) => {
       pendingTechnicians: count(pendingTechnicians),
       pendingSerials: count(pendingSerials),
       pendingQuotationApprovals: count(pendingQuotationApprovals),
-      pendingPayable: Number(pendingPayable.rows?.[0]?.total || 0)
+      pendingPayable: Number(pendingPayable.rows?.[0]?.total || 0),
+      pendingReplaceReturn: count(pendingReplaceReturn)
     }
   });
 }));
@@ -5183,6 +5227,309 @@ app.post("/warranties/:id/assign-installation", asyncRoute(async (req, res) => {
   });
 }));
 
+const REPLACE_RETURN_DETAIL_SELECT = `
+  rr.*,
+  c.complaint_no,
+  c.status AS complaint_status,
+  w.warranty_no,
+  w.start_date AS warranty_start,
+  w.expiry_date AS warranty_expiry,
+  w.status AS warranty_status,
+  cust.name AS customer_name,
+  cust.mobile AS customer_mobile,
+  cust.city AS customer_city,
+  cust.address AS customer_address,
+  d.dealer_no,
+  d.name AS dealer_name,
+  d.mobile AS dealer_mobile,
+  d.city AS dealer_city,
+  s.serial_no,
+  p.name AS product_name,
+  p.model_no,
+  p.category AS product_category,
+  t.resolution_notes AS technician_remarks,
+  tech.name AS technician_name`;
+
+const REPLACE_RETURN_DETAIL_JOINS = `
+  FROM replace_return_cases rr
+  INNER JOIN complaints c ON c.id = rr.complaint_id
+  LEFT JOIN warranties w ON w.id = rr.warranty_id
+  LEFT JOIN customers cust ON cust.id = rr.customer_id
+  LEFT JOIN dealers d ON d.id = rr.dealer_id
+  LEFT JOIN serial_numbers s ON s.id = rr.serial_id
+  LEFT JOIN products p ON p.id = s.product_id
+  LEFT JOIN tasks t ON t.id = rr.task_id
+  LEFT JOIN technicians tech ON tech.id = t.technician_id`;
+
+async function resolveReplaceReturnCase(identifier) {
+  const key = cleanString(identifier);
+  if (!key) return null;
+  await ensureReplaceReturnSchema();
+  const byId = await query("SELECT id FROM replace_return_cases WHERE id = ? OR case_no = ? LIMIT 1", [key, key]);
+  return byId.rowCount ? byId.rows[0].id : null;
+}
+
+app.get("/replace-return", asyncRoute(async (req, res) => {
+  await ensureReplaceReturnSchema();
+  const status = cleanString(req.query.status);
+  const dealerId = cleanString(req.query.dealerId || req.query.dealer_id);
+  const where = [];
+  const params = [];
+  if (status && status !== "All") {
+    where.push("rr.status = ?");
+    params.push(status);
+  }
+  if (dealerId) {
+    const dealer = await resolveDealerRecord(dealerId);
+    if (dealer) {
+      where.push("rr.dealer_id = ?");
+      params.push(dealer.id);
+    }
+  }
+  const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  const result = await query(
+    `SELECT ${REPLACE_RETURN_DETAIL_SELECT}
+     ${REPLACE_RETURN_DETAIL_JOINS}
+     ${whereSql}
+     ORDER BY rr.created_at DESC
+     LIMIT 500`,
+    params
+  );
+  res.json({ cases: result.rows });
+}));
+
+app.get("/replace-return/eligible", asyncRoute(async (req, res) => {
+  await ensureReplaceReturnSchema();
+  await ensureComplaintsSchema();
+  const dealerKey = cleanString(req.query.dealerId || req.query.dealer_id);
+  const dealer = await resolveDealerRecord(dealerKey);
+  if (!dealer) {
+    return res.status(404).json({ error: "Dealer not found." });
+  }
+  const result = await query(
+    `SELECT
+       c.*,
+       w.warranty_no,
+       w.id AS warranty_id,
+       COALESCE(c.warranty_start_date, w.start_date) AS start_date,
+       COALESCE(c.warranty_end_date, w.expiry_date) AS expiry_date,
+       COALESCE(c.warranty_status, w.status) AS warranty_status,
+       cust.name AS customer_name,
+       cust.mobile AS customer_mobile,
+       s.serial_no,
+       s.id AS serial_id,
+       COALESCE(c.product_name, p.name) AS product_name,
+       COALESCE(c.model_no, p.model_no) AS model_no,
+       t.id AS task_id,
+       t.resolution_notes AS technician_remarks,
+       t.status AS task_status
+     FROM complaints c
+     LEFT JOIN warranties w ON w.id = c.warranty_id
+     LEFT JOIN customers cust ON cust.id = c.customer_id
+     LEFT JOIN serial_numbers s ON s.id = w.serial_id
+     LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN tasks t ON t.complaint_id = c.id AND LOWER(TRIM(t.status)) = 'unrepairable'
+     WHERE COALESCE(c.dealer_id, w.dealer_id, s.dealer_id) = ?
+       AND c.status = 'Awaiting Dealer Action'
+       AND NOT EXISTS (SELECT 1 FROM replace_return_cases rr WHERE rr.complaint_id = c.id)
+     ORDER BY c.created_at DESC
+     LIMIT 200`,
+    [dealer.id]
+  );
+  res.json({ complaints: result.rows });
+}));
+
+app.post("/replace-return", asyncRoute(async (req, res) => {
+  await ensureReplaceReturnSchema();
+  await ensureComplaintsSchema();
+  const complaintId = cleanString(req.body.complaintId || req.body.complaint_id);
+  const dealerId = cleanString(req.body.dealerId || req.body.dealer_id);
+  const actionType = cleanString(req.body.actionType || req.body.action_type);
+  const problemDetails = cleanString(req.body.problemDetails || req.body.problem_details);
+  const createdById = cleanString(req.body.createdById || req.body.userId || req.body.user_id) || null;
+
+  if (!complaintId || !dealerId || !actionType || !problemDetails) {
+    return res.status(400).json({ error: "Complaint, dealer, action type, and problem details are required." });
+  }
+  if (!["Replace", "Return"].includes(actionType)) {
+    return res.status(400).json({ error: "Action type must be Replace or Return." });
+  }
+
+  const dealer = await resolveDealerRecord(dealerId);
+  if (!dealer) {
+    return res.status(404).json({ error: "Dealer not found." });
+  }
+
+  const complaintRow = await query(
+    `SELECT c.*, w.id AS warranty_id, w.dealer_id AS warranty_dealer_id, w.serial_id, w.customer_id, w.warranty_no, s.serial_no,
+            t.id AS task_id, t.resolution_notes
+     FROM complaints c
+     LEFT JOIN warranties w ON w.id = c.warranty_id
+     LEFT JOIN serial_numbers s ON s.id = w.serial_id
+     LEFT JOIN tasks t ON t.complaint_id = c.id AND LOWER(TRIM(t.status)) = 'unrepairable'
+     WHERE c.id = ?
+     LIMIT 1`,
+    [complaintId]
+  );
+  if (!complaintRow.rowCount) {
+    return res.status(404).json({ error: "Complaint not found." });
+  }
+  const complaint = complaintRow.rows[0];
+  if (String(complaint.status || "") !== "Awaiting Dealer Action") {
+    return res.status(400).json({ error: "This complaint is not awaiting dealer replace/return action." });
+  }
+  const owningDealerId = String(complaint.dealer_id || complaint.warranty_dealer_id || "");
+  if (owningDealerId && owningDealerId !== String(dealer.id)) {
+    return res.status(403).json({ error: "This complaint does not belong to your dealership." });
+  }
+
+  const existing = await query("SELECT id FROM replace_return_cases WHERE complaint_id = ? LIMIT 1", [complaintId]);
+  if (existing.rowCount) {
+    return res.status(409).json({ error: "Replace/Return case already exists for this complaint." });
+  }
+
+  const caseNo = `RR-${Date.now()}`;
+  const caseId = crypto.randomUUID();
+  const qrPayload = replaceReturnQrPayload({
+    caseId,
+    caseNo,
+    serialNo: complaint.serial_no,
+    actionType,
+  });
+
+  await query(
+    `INSERT INTO replace_return_cases
+       (id, case_no, complaint_id, task_id, warranty_id, customer_id, dealer_id, serial_id,
+        action_type, problem_details, technician_remarks, status, qr_status, qr_payload, qr_printed_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending Admin Scan', 'Printed', ?, CURRENT_TIMESTAMP)`,
+    [
+      caseId,
+      caseNo,
+      complaintId,
+      complaint.task_id || null,
+      complaint.warranty_id || null,
+      complaint.customer_id || null,
+      dealer.id,
+      complaint.serial_id || null,
+      actionType,
+      problemDetails,
+      complaint.resolution_notes || null,
+      qrPayload,
+    ]
+  );
+
+  await recordStatusHistory({
+    complaintId,
+    oldStatus: complaint.status,
+    newStatus: "Replace/Return Submitted",
+    changedByRole: "Dealer",
+    changedById: createdById,
+    remarks: `${actionType} case ${caseNo} created`,
+  });
+
+  await ensureNotificationsSchema();
+  const adminUsers = await query("SELECT id FROM users WHERE role = 'Admin' LIMIT 5");
+  for (const admin of adminUsers.rows) {
+    await createNotification({
+      userId: admin.id,
+      recipientRole: "Admin",
+      type: "replace_return",
+      title: `New ${actionType} case`,
+      message: `${caseNo}: ${complaint.product_name || "Product"} — scan QR in Replace/Return panel.`,
+      entityType: "replace_return",
+      entityId: caseId,
+    });
+  }
+
+  const detail = await query(
+    `SELECT ${REPLACE_RETURN_DETAIL_SELECT}
+     ${REPLACE_RETURN_DETAIL_JOINS}
+     WHERE rr.id = ?
+     LIMIT 1`,
+    [caseId]
+  );
+
+  res.status(201).json({
+    case: detail.rows[0],
+    qrPayload,
+    message: `${actionType} case created. QR is ready — Admin will scan to receive product.`,
+  });
+}));
+
+app.get("/replace-return/:id/scan", asyncRoute(async (req, res) => {
+  const caseId = await resolveReplaceReturnCase(req.params.id);
+  if (!caseId) {
+    return res.status(404).json({ error: "Replace/Return case not found." });
+  }
+  const result = await query(
+    `SELECT ${REPLACE_RETURN_DETAIL_SELECT}
+     ${REPLACE_RETURN_DETAIL_JOINS}
+     WHERE rr.id = ?
+     LIMIT 1`,
+    [caseId]
+  );
+  if (!result.rowCount) {
+    return res.status(404).json({ error: "Replace/Return case not found." });
+  }
+  res.json({ case: result.rows[0] });
+}));
+
+app.get("/replace-return/:id/qr.svg", asyncRoute(async (req, res) => {
+  const caseId = await resolveReplaceReturnCase(req.params.id);
+  if (!caseId) {
+    return res.status(404).json({ error: "Replace/Return case not found." });
+  }
+  const row = await query("SELECT qr_payload FROM replace_return_cases WHERE id = ? LIMIT 1", [caseId]);
+  if (!row.rowCount || !row.rows[0].qr_payload) {
+    return res.status(404).json({ error: "QR not generated for this case." });
+  }
+  res.setHeader("Content-Type", "image/svg+xml");
+  res.send(qrSvg(row.rows[0].qr_payload, 280));
+}));
+
+app.post("/replace-return/:id/admin-scan", asyncRoute(async (req, res) => {
+  await ensureReplaceReturnSchema();
+  const caseId = await resolveReplaceReturnCase(req.params.id);
+  if (!caseId) {
+    return res.status(404).json({ error: "Replace/Return case not found." });
+  }
+  const adminUserId = cleanString(req.body.adminUserId || req.body.userId || req.body.user_id) || null;
+  const existing = await query("SELECT * FROM replace_return_cases WHERE id = ? LIMIT 1", [caseId]);
+  const row = existing.rows[0];
+  if (String(row.status || "") === "Admin Received") {
+    return res.status(409).json({ error: "This case was already scanned by Admin." });
+  }
+
+  await query(
+    `UPDATE replace_return_cases
+     SET status = 'Admin Received', admin_scanned_at = CURRENT_TIMESTAMP, admin_scanned_by = ?
+     WHERE id = ?`,
+    [adminUserId, caseId]
+  );
+
+  await recordStatusHistory({
+    complaintId: row.complaint_id,
+    oldStatus: "Replace/Return Submitted",
+    newStatus: "Admin Received",
+    changedByRole: "Admin",
+    changedById: adminUserId,
+    remarks: `Admin scanned ${row.case_no}`,
+  });
+
+  const detail = await query(
+    `SELECT ${REPLACE_RETURN_DETAIL_SELECT}
+     ${REPLACE_RETURN_DETAIL_JOINS}
+     WHERE rr.id = ?
+     LIMIT 1`,
+    [caseId]
+  );
+
+  res.json({
+    case: detail.rows[0],
+    message: "Case received in Admin Replace/Return panel.",
+  });
+}));
+
 /** List complaints (staff panels). Customers should use `/complaints/customer/:customerId`. */
 app.get("/complaints", asyncRoute(async (_req, res) => {
   await ensureFeedbackSchema();
@@ -5266,6 +5613,20 @@ app.get("/serial-numbers", asyncRoute(async (req, res) => {
          ORDER BY w.created_at DESC
          LIMIT 1
        ) AS warranty_no,
+       (
+         SELECT w.id
+         FROM warranties w
+         WHERE w.serial_id = s.id
+         ORDER BY w.created_at DESC
+         LIMIT 1
+       ) AS warranty_id,
+       (
+         SELECT w.installation_status
+         FROM warranties w
+         WHERE w.serial_id = s.id
+         ORDER BY w.created_at DESC
+         LIMIT 1
+       ) AS installation_status,
        (
          SELECT w.customer_id
          FROM warranties w
@@ -5658,6 +6019,7 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
     "Reached",
     "Inspection Started",
     "On Hold",
+    "Unrepairable",
     "Completed",
     "Closed"
   ];
@@ -5698,6 +6060,11 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
   await withTransaction(async (tx) => {
     if (dueAt && (status === "Rescheduled" || status === "Scheduled")) {
       await tx("UPDATE tasks SET status = ?, due_at = ? WHERE id = ?", [status, dueAt, id]);
+    } else if (status === "Unrepairable") {
+      await tx(
+        "UPDATE tasks SET status = ?, resolution_notes = COALESCE(?, resolution_notes) WHERE id = ?",
+        [status, resolutionNotes, id]
+      );
     } else if (status === "Completed" || status === "Closed") {
       await tx(
         "UPDATE tasks SET status = ?, completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP), resolution_notes = COALESCE(?, resolution_notes) WHERE id = ?",

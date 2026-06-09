@@ -317,3 +317,34 @@ CREATE TABLE IF NOT EXISTS feedback (
   CONSTRAINT fk_feedback_customer FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE,
   CONSTRAINT fk_feedback_technician FOREIGN KEY (technician_id) REFERENCES technicians(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS replace_return_cases (
+  id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
+  case_no VARCHAR(80) NOT NULL UNIQUE,
+  complaint_id CHAR(36) NOT NULL,
+  task_id CHAR(36),
+  warranty_id CHAR(36),
+  customer_id CHAR(36),
+  dealer_id CHAR(36) NOT NULL,
+  serial_id CHAR(36),
+  action_type VARCHAR(40) NOT NULL,
+  problem_details TEXT NOT NULL,
+  technician_remarks TEXT,
+  status VARCHAR(60) NOT NULL DEFAULT 'Pending Admin Scan',
+  qr_status VARCHAR(40) NOT NULL DEFAULT 'Not Printed',
+  qr_payload VARCHAR(255),
+  qr_printed_at TIMESTAMP NULL,
+  admin_scanned_at TIMESTAMP NULL,
+  admin_scanned_by CHAR(36),
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_rr_dealer (dealer_id),
+  INDEX idx_rr_status (status),
+  INDEX idx_rr_complaint (complaint_id),
+  CONSTRAINT fk_rr_complaint FOREIGN KEY (complaint_id) REFERENCES complaints(id) ON DELETE CASCADE,
+  CONSTRAINT fk_rr_task FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE SET NULL,
+  CONSTRAINT fk_rr_warranty FOREIGN KEY (warranty_id) REFERENCES warranties(id) ON DELETE SET NULL,
+  CONSTRAINT fk_rr_customer FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE SET NULL,
+  CONSTRAINT fk_rr_dealer FOREIGN KEY (dealer_id) REFERENCES dealers(id) ON DELETE CASCADE,
+  CONSTRAINT fk_rr_serial FOREIGN KEY (serial_id) REFERENCES serial_numbers(id) ON DELETE SET NULL,
+  CONSTRAINT fk_rr_admin_user FOREIGN KEY (admin_scanned_by) REFERENCES users(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
