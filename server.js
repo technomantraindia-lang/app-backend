@@ -6504,11 +6504,11 @@ app.get("/tasks/:id", asyncRoute(async (req, res) => {
 app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
   await ensureTasksSchema();
   const taskId = await resolveTaskId(req.params.id);
-  const status = cleanString(req.body?.status);
+  const rawStatus = cleanString(req.body?.status);
   const dueAt = cleanString(req.body?.dueAt || req.body?.due_at) || null;
   const technicianId = cleanString(req.body?.technicianId || req.body?.technician_id);
   const resolutionNotes = cleanString(req.body?.resolutionNotes || req.body?.resolution_notes) || null;
-  if (!taskId || !status) {
+  if (!taskId || !rawStatus) {
     return res.status(400).json({ error: "Task id and status are required." });
   }
   const allowed = [
@@ -6525,11 +6525,11 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
     "Completed",
     "Closed"
   ];
-  const normalizedStatus = allowed.find((item) => item.toLowerCase() === status.toLowerCase());
+  const normalizedStatus = allowed.find((item) => item.toLowerCase() === rawStatus.toLowerCase());
   if (!normalizedStatus) {
     return res.status(400).json({ error: "Invalid task status." });
   }
-  status = normalizedStatus;
+  const status = normalizedStatus;
   const id = taskId;
   const existing = await query(
     `SELECT t.id, t.complaint_id, t.technician_id, t.status, t.work_type, c.warranty_id
