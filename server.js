@@ -1248,7 +1248,10 @@ async function ensureSerialNumbersSchema() {
     ["qr_payload", "ALTER TABLE serial_numbers ADD COLUMN qr_payload VARCHAR(255) NULL AFTER qr_status"],
     ["qr_printed_at", "ALTER TABLE serial_numbers ADD COLUMN qr_printed_at TIMESTAMP NULL AFTER qr_payload"],
     ["dispatched_at", "ALTER TABLE serial_numbers ADD COLUMN dispatched_at TIMESTAMP NULL AFTER dispatch_status"],
-    ["installation_required", "ALTER TABLE serial_numbers ADD COLUMN installation_required TINYINT(1) NOT NULL DEFAULT 0 AFTER dispatched_at"]
+    ["installation_required", "ALTER TABLE serial_numbers ADD COLUMN installation_required TINYINT(1) NOT NULL DEFAULT 0 AFTER dispatched_at"],
+    ["replacement_case_id", "ALTER TABLE serial_numbers ADD COLUMN replacement_case_id CHAR(36) NULL AFTER installation_required"],
+    ["replacement_for_customer_id", "ALTER TABLE serial_numbers ADD COLUMN replacement_for_customer_id CHAR(36) NULL AFTER replacement_case_id"],
+    ["replacement_label", "ALTER TABLE serial_numbers ADD COLUMN replacement_label VARCHAR(255) NULL AFTER replacement_for_customer_id"],
   ];
 
   for (const [columnName, ddl] of columns) {
@@ -1463,12 +1466,34 @@ async function ensureReplaceReturnSchema() {
       qr_printed_at TIMESTAMP NULL,
       admin_scanned_at TIMESTAMP NULL,
       admin_scanned_by CHAR(36),
+      replacement_serial_id CHAR(36),
+      replacement_dispatched_at TIMESTAMP NULL,
+      replacement_dispatched_by CHAR(36),
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       INDEX idx_rr_dealer (dealer_id),
       INDEX idx_rr_status (status),
       INDEX idx_rr_complaint (complaint_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
   );
+  const columns = [
+    ["replacement_serial_id", "ALTER TABLE replace_return_cases ADD COLUMN replacement_serial_id CHAR(36) NULL AFTER admin_scanned_by"],
+    ["replacement_dispatched_at", "ALTER TABLE replace_return_cases ADD COLUMN replacement_dispatched_at TIMESTAMP NULL AFTER replacement_serial_id"],
+    ["replacement_dispatched_by", "ALTER TABLE replace_return_cases ADD COLUMN replacement_dispatched_by CHAR(36) NULL AFTER replacement_dispatched_at"],
+  ];
+  for (const [columnName, ddl] of columns) {
+    const found = await query(
+      `SELECT COLUMN_NAME
+       FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE()
+         AND TABLE_NAME = 'replace_return_cases'
+         AND COLUMN_NAME = ?
+       LIMIT 1`,
+      [columnName]
+    );
+    if (!found.rowCount) {
+      await query(ddl);
+    }
+  }
 }
 
 async function ensureFeedbackSchema() {
@@ -3818,9 +3843,20 @@ app.get("/dealers/:id/assigned-products", asyncRoute(async (req, res) => {
        p.id AS product_id,
        p.name AS product_name,
        p.model_no,
-       p.category AS product_category
+       p.category AS product_category,
+       s.replacement_case_id,
+       s.replacement_for_customer_id,
+       s.replacement_label,
+       rc.name AS replacement_customer_name,
+       rc.mobile AS replacement_customer_mobile,
+       rr.case_no AS replacement_case_no,
+       rr.complaint_id AS replacement_complaint_id,
+       c.complaint_no AS replacement_complaint_no
      FROM serial_numbers s
      LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN replace_return_cases rr ON rr.id = s.replacement_case_id
+     LEFT JOIN customers rc ON rc.id = s.replacement_for_customer_id
+     LEFT JOIN complaints c ON c.id = rr.complaint_id
      WHERE s.dealer_id = ?
        AND NOT EXISTS (
          SELECT 1
@@ -5280,7 +5316,10 @@ const REPLACE_RETURN_DETAIL_SELECT = `
   p.model_no,
   p.category AS product_category,
   t.resolution_notes AS technician_remarks,
-  tech.name AS technician_name`;
+  tech.name AS technician_name,
+  rs.serial_no AS replacement_serial_no,
+  rp.name AS replacement_product_name,
+  rp.model_no AS replacement_model_no`;
 
 const REPLACE_RETURN_DETAIL_JOINS = `
   FROM replace_return_cases rr
@@ -5291,7 +5330,9 @@ const REPLACE_RETURN_DETAIL_JOINS = `
   LEFT JOIN serial_numbers s ON s.id = rr.serial_id
   LEFT JOIN products p ON p.id = s.product_id
   LEFT JOIN tasks t ON t.id = rr.task_id
-  LEFT JOIN technicians tech ON tech.id = t.technician_id`;
+  LEFT JOIN technicians tech ON tech.id = t.technician_id
+  LEFT JOIN serial_numbers rs ON rs.id = rr.replacement_serial_id
+  LEFT JOIN products rp ON rp.id = rs.product_id`;
 
 async function resolveReplaceReturnCase(identifier) {
   const key = cleanString(identifier);
@@ -5567,6 +5608,228 @@ app.post("/replace-return/:id/admin-scan", asyncRoute(async (req, res) => {
   res.json({
     case: detail.rows[0],
     message: "Case received in Admin Replace/Return panel.",
+  });
+}));
+
+app.get("/replace-return/:id/available-replacement-serials", asyncRoute(async (req, res) => {
+  await ensureReplaceReturnSchema();
+  await ensureSerialNumbersSchema();
+  const caseId = await resolveReplaceReturnCase(req.params.id);
+  if (!caseId) {
+    return res.status(404).json({ error: "Replace/Return case not found." });
+  }
+  const caseRow = await query(
+    `SELECT rr.*, c.complaint_no, cust.name AS customer_name, p.name AS product_name, p.model_no, p.category_id
+     FROM replace_return_cases rr
+     INNER JOIN complaints c ON c.id = rr.complaint_id
+     LEFT JOIN customers cust ON cust.id = rr.customer_id
+     LEFT JOIN serial_numbers s ON s.id = rr.serial_id
+     LEFT JOIN products p ON p.id = s.product_id
+     WHERE rr.id = ?
+     LIMIT 1`,
+    [caseId]
+  );
+  if (!caseRow.rowCount) {
+    return res.status(404).json({ error: "Replace/Return case not found." });
+  }
+  const row = caseRow.rows[0];
+  if (String(row.status || "") !== "Admin Received") {
+    return res.status(400).json({ error: "Admin must receive the product before dispatching replacement." });
+  }
+  if (row.replacement_serial_id) {
+    return res.status(409).json({ error: "Replacement already dispatched for this case." });
+  }
+  const productName = cleanString(row.product_name);
+  const modelNo = cleanString(row.model_no);
+  const categoryId = cleanString(row.category_id);
+  const clauses = ["s.dealer_id IS NULL", "s.dispatch_status = 'Pending'", "s.replacement_case_id IS NULL"];
+  const params = [];
+  if (productName) {
+    clauses.push("p.name = ?");
+    params.push(productName);
+  } else if (categoryId) {
+    clauses.push("p.category_id = ?");
+    params.push(categoryId);
+  }
+  params.push(modelNo || "", 100);
+  const result = await query(
+    `SELECT s.id, s.serial_no, p.name AS product_name, p.model_no, p.category AS product_category
+     FROM serial_numbers s
+     INNER JOIN products p ON p.id = s.product_id
+     WHERE ${clauses.join(" AND ")}
+     ORDER BY CASE WHEN LOWER(TRIM(COALESCE(p.model_no, ''))) = LOWER(?) THEN 0 ELSE 1 END, s.serial_no ASC
+     LIMIT ?`,
+    params
+  );
+  res.json({
+    caseId,
+    caseNo: row.case_no,
+    customerName: row.customer_name,
+    complaintNo: row.complaint_no,
+    productName,
+    modelNo,
+    serials: result.rows,
+  });
+}));
+
+app.post("/replace-return/:id/dispatch-replacement", asyncRoute(async (req, res) => {
+  await ensureReplaceReturnSchema();
+  await ensureSerialNumbersSchema();
+  await ensureProductsQrSchema();
+  await ensureNotificationsSchema();
+  const caseId = await resolveReplaceReturnCase(req.params.id);
+  if (!caseId) {
+    return res.status(404).json({ error: "Replace/Return case not found." });
+  }
+  const serialId = cleanString(req.body.serialId || req.body.serial_id);
+  const serialNo = cleanSerialNo(req.body.serialNo || req.body.serial_no);
+  const adminUserId = cleanString(req.body.adminUserId || req.body.userId || req.body.user_id) || null;
+  if (!serialId && !serialNo) {
+    return res.status(400).json({ error: "Select a replacement serial number to dispatch." });
+  }
+
+  const caseRow = await query(
+    `SELECT rr.*, c.complaint_no, c.status AS complaint_status, cust.name AS customer_name, cust.mobile AS customer_mobile,
+            d.dealer_no, d.name AS dealer_name, d.mobile AS dealer_mobile,
+            du.id AS dealer_user_id,
+            p.name AS product_name, p.model_no
+     FROM replace_return_cases rr
+     INNER JOIN complaints c ON c.id = rr.complaint_id
+     LEFT JOIN customers cust ON cust.id = rr.customer_id
+     LEFT JOIN dealers d ON d.id = rr.dealer_id
+     LEFT JOIN users du ON du.role = 'Dealer' AND ${sqlNormalizeMobileColumn("du.mobile")} = ${sqlNormalizeMobileColumn("d.mobile")}
+     LEFT JOIN serial_numbers s ON s.id = rr.serial_id
+     LEFT JOIN products p ON p.id = s.product_id
+     WHERE rr.id = ?
+     LIMIT 1`,
+    [caseId]
+  );
+  if (!caseRow.rowCount) {
+    return res.status(404).json({ error: "Replace/Return case not found." });
+  }
+  const row = caseRow.rows[0];
+  if (String(row.status || "") !== "Admin Received") {
+    return res.status(400).json({ error: "Admin must receive the product before dispatching replacement." });
+  }
+  if (row.replacement_serial_id) {
+    return res.status(409).json({ error: "Replacement already dispatched for this case." });
+  }
+
+  const serialResult = serialId
+    ? await query(
+        `SELECT s.*, p.name AS product_name, p.model_no
+         FROM serial_numbers s
+         LEFT JOIN products p ON p.id = s.product_id
+         WHERE s.id = ?
+         LIMIT 1`,
+        [serialId]
+      )
+    : await query(
+        `SELECT s.*, p.name AS product_name, p.model_no
+         FROM serial_numbers s
+         LEFT JOIN products p ON p.id = s.product_id
+         WHERE s.serial_no = ?
+         LIMIT 1`,
+        [serialNo]
+      );
+  if (!serialResult.rowCount) {
+    return res.status(404).json({ error: "Replacement serial not found." });
+  }
+  const serial = serialResult.rows[0];
+  if (serial.dealer_id) {
+    return res.status(409).json({ error: "This serial is already assigned to a dealer." });
+  }
+  if (String(serial.dispatch_status || "") !== "Pending") {
+    return res.status(409).json({ error: "This serial is not available for dispatch." });
+  }
+  if (serial.replacement_case_id) {
+    return res.status(409).json({ error: "This serial is already marked as a customer replacement." });
+  }
+
+  const dealer = await resolveDealerRecord(row.dealer_id);
+  if (!dealer) {
+    return res.status(404).json({ error: "Dealer not found for this case." });
+  }
+
+  const replacementLabel = `Replacement for ${row.customer_name || "Customer"} · ${row.complaint_no || row.case_no}`;
+  const batchNo = `RPL-${Date.now()}`;
+  const qrPayload = dispatchUnitQrPayload({
+    productId: serial.product_id,
+    productName: serial.product_name,
+    modelNo: serial.model_no,
+    serialNo: serial.serial_no,
+    dealerId: dealer.id,
+    dealerNo: dealer.dealer_no,
+    dealerName: dealer.name,
+  });
+
+  await withTransaction(async (tx) => {
+    await tx(
+      `UPDATE serial_numbers
+       SET dealer_id = ?,
+           batch_no = ?,
+           dispatch_date = CURDATE(),
+           qr_status = 'Printed',
+           qr_payload = ?,
+           qr_printed_at = NOW(),
+           dispatch_status = 'Dispatched',
+           dispatched_at = NOW(),
+           replacement_case_id = ?,
+           replacement_for_customer_id = ?,
+           replacement_label = ?
+       WHERE id = ?`,
+      [dealer.id, batchNo, qrPayload, caseId, row.customer_id || null, replacementLabel, serial.id]
+    );
+    await tx(
+      `UPDATE replace_return_cases
+       SET status = 'Replacement Dispatched',
+           replacement_serial_id = ?,
+           replacement_dispatched_at = CURRENT_TIMESTAMP,
+           replacement_dispatched_by = ?
+       WHERE id = ?`,
+      [serial.id, adminUserId, caseId]
+    );
+    await tx("UPDATE complaints SET status = 'Replacement Dispatched to Dealer' WHERE id = ?", [row.complaint_id]);
+    await recordStatusHistory({
+      complaintId: row.complaint_id,
+      oldStatus: row.complaint_status,
+      newStatus: "Replacement Dispatched to Dealer",
+      changedByRole: "Admin",
+      changedById: adminUserId,
+      remarks: `${replacementLabel} — new serial ${serial.serial_no} sent to ${dealer.dealer_no}`,
+    }, tx);
+  });
+
+  if (row.dealer_user_id) {
+    await createNotification({
+      userId: row.dealer_user_id,
+      recipientRole: "Dealer",
+      type: "replacement_dispatched",
+      title: "Customer replacement product dispatched",
+      message: `${serial.serial_no} — ${replacementLabel}. Give this unit to the customer.`,
+      entityType: "replace_return",
+      entityId: caseId,
+    });
+  }
+
+  const detail = await query(
+    `SELECT ${REPLACE_RETURN_DETAIL_SELECT}
+     ${REPLACE_RETURN_DETAIL_JOINS}
+     WHERE rr.id = ?
+     LIMIT 1`,
+    [caseId]
+  );
+
+  res.status(201).json({
+    case: detail.rows[0],
+    serial: {
+      id: serial.id,
+      serial_no: serial.serial_no,
+      product_name: serial.product_name,
+      model_no: serial.model_no,
+      replacement_label: replacementLabel,
+    },
+    message: `Replacement ${serial.serial_no} dispatched to ${dealer.name}. Dealer can deliver to customer.`,
   });
 }));
 
