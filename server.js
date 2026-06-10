@@ -707,6 +707,16 @@ function replaceReturnQrPayload({ caseId, caseNo, serialNo, actionType }) {
   return `hitaishi://replace-return?${params.toString()}`;
 }
 
+function replacementDeliveryQrPayload({ caseId, caseNo, serialNo, customerId, complaintNo }) {
+  const params = new URLSearchParams();
+  if (caseId) params.set("caseId", caseId);
+  if (caseNo) params.set("caseNo", caseNo);
+  if (serialNo) params.set("serial", serialNo);
+  if (customerId) params.set("customerId", customerId);
+  if (complaintNo) params.set("complaint", complaintNo);
+  return `hitaishi://replacement-delivery?${params.toString()}`;
+}
+
 async function allocateDispatchSerialNumbers(product, quantity, tx) {
   const modelBase = cleanString(product?.model_no).replace(/[^A-Za-z0-9]/g, "").toUpperCase() || "UNIT";
   const prefix = `${modelBase}-`;
@@ -1479,6 +1489,7 @@ async function ensureReplaceReturnSchema() {
     ["replacement_serial_id", "ALTER TABLE replace_return_cases ADD COLUMN replacement_serial_id CHAR(36) NULL AFTER admin_scanned_by"],
     ["replacement_dispatched_at", "ALTER TABLE replace_return_cases ADD COLUMN replacement_dispatched_at TIMESTAMP NULL AFTER replacement_serial_id"],
     ["replacement_dispatched_by", "ALTER TABLE replace_return_cases ADD COLUMN replacement_dispatched_by CHAR(36) NULL AFTER replacement_dispatched_at"],
+    ["delivered_to_customer_at", "ALTER TABLE replace_return_cases ADD COLUMN delivered_to_customer_at TIMESTAMP NULL AFTER replacement_dispatched_by"],
   ];
   for (const [columnName, ddl] of columns) {
     const found = await query(
@@ -5753,14 +5764,12 @@ app.post("/replace-return/:id/dispatch-replacement", asyncRoute(async (req, res)
 
   const replacementLabel = `Replacement for ${row.customer_name || "Customer"} · ${row.complaint_no || row.case_no}`;
   const batchNo = `RPL-${Date.now()}`;
-  const qrPayload = dispatchUnitQrPayload({
-    productId: serial.product_id,
-    productName: serial.product_name,
-    modelNo: serial.model_no,
+  const qrPayload = replacementDeliveryQrPayload({
+    caseId,
+    caseNo: row.case_no,
     serialNo: serial.serial_no,
-    dealerId: dealer.id,
-    dealerNo: dealer.dealer_no,
-    dealerName: dealer.name,
+    customerId: row.customer_id || null,
+    complaintNo: row.complaint_no || null,
   });
 
   await withTransaction(async (tx) => {
@@ -5828,8 +5837,196 @@ app.post("/replace-return/:id/dispatch-replacement", asyncRoute(async (req, res)
       product_name: serial.product_name,
       model_no: serial.model_no,
       replacement_label: replacementLabel,
+      qr_payload: qrPayload,
     },
-    message: `Replacement ${serial.serial_no} dispatched to ${dealer.name}. Dealer can deliver to customer.`,
+    qrPayload,
+    qrUrl: `/replace-return/${caseId}/replacement-qr.svg`,
+    message: `Replacement ${serial.serial_no} dispatched to ${dealer.name}. Print QR sticker — dealer will scan to deliver to customer.`,
+  });
+}));
+
+app.get("/replace-return/:id/replacement-qr.svg", asyncRoute(async (req, res) => {
+  const caseId = await resolveReplaceReturnCase(req.params.id);
+  if (!caseId) {
+    return res.status(404).json({ error: "Replace/Return case not found." });
+  }
+  const row = await query(
+    `SELECT rs.qr_payload
+     FROM replace_return_cases rr
+     LEFT JOIN serial_numbers rs ON rs.id = rr.replacement_serial_id
+     WHERE rr.id = ?
+     LIMIT 1`,
+    [caseId]
+  );
+  if (!row.rowCount || !row.rows[0].qr_payload) {
+    return res.status(404).json({ error: "Replacement QR not generated yet. Dispatch replacement first." });
+  }
+  res.setHeader("Content-Type", "image/svg+xml");
+  res.send(qrSvg(row.rows[0].qr_payload, 280));
+}));
+
+app.get("/replacement-delivery/scan", asyncRoute(async (req, res) => {
+  await ensureReplaceReturnSchema();
+  await ensureSerialNumbersSchema();
+  const caseKey = cleanString(req.query.caseId || req.query.case_id || req.query.caseNo || req.query.case_no);
+  const serialNo = cleanSerialNo(req.query.serial || req.query.serialNo || req.query.serial_no);
+  let caseId = caseKey ? await resolveReplaceReturnCase(caseKey) : null;
+  if (!caseId && serialNo) {
+    const bySerial = await query(
+      `SELECT rr.id
+       FROM replace_return_cases rr
+       INNER JOIN serial_numbers s ON s.id = rr.replacement_serial_id
+       WHERE LOWER(TRIM(s.serial_no)) = LOWER(TRIM(?))
+       LIMIT 1`,
+      [serialNo]
+    );
+    caseId = bySerial.rowCount ? bySerial.rows[0].id : null;
+  }
+  if (!caseId) {
+    return res.status(404).json({ error: "Replacement delivery record not found." });
+  }
+  const result = await query(
+    `SELECT ${REPLACE_RETURN_DETAIL_SELECT},
+            rs.id AS replacement_serial_id,
+            rs.qr_payload AS replacement_qr_payload,
+            rs.replacement_label,
+            cust.address AS customer_address,
+            cust.pincode AS customer_pincode
+     ${REPLACE_RETURN_DETAIL_JOINS}
+     WHERE rr.id = ?
+     LIMIT 1`,
+    [caseId]
+  );
+  if (!result.rowCount) {
+    return res.status(404).json({ error: "Replacement delivery record not found." });
+  }
+  const row = result.rows[0];
+  if (!row.replacement_serial_id) {
+    return res.status(400).json({ error: "Replacement unit not dispatched yet." });
+  }
+  if (String(row.status || "") === "Delivered to Customer") {
+    return res.status(409).json({ error: "This replacement was already delivered to the customer." });
+  }
+  res.json({
+    delivery: {
+      caseId: row.id,
+      caseNo: row.case_no,
+      status: row.status,
+      complaintNo: row.complaint_no,
+      productName: row.replacement_product_name || row.product_name,
+      modelNo: row.replacement_model_no || row.model_no,
+      serialNo: row.replacement_serial_no,
+      replacementLabel: row.replacement_label,
+      qrPayload: row.replacement_qr_payload,
+      customerId: row.customer_id,
+      customerName: row.customer_name,
+      customerMobile: row.customer_mobile,
+      customerAddress: row.customer_address,
+      customerCity: row.customer_city,
+      customerPincode: row.customer_pincode,
+      dealerId: row.dealer_id,
+      dealerNo: row.dealer_no,
+      dealerName: row.dealer_name,
+      warrantyNo: row.warranty_no,
+      warrantyStatus: row.warranty_status,
+      warrantyStart: row.warranty_start,
+      warrantyExpiry: row.warranty_expiry,
+      problemDetails: row.problem_details,
+      technicianRemarks: row.technician_remarks,
+    },
+  });
+}));
+
+app.post("/replacement-delivery/confirm", asyncRoute(async (req, res) => {
+  await ensureReplaceReturnSchema();
+  await ensureComplaintsSchema();
+  await ensureNotificationsSchema();
+  const caseId = await resolveReplaceReturnCase(req.body.caseId || req.body.case_id || req.body.caseNo || req.body.case_no);
+  const dealerId = cleanString(req.body.dealerId || req.body.dealer_id);
+  const confirmedById = cleanString(req.body.userId || req.body.user_id || req.body.dealerUserId) || null;
+  if (!caseId) {
+    return res.status(400).json({ error: "Replacement case is required." });
+  }
+  if (!dealerId) {
+    return res.status(400).json({ error: "Dealer id is required." });
+  }
+  const dealer = await resolveDealerRecord(dealerId);
+  if (!dealer) {
+    return res.status(404).json({ error: "Dealer not found." });
+  }
+
+  const caseRow = await query(
+    `SELECT rr.*, c.complaint_no, c.status AS complaint_status, w.id AS warranty_id, w.warranty_no,
+            rs.serial_no AS replacement_serial_no, rs.id AS replacement_serial_id
+     FROM replace_return_cases rr
+     INNER JOIN complaints c ON c.id = rr.complaint_id
+     LEFT JOIN warranties w ON w.id = rr.warranty_id
+     LEFT JOIN serial_numbers rs ON rs.id = rr.replacement_serial_id
+     WHERE rr.id = ?
+     LIMIT 1`,
+    [caseId]
+  );
+  if (!caseRow.rowCount) {
+    return res.status(404).json({ error: "Replacement case not found." });
+  }
+  const row = caseRow.rows[0];
+  if (String(row.dealer_id) !== String(dealer.id)) {
+    return res.status(403).json({ error: "This replacement is not assigned to your dealership." });
+  }
+  if (!row.replacement_serial_id) {
+    return res.status(400).json({ error: "Replacement unit not dispatched yet." });
+  }
+  if (String(row.status || "") === "Delivered to Customer") {
+    return res.status(409).json({ error: "Already delivered to customer." });
+  }
+  if (String(row.status || "") !== "Replacement Dispatched") {
+    return res.status(400).json({ error: "Replacement must be dispatched by Admin before dealer delivery." });
+  }
+
+  await withTransaction(async (tx) => {
+    if (row.warranty_id) {
+      await tx("UPDATE warranties SET serial_id = ? WHERE id = ?", [row.replacement_serial_id, row.warranty_id]);
+    }
+    await tx(
+      `UPDATE replace_return_cases
+       SET status = 'Delivered to Customer', delivered_to_customer_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [caseId]
+    );
+    await tx("UPDATE complaints SET status = 'Replacement Completed' WHERE id = ?", [row.complaint_id]);
+    await recordStatusHistory({
+      complaintId: row.complaint_id,
+      oldStatus: row.complaint_status,
+      newStatus: "Replacement Completed",
+      changedByRole: "Dealer",
+      changedById: confirmedById,
+      remarks: `Replacement unit ${row.replacement_serial_no} delivered to customer`,
+    }, tx);
+  });
+
+  if (row.customer_id) {
+    await createNotification({
+      customerId: row.customer_id,
+      recipientRole: "Customer",
+      type: "replacement_delivered",
+      title: "Replacement product received",
+      message: `Your replacement ${row.replacement_serial_no} was delivered by ${dealer.name}.`,
+      entityType: "complaint",
+      entityId: row.complaint_id,
+    });
+  }
+
+  const detail = await query(
+    `SELECT ${REPLACE_RETURN_DETAIL_SELECT}
+     ${REPLACE_RETURN_DETAIL_JOINS}
+     WHERE rr.id = ?
+     LIMIT 1`,
+    [caseId]
+  );
+
+  res.json({
+    case: detail.rows[0],
+    message: `Replacement delivered to customer. Warranty now linked to serial ${row.replacement_serial_no}.`,
   });
 }));
 
