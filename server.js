@@ -1249,6 +1249,29 @@ function pickRowValue(row, names) {
   return "";
 }
 
+async function ensureTableColumn(tableName, columnName, ddl) {
+  try {
+    const found = await query(
+      `SELECT COLUMN_NAME
+       FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE()
+         AND TABLE_NAME = ?
+         AND COLUMN_NAME = ?
+       LIMIT 1`,
+      [tableName, columnName]
+    );
+    if (!found.rowCount) {
+      await query(ddl);
+    }
+  } catch (e) {
+    const msg = String(e?.message || e?.sqlMessage || "");
+    if (e?.code === "ER_DUP_FIELDNAME" || msg.includes("Duplicate column")) {
+      return;
+    }
+    throw e;
+  }
+}
+
 async function ensureSerialNumbersSchema() {
   const columns = [
     ["invoice_no", "ALTER TABLE serial_numbers ADD COLUMN invoice_no VARCHAR(120) NULL AFTER serial_no"],
@@ -1265,18 +1288,7 @@ async function ensureSerialNumbersSchema() {
   ];
 
   for (const [columnName, ddl] of columns) {
-    const found = await query(
-      `SELECT COLUMN_NAME
-       FROM INFORMATION_SCHEMA.COLUMNS
-       WHERE TABLE_SCHEMA = DATABASE()
-         AND TABLE_NAME = 'serial_numbers'
-         AND COLUMN_NAME = ?
-       LIMIT 1`,
-      [columnName]
-    );
-    if (!found.rowCount) {
-      await query(ddl);
-    }
+    await ensureTableColumn("serial_numbers", columnName, ddl);
   }
 }
 
@@ -1479,6 +1491,7 @@ async function ensureReplaceReturnSchema() {
       replacement_serial_id CHAR(36),
       replacement_dispatched_at TIMESTAMP NULL,
       replacement_dispatched_by CHAR(36),
+      delivered_to_customer_at TIMESTAMP NULL,
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       INDEX idx_rr_dealer (dealer_id),
       INDEX idx_rr_status (status),
@@ -1492,18 +1505,7 @@ async function ensureReplaceReturnSchema() {
     ["delivered_to_customer_at", "ALTER TABLE replace_return_cases ADD COLUMN delivered_to_customer_at TIMESTAMP NULL AFTER replacement_dispatched_by"],
   ];
   for (const [columnName, ddl] of columns) {
-    const found = await query(
-      `SELECT COLUMN_NAME
-       FROM INFORMATION_SCHEMA.COLUMNS
-       WHERE TABLE_SCHEMA = DATABASE()
-         AND TABLE_NAME = 'replace_return_cases'
-         AND COLUMN_NAME = ?
-       LIMIT 1`,
-      [columnName]
-    );
-    if (!found.rowCount) {
-      await query(ddl);
-    }
+    await ensureTableColumn("replace_return_cases", columnName, ddl);
   }
 }
 
