@@ -429,6 +429,13 @@ function isWarrantyExpiredStatus(status, expiryDate) {
   return false;
 }
 
+const WARRANTY_ACTIVE_SQL = `
+  LOWER(TRIM(COALESCE(c.warranty_status, w.status, ''))) NOT LIKE '%expired%'
+  AND (
+    COALESCE(c.warranty_end_date, w.expiry_date) IS NULL
+    OR DATE(COALESCE(c.warranty_end_date, w.expiry_date)) >= CURDATE()
+  )`;
+
 function calcQuotationTotal(parts) {
   const spare = Number(parts.sparePartAmount) || 0;
   const service = Number(parts.serviceCharge) || 0;
@@ -5356,6 +5363,7 @@ app.get("/replace-return/eligible", asyncRoute(async (req, res) => {
      LEFT JOIN tasks t ON t.complaint_id = c.id AND LOWER(TRIM(t.status)) = 'unrepairable'
      WHERE COALESCE(c.dealer_id, w.dealer_id, s.dealer_id) = ?
        AND c.status = 'Awaiting Dealer Action'
+       AND ${WARRANTY_ACTIVE_SQL}
        AND NOT EXISTS (SELECT 1 FROM replace_return_cases rr WHERE rr.complaint_id = c.id)
      ORDER BY c.created_at DESC
      LIMIT 200`,
@@ -5387,6 +5395,8 @@ app.post("/replace-return", asyncRoute(async (req, res) => {
 
   const complaintRow = await query(
     `SELECT c.*, w.id AS warranty_id, w.dealer_id AS warranty_dealer_id, w.serial_id, w.customer_id, w.warranty_no, s.serial_no,
+            COALESCE(c.warranty_end_date, w.expiry_date) AS expiry_date,
+            COALESCE(c.warranty_status, w.status) AS warranty_status,
             t.id AS task_id, t.resolution_notes
      FROM complaints c
      LEFT JOIN warranties w ON w.id = c.warranty_id
@@ -5402,6 +5412,11 @@ app.post("/replace-return", asyncRoute(async (req, res) => {
   const complaint = complaintRow.rows[0];
   if (String(complaint.status || "") !== "Awaiting Dealer Action") {
     return res.status(400).json({ error: "This complaint is not awaiting dealer replace/return action." });
+  }
+  if (isWarrantyExpiredStatus(complaint.warranty_status, complaint.expiry_date)) {
+    return res.status(400).json({
+      error: "Product replacement is only available while warranty is active. This warranty has expired.",
+    });
   }
   const owningDealerId = String(complaint.dealer_id || complaint.warranty_dealer_id || "");
   if (owningDealerId && owningDealerId !== String(dealer.id)) {
