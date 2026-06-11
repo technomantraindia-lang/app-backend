@@ -410,6 +410,28 @@ const COMPLAINT_LATEST_QUOTATION_FIELDS = `
        qt.customer_paid_at AS quotation_paid_at,
        qt.created_at AS quotation_created_at`;
 
+const COMPLAINT_REPLACEMENT_JOIN = `
+  LEFT JOIN replace_return_cases rr ON rr.complaint_id = c.id
+  LEFT JOIN serial_numbers old_sn ON old_sn.id = rr.serial_id
+  LEFT JOIN products old_p ON old_p.id = old_sn.product_id
+  LEFT JOIN serial_numbers repl_sn ON repl_sn.id = rr.replacement_serial_id
+  LEFT JOIN products repl_p ON repl_p.id = repl_sn.product_id`;
+
+const COMPLAINT_REPLACEMENT_FIELDS = `
+       rr.id AS replacement_case_id,
+       rr.case_no AS replacement_case_no,
+       rr.action_type AS replacement_action_type,
+       rr.status AS replacement_case_status,
+       rr.problem_details AS replacement_problem_details,
+       rr.delivered_to_customer_at AS replacement_delivered_at,
+       rr.replacement_dispatched_at AS replacement_dispatched_at,
+       old_sn.serial_no AS replaced_serial_no,
+       COALESCE(old_p.name, c.product_name) AS replaced_product_name,
+       COALESCE(old_p.model_no, c.model_no) AS replaced_model_no,
+       repl_sn.serial_no AS replacement_serial_no,
+       repl_p.name AS replacement_product_name,
+       repl_p.model_no AS replacement_model_no`;
+
 function isWarrantyExpiredStatus(status, expiryDate) {
   const st = String(status || "").toLowerCase();
   if (st.includes("expired")) {
@@ -7381,6 +7403,8 @@ app.get("/complaints/customer/:customerId", asyncRoute(async (req, res) => {
   await ensureComplaintsSchema();
   await ensureFeedbackSchema();
   await ensureQuotationsSchema();
+  await ensureReplaceReturnSchema();
+  await syncReplacementDeliveryForCustomer(req.params.customerId);
   const result = await query(
     `SELECT
        c.*,
@@ -7395,7 +7419,8 @@ app.get("/complaints/customer/:customerId", asyncRoute(async (req, res) => {
        d.dealer_no,
        d.name AS dealer_name,
        ${COMPLAINT_LATEST_TASK_FIELDS},
-       ${COMPLAINT_LATEST_QUOTATION_FIELDS}
+       ${COMPLAINT_LATEST_QUOTATION_FIELDS},
+       ${COMPLAINT_REPLACEMENT_FIELDS}
      FROM complaints c
      LEFT JOIN warranties w ON w.id = c.warranty_id
      LEFT JOIN serial_numbers s ON s.id = w.serial_id
@@ -7404,11 +7429,51 @@ app.get("/complaints/customer/:customerId", asyncRoute(async (req, res) => {
      ${COMPLAINT_LATEST_TASK_JOIN}
      ${COMPLAINT_FEEDBACK_JOIN}
      ${COMPLAINT_LATEST_QUOTATION_JOIN}
+     ${COMPLAINT_REPLACEMENT_JOIN}
      WHERE c.customer_id = ?
      ORDER BY c.created_at DESC`,
     [req.params.customerId]
   );
   res.json({ complaints: result.rows });
+}));
+
+async function syncReplacementDeliveryForCustomer(customerId) {
+  await ensureReplaceReturnSchema();
+  await ensureComplaintsSchema();
+  const pending = await query(
+    `SELECT rr.id, rr.complaint_id, rr.replacement_serial_id, rr.warranty_id, rr.status,
+            c.status AS complaint_status
+     FROM replace_return_cases rr
+     INNER JOIN complaints c ON c.id = rr.complaint_id
+     WHERE rr.customer_id = ? AND rr.status = 'Delivered to Customer'`,
+    [customerId]
+  );
+  for (const row of pending.rows) {
+    if (String(row.complaint_status || "") !== "Replacement Completed") {
+      await query("UPDATE complaints SET status = 'Replacement Completed' WHERE id = ?", [row.complaint_id]);
+    }
+    if (row.warranty_id && row.replacement_serial_id) {
+      await query("UPDATE warranties SET serial_id = ? WHERE id = ?", [row.replacement_serial_id, row.warranty_id]);
+    }
+  }
+}
+
+app.get("/complaints/customer/:customerId/replacement-cases", asyncRoute(async (req, res) => {
+  await ensureReplaceReturnSchema();
+  await ensureComplaintsSchema();
+  const customerId = cleanString(req.params.customerId);
+  if (!customerId) {
+    return res.status(400).json({ error: "Customer id is required." });
+  }
+  await syncReplacementDeliveryForCustomer(customerId);
+  const result = await query(
+    `SELECT ${REPLACE_RETURN_DETAIL_SELECT}
+     ${REPLACE_RETURN_DETAIL_JOINS}
+     WHERE rr.customer_id = ?
+     ORDER BY rr.created_at DESC`,
+    [customerId]
+  );
+  res.json({ cases: result.rows });
 }));
 
 app.get("/complaints/dealer/:dealerId", asyncRoute(async (req, res) => {
