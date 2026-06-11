@@ -5610,10 +5610,11 @@ app.post("/replace-return/:id/admin-scan", asyncRoute(async (req, res) => {
     return res.status(404).json({ error: "Replace/Return case not found." });
   }
   const adminUserId = cleanString(req.body.adminUserId || req.body.userId || req.body.user_id) || null;
+  const scannedByRole = cleanString(req.body.scannedByRole || req.body.scanned_by_role) || "Admin";
   const existing = await query("SELECT * FROM replace_return_cases WHERE id = ? LIMIT 1", [caseId]);
   const row = existing.rows[0];
   if (String(row.status || "") === "Admin Received") {
-    return res.status(409).json({ error: "This case was already scanned by Admin." });
+    return res.status(409).json({ error: "This case was already scanned." });
   }
 
   await query(
@@ -5627,9 +5628,9 @@ app.post("/replace-return/:id/admin-scan", asyncRoute(async (req, res) => {
     complaintId: row.complaint_id,
     oldStatus: "Replace/Return Submitted",
     newStatus: "Admin Received",
-    changedByRole: "Admin",
+    changedByRole: scannedByRole,
     changedById: adminUserId,
-    remarks: `Admin scanned ${row.case_no}`,
+    remarks: `${scannedByRole} scanned ${row.case_no}`,
   });
 
   const detail = await query(
@@ -5642,7 +5643,7 @@ app.post("/replace-return/:id/admin-scan", asyncRoute(async (req, res) => {
 
   res.json({
     case: detail.rows[0],
-    message: "Case received in Admin Replace/Return panel.",
+    message: `Case received in ${scannedByRole} Replace/Return panel.`,
   });
 }));
 
@@ -7287,6 +7288,100 @@ app.post("/dispatch/to-dealer", asyncRoute(async (req, res) => {
     printSheetUrl: `/dispatch/qr-print-sheet?batchNo=${encodeURIComponent(batchNo)}`,
     message: `${dispatchedSerialNos.length} QR code(s) generated for ${dealer.name}. Open Dispatch QR Print to print stickers.`,
     productSummary,
+  });
+}));
+
+app.get("/dispatch/dashboard", asyncRoute(async (_req, res) => {
+  await ensureReplaceReturnSchema();
+  const [
+    totalDealers,
+    stockAvailable,
+    qrCreated,
+    productsDispatched,
+    dispatchBatches,
+    replaceReturnTotal,
+    replaceReturnOpen,
+  ] = await Promise.all([
+    query("SELECT COUNT(*) AS total FROM dealers WHERE status = 'Active'"),
+    query(
+      "SELECT COUNT(*) AS total FROM serial_numbers WHERE dealer_id IS NULL AND dispatch_status = 'Pending'"
+    ),
+    query("SELECT COUNT(*) AS total FROM serial_numbers WHERE qr_status = 'Printed'"),
+    query(
+      "SELECT COUNT(*) AS total FROM serial_numbers WHERE dispatch_status = 'Dispatched' AND dealer_id IS NOT NULL"
+    ),
+    query(
+      `SELECT COUNT(DISTINCT batch_no) AS total
+       FROM serial_numbers
+       WHERE dispatch_status = 'Dispatched' AND batch_no IS NOT NULL AND TRIM(batch_no) <> ''`
+    ),
+    query("SELECT COUNT(*) AS total FROM replace_return_cases").catch(() => ({ rows: [{ total: 0 }] })),
+    query(
+      "SELECT COUNT(*) AS total FROM replace_return_cases WHERE status NOT IN ('Delivered to Customer')"
+    ).catch(() => ({ rows: [{ total: 0 }] })),
+  ]);
+  const count = (result) => Number(result.rows?.[0]?.total || 0);
+  res.json({
+    summary: {
+      totalDealers: count(totalDealers),
+      stockAvailable: count(stockAvailable),
+      qrCreated: count(qrCreated),
+      productsDispatched: count(productsDispatched),
+      dispatchBatches: count(dispatchBatches),
+      replaceReturnTotal: count(replaceReturnTotal),
+      replaceReturnOpen: count(replaceReturnOpen),
+    },
+  });
+}));
+
+app.get("/dispatch/stock", asyncRoute(async (_req, res) => {
+  await ensureProductsQrSchema();
+  const categoriesResult = await query(
+    `SELECT
+       c.id,
+       c.name,
+       COUNT(CASE WHEN s.dealer_id IS NULL AND s.dispatch_status = 'Pending' THEN 1 END) AS in_stock,
+       COUNT(CASE WHEN s.dispatch_status = 'Dispatched' THEN 1 END) AS dispatched,
+       COUNT(CASE WHEN s.qr_status = 'Printed' THEN 1 END) AS qr_printed
+     FROM product_categories c
+     LEFT JOIN products p ON p.category_id = c.id
+     LEFT JOIN serial_numbers s ON s.product_id = p.id
+     GROUP BY c.id, c.name
+     ORDER BY c.name ASC`
+  );
+  const productsResult = await query(
+    `SELECT
+       p.id,
+       p.name AS product_name,
+       p.model_no,
+       c.name AS category_name,
+       COUNT(CASE WHEN s.dealer_id IS NULL AND s.dispatch_status = 'Pending' THEN 1 END) AS in_stock,
+       COUNT(CASE WHEN s.dispatch_status = 'Dispatched' THEN 1 END) AS dispatched,
+       COUNT(CASE WHEN s.qr_status = 'Printed' THEN 1 END) AS qr_printed
+     FROM products p
+     LEFT JOIN product_categories c ON c.id = p.category_id
+     LEFT JOIN serial_numbers s ON s.product_id = p.id
+     GROUP BY p.id, p.name, p.model_no, c.name
+     HAVING in_stock > 0 OR dispatched > 0 OR qr_printed > 0
+     ORDER BY c.name ASC, p.name ASC`
+  );
+  res.json({
+    categories: categoriesResult.rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      inStock: Number(row.in_stock || 0),
+      dispatched: Number(row.dispatched || 0),
+      qrPrinted: Number(row.qr_printed || 0),
+    })),
+    products: productsResult.rows.map((row) => ({
+      id: row.id,
+      productName: row.product_name,
+      modelNo: row.model_no,
+      categoryName: row.category_name || "—",
+      inStock: Number(row.in_stock || 0),
+      dispatched: Number(row.dispatched || 0),
+      qrPrinted: Number(row.qr_printed || 0),
+    })),
   });
 }));
 
