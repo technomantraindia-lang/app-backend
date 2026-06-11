@@ -5612,9 +5612,22 @@ app.post("/replace-return/:id/admin-scan", asyncRoute(async (req, res) => {
   const adminUserId = cleanString(req.body.adminUserId || req.body.userId || req.body.user_id) || null;
   const scannedByRole = cleanString(req.body.scannedByRole || req.body.scanned_by_role) || "Admin";
   const existing = await query("SELECT * FROM replace_return_cases WHERE id = ? LIMIT 1", [caseId]);
+  if (!existing.rowCount) {
+    return res.status(404).json({ error: "Replace/Return case not found." });
+  }
   const row = existing.rows[0];
+  if (
+    row.replacement_serial_id ||
+    row.replacement_dispatched_at ||
+    ["Replacement Dispatched", "Delivered to Customer"].includes(String(row.status || ""))
+  ) {
+    return res.status(409).json({ error: "This case has already moved to replacement delivery." });
+  }
   if (String(row.status || "") === "Admin Received") {
     return res.status(409).json({ error: "This case was already scanned." });
+  }
+  if (String(row.status || "") !== "Pending Admin Scan") {
+    return res.status(409).json({ error: `This case cannot be received while status is ${row.status || "unknown"}.` });
   }
 
   await query(
@@ -5626,7 +5639,7 @@ app.post("/replace-return/:id/admin-scan", asyncRoute(async (req, res) => {
 
   await recordStatusHistory({
     complaintId: row.complaint_id,
-    oldStatus: "Replace/Return Submitted",
+    oldStatus: row.status,
     newStatus: "Admin Received",
     changedByRole: scannedByRole,
     changedById: adminUserId,
@@ -5982,7 +5995,10 @@ app.post("/replacement-delivery/confirm", asyncRoute(async (req, res) => {
 
   const caseRow = await query(
     `SELECT rr.*, c.complaint_no, c.status AS complaint_status, w.id AS warranty_id, w.warranty_no,
-            rs.serial_no AS replacement_serial_no, rs.id AS replacement_serial_id
+            rs.serial_no AS replacement_serial_no, rs.id AS replacement_serial_id,
+            rs.dealer_id AS replacement_serial_dealer_id,
+            rs.dispatch_status AS replacement_serial_dispatch_status,
+            rs.dispatched_at AS replacement_serial_dispatched_at
      FROM replace_return_cases rr
      INNER JOIN complaints c ON c.id = rr.complaint_id
      LEFT JOIN warranties w ON w.id = rr.warranty_id
@@ -6001,10 +6017,24 @@ app.post("/replacement-delivery/confirm", asyncRoute(async (req, res) => {
   if (!row.replacement_serial_id) {
     return res.status(400).json({ error: "Replacement unit not dispatched yet." });
   }
+  if (
+    row.replacement_serial_dealer_id &&
+    String(row.replacement_serial_dealer_id) !== String(dealer.id)
+  ) {
+    return res.status(403).json({ error: "This replacement unit is assigned to another dealer." });
+  }
   if (String(row.status || "") === "Delivered to Customer") {
     return res.status(409).json({ error: "Already delivered to customer." });
   }
-  if (String(row.status || "") !== "Replacement Dispatched") {
+  const hasDispatchEvidence =
+    String(row.status || "") === "Replacement Dispatched" ||
+    Boolean(row.replacement_dispatched_at) ||
+    (
+      String(row.replacement_serial_dispatch_status || "") === "Dispatched" &&
+      Boolean(row.replacement_serial_dispatched_at) &&
+      String(row.replacement_serial_dealer_id || "") === String(dealer.id)
+    );
+  if (!hasDispatchEvidence) {
     return res.status(400).json({ error: "Replacement must be dispatched by Admin before dealer delivery." });
   }
 
