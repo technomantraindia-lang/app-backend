@@ -778,16 +778,16 @@ async function allocateDispatchSerialNumbers(product, quantity, tx) {
 
 function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet") {
   const pages = [];
-  for (let index = 0; index < rows.length; index += 9) {
-    pages.push(rows.slice(index, index + 9));
+  for (let index = 0; index < rows.length; index += 2) {
+    pages.push(rows.slice(index, index + 2));
   }
   const pageHtml = pages
     .map((chunk) => {
       const cells = [];
-      for (let slot = 0; slot < 9; slot += 1) {
+      for (let slot = 0; slot < 2; slot += 1) {
         const serial = chunk[slot];
         if (!serial) {
-          cells.push('<div class="cell empty"></div>');
+          cells.push('<div class="label empty"></div>');
           continue;
         }
         const payload =
@@ -803,17 +803,16 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet") {
           });
         const qrUrl = `/serial-numbers/${encodeURIComponent(serial.serial_no)}/qr.svg?download=1`;
         cells.push(`
-          <div class="cell">
-            ${qrSvg(payload, 118)}
+          <div class="label">
+            <div class="qr">${qrSvg(payload, 96)}</div>
             <div class="brand">Hitaishi CRM</div>
-            <div class="serial">${escapeHtml(serial.serial_no)}</div>
             <div class="product">${escapeHtml(serial.product_name || "Product")}</div>
+            <div class="serial">${escapeHtml(serial.serial_no)}</div>
             <div class="meta">${escapeHtml(serial.model_no || "")}</div>
-            <div class="dealer">${escapeHtml(serial.dealer_no || "")} ${escapeHtml(serial.dealer_name || "")}</div>
             <a class="download" href="${qrUrl}">Download QR</a>
           </div>`);
       }
-      return `<section class="page">${cells.join("")}</section>`;
+      return `<section class="roll-row">${cells.join("")}</section>`;
     })
     .join("");
 
@@ -823,54 +822,59 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet") {
   <meta charset="utf-8" />
   <title>${escapeHtml(title)}</title>
   <style>
-    @page { size: A4 portrait; margin: 8mm; }
+    @page { size: 2in 2in; margin: 0; }
     * { box-sizing: border-box; }
     body { font-family: Arial, sans-serif; margin: 0; color: #111827; background: #fff; }
     .toolbar { padding: 12px 16px; border-bottom: 1px solid #d1d5db; }
     .toolbar button { padding: 8px 14px; font-size: 14px; cursor: pointer; }
     .hint { font-size: 12px; color: #4b5563; margin-top: 6px; }
-    .page {
-      width: 194mm;
-      min-height: 277mm;
-      margin: 0 auto;
-      padding: 2mm 0;
+    main { display: flex; flex-direction: column; align-items: center; }
+    .roll-row {
+      width: 2in;
+      height: 2in;
+      margin: 10px auto;
       display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      grid-template-rows: repeat(3, 1fr);
-      gap: 3mm;
+      grid-template-columns: repeat(2, 1in);
+      grid-template-rows: 2in;
+      gap: 0;
       page-break-after: always;
     }
-    .page:last-child { page-break-after: auto; }
-    .cell {
-      border: 1px solid #111827;
-      border-radius: 6px;
-      padding: 4mm 2mm;
+    .roll-row:last-child { page-break-after: auto; }
+    .label {
+      width: 1in;
+      height: 2in;
+      padding: 0.06in 0.04in;
       text-align: center;
       display: flex;
       flex-direction: column;
       align-items: center;
-      justify-content: flex-start;
-      min-height: 88mm;
+      justify-content: center;
       break-inside: avoid;
+      overflow: hidden;
+      border: 1px dashed #cbd5e1;
     }
-    .cell.empty { border: 1px dashed #d1d5db; }
-    .brand { font-weight: 700; font-size: 11px; margin-top: 2mm; }
-    .serial { font-size: 13px; font-weight: 800; margin-top: 1mm; word-break: break-all; }
-    .product { font-size: 11px; font-weight: 700; margin-top: 1mm; }
-    .meta, .dealer { font-size: 10px; color: #374151; margin-top: 1mm; word-break: break-word; }
-    .download { display: inline-block; margin-top: 2mm; color: #0f3f6b; font-size: 10px; text-decoration: none; }
+    .label.empty { visibility: hidden; }
+    .qr svg { width: 0.74in; height: 0.74in; display: block; }
+    .brand { font-weight: 700; font-size: 7px; line-height: 1.05; margin-top: 0.025in; max-width: 0.9in; }
+    .product { font-size: 7.5px; font-weight: 800; line-height: 1.05; margin-top: 0.025in; max-width: 0.9in; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow-wrap: anywhere; }
+    .serial { font-size: 7px; font-weight: 800; line-height: 1.05; margin-top: 0.025in; max-width: 0.9in; overflow-wrap: anywhere; }
+    .meta { font-size: 6.5px; color: #374151; line-height: 1.05; margin-top: 0.018in; max-width: 0.9in; overflow-wrap: anywhere; }
+    .download { display: inline-block; margin-top: 4px; color: #0f3f6b; font-size: 9px; text-decoration: none; }
     @media print {
       .toolbar { display: none; }
       .download { display: none; }
-      body { margin: 0; }
-      .page { margin: 0 auto; }
+      html, body { width: 2in; min-height: 2in; margin: 0; padding: 0; }
+      main { display: block; }
+      .roll-row { margin: 0; width: 2in; height: 2in; page-break-after: always; break-after: page; }
+      .roll-row:last-child { page-break-after: auto; break-after: auto; }
+      .label { border: 0; }
     }
   </style>
 </head>
 <body>
   <div class="toolbar">
     <button onclick="window.print()">Print / Save as PDF</button>
-    <div class="hint">A4 layout: 3 QR codes per row, 9 per page. Use Print → Save as PDF.</div>
+    <div class="hint">Thermal 2-UP label layout: each sticker is 2 inch height x 1 inch width. Disable browser headers/footers and use zero/minimum margins.</div>
   </div>
   <main>${pageHtml || "<p>No QR codes found for this dispatch.</p>"}</main>
 </body>
@@ -4195,11 +4199,11 @@ app.get("/products/print-sticker", asyncRoute(async (req, res) => {
   const qrUrl = `/products/${encodeURIComponent(productId)}/qr.svg?download=1`;
   const card = `
     <section class="label">
-      ${qrSvg(payload, 180)}
+      <div class="qr">${qrSvg(payload, 96)}</div>
       <div class="brand">Hitaishi CRM</div>
       <div class="product">${escapeHtml(product.name)}</div>
       <div class="model">${escapeHtml(product.model_no)}</div>
-      <div class="meta">${escapeHtml(product.category || "Product")} · ${productHasWarrantyCoverage(product.warranty_months) ? `${Number(product.warranty_months)} months warranty` : "Warranty expired / not set"}</div>
+      <div class="meta">${escapeHtml(product.category || "Product")}</div>
       <a class="download" href="${qrUrl}">Download QR</a>
     </section>`;
   res.type("html").send(`<!doctype html>
@@ -4208,21 +4212,53 @@ app.get("/products/print-sticker", asyncRoute(async (req, res) => {
   <meta charset="utf-8" />
   <title>Hitaishi Product QR</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 16px; color: #111827; }
-    .toolbar { margin-bottom: 16px; }
-    .sheet { display: flex; justify-content: center; }
-    .label { border: 1px solid #111827; border-radius: 8px; padding: 14px; text-align: center; max-width: 260px; }
-    .brand { font-weight: 700; margin-top: 6px; }
-    .product { font-size: 18px; font-weight: 800; margin-top: 4px; }
-    .model { font-size: 15px; margin-top: 2px; }
-    .meta { font-size: 12px; color: #4b5563; margin-top: 4px; }
-    .download { display: inline-block; margin-top: 8px; color: #0f3f6b; font-size: 12px; }
-    @media print { .toolbar, .download { display: none; } body { margin: 0; } }
+    @page { size: 2in 2in; margin: 0; }
+    * { box-sizing: border-box; }
+    body { font-family: Arial, sans-serif; margin: 0; color: #111827; background: #fff; }
+    .toolbar { padding: 12px 16px; border-bottom: 1px solid #d1d5db; }
+    .toolbar button { padding: 8px 14px; font-size: 14px; cursor: pointer; }
+    .hint { font-size: 12px; color: #4b5563; margin-top: 6px; }
+    .sheet {
+      width: 2in;
+      height: 2in;
+      margin: 10px auto;
+      display: grid;
+      grid-template-columns: repeat(2, 1in);
+      grid-template-rows: 2in;
+      gap: 0;
+    }
+    .label {
+      width: 1in;
+      height: 2in;
+      padding: 0.06in 0.04in;
+      text-align: center;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      border: 1px dashed #cbd5e1;
+    }
+    .label.empty { visibility: hidden; }
+    .qr svg { width: 0.74in; height: 0.74in; display: block; }
+    .brand { font-weight: 700; font-size: 7px; line-height: 1.05; margin-top: 0.025in; max-width: 0.9in; }
+    .product { font-size: 7.5px; font-weight: 800; line-height: 1.05; margin-top: 0.025in; max-width: 0.9in; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow-wrap: anywhere; }
+    .model, .meta { font-size: 6.5px; color: #374151; line-height: 1.05; margin-top: 0.018in; max-width: 0.9in; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow-wrap: anywhere; }
+    .download { display: inline-block; margin-top: 4px; color: #0f3f6b; font-size: 9px; }
+    @media print {
+      .toolbar, .download { display: none; }
+      html, body { width: 2in; min-height: 2in; margin: 0; padding: 0; }
+      .sheet { margin: 0; width: 2in; height: 2in; }
+      .label { border: 0; }
+    }
   </style>
 </head>
 <body>
-  <div class="toolbar"><button onclick="window.print()">Print Product QR</button></div>
-  <main class="sheet">${card}</main>
+  <div class="toolbar">
+    <button onclick="window.print()">Print Product QR</button>
+    <div class="hint">Thermal 2-UP label layout: each sticker is 2 inch height x 1 inch width. Disable browser headers/footers and use zero/minimum margins.</div>
+  </div>
+  <main class="sheet">${card}<section class="label empty"></section></main>
 </body>
 </html>`);
 }));
