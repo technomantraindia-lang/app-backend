@@ -51,6 +51,45 @@ function normalizeLoginMobile(value) {
   return digits.length > 10 ? digits.slice(-10) : digits;
 }
 
+function renderSmsTemplate(template, values) {
+  return String(template || "").replace(/\{\{(\w+)\}\}/g, (_match, key) => encodeURIComponent(values[key] ?? ""));
+}
+
+async function sendLoginOtpSms(mobile, otp) {
+  const smsUrlTemplate = cleanString(process.env.SMS_OTP_URL);
+  if (!smsUrlTemplate) {
+    return { sent: false, reason: "not_configured" };
+  }
+
+  const message = `Your Hitaishi CRM login OTP is ${otp}. It is valid for 5 minutes.`;
+  const method = cleanString(process.env.SMS_OTP_METHOD || "POST").toUpperCase();
+  const headers = { Accept: "application/json" };
+  const authHeader = cleanString(process.env.SMS_OTP_AUTH_HEADER);
+  const authValue = cleanString(process.env.SMS_OTP_AUTH_VALUE);
+  if (authHeader && authValue) {
+    headers[authHeader] = authValue;
+  }
+
+  const url = renderSmsTemplate(smsUrlTemplate, { mobile, otp, message });
+  const options = { method, headers };
+  if (method !== "GET") {
+    headers["Content-Type"] = "application/json";
+    const bodyTemplate = cleanString(process.env.SMS_OTP_BODY_TEMPLATE);
+    options.body = bodyTemplate
+      ? renderSmsTemplate(bodyTemplate, { mobile, otp, message })
+      : JSON.stringify({ mobile, otp, message });
+  }
+
+  const response = await fetch(url, options);
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    const err = new Error(body || `SMS provider failed (${response.status})`);
+    err.statusCode = 502;
+    throw err;
+  }
+  return { sent: true };
+}
+
 /** Match dealers.mobile to users.mobile even when formatting differs (+91, spaces, etc.). */
 function sqlNormalizeMobileColumn(column) {
   return `REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(${column}, ' ', ''), '-', ''), '+', ''), '(', ''), ')', ''), '.', '')`;
@@ -1889,6 +1928,11 @@ app.post("/auth/request-otp", asyncRoute(async (req, res) => {
 
   const otp = String(crypto.randomInt(100000, 1000000));
   const token = crypto.randomUUID();
+  for (const [key, value] of loginOtpChallenges.entries()) {
+    if (Date.now() > value.expiresAt) {
+      loginOtpChallenges.delete(key);
+    }
+  }
   loginOtpChallenges.set(token, {
     userId: userRow.id,
     role,
@@ -1898,11 +1942,22 @@ app.post("/auth/request-otp", asyncRoute(async (req, res) => {
     expiresAt: Date.now() + LOGIN_OTP_TTL_MS,
   });
 
+  let smsResult;
+  try {
+    smsResult = await sendLoginOtpSms(rawMobile, otp);
+  } catch (err) {
+    loginOtpChallenges.delete(token);
+    throw err;
+  }
+
   res.json({
     token,
     expiresInSeconds: Math.floor(LOGIN_OTP_TTL_MS / 1000),
-    message: "OTP sent to registered mobile number.",
-    devOtp: process.env.SMS_PROVIDER ? undefined : otp,
+    message: smsResult.sent
+      ? "OTP sent to registered mobile number."
+      : "SMS gateway is not configured. Use development OTP for testing.",
+    smsSent: Boolean(smsResult.sent),
+    devOtp: smsResult.sent ? undefined : otp,
   });
 }));
 
