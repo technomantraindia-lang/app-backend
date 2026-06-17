@@ -35,6 +35,8 @@ const accountRoles = ["Front Desk", "Dispatch", "Dealer", "Technician", "Custome
 const accountCreatorRoles = ["Admin", "Dealer"];
 const customerOnlyAccountCreators = ["Front Desk"];
 const dealerCreatableRoles = ["Customer", "Technician"];
+const loginOtpChallenges = new Map();
+const LOGIN_OTP_TTL_MS = 5 * 60 * 1000;
 
 function normalizeEmail(email) {
   return typeof email === "string" ? email.trim().toLowerCase() : "";
@@ -42,6 +44,11 @@ function normalizeEmail(email) {
 
 function normalizeMobileValue(mobile) {
   return typeof mobile === "string" ? mobile.replace(/\D/g, "") : "";
+}
+
+function normalizeLoginMobile(value) {
+  const digits = normalizeMobileValue(value);
+  return digits.length > 10 ? digits.slice(-10) : digits;
 }
 
 /** Match dealers.mobile to users.mobile even when formatting differs (+91, spaces, etc.). */
@@ -1784,58 +1791,7 @@ app.get("/health", async (_req, res) => {
   }
 });
 
-app.post("/auth/login", asyncRoute(async (req, res) => {
-  const lid = typeof req.body.loginId === "string" ? req.body.loginId.trim() : "";
-  let rawEmail =
-    typeof req.body.email === "string" ? req.body.email.trim().toLowerCase() : "";
-  let rawMobile =
-    typeof req.body.mobile === "string" ? String(req.body.mobile).replace(/\D/g, "") : "";
-  const password = req.body.password;
-  const { role } = req.body;
-
-  if (lid) {
-    if (lid.includes("@")) {
-      rawEmail = lid.toLowerCase();
-    } else {
-      const digitsOnly = lid.replace(/\D/g, "");
-      if (digitsOnly.length >= 10) {
-        rawMobile = digitsOnly;
-      } else {
-        rawEmail = lid.toLowerCase();
-      }
-    }
-  } else if (rawEmail) {
-    rawEmail = rawEmail.toLowerCase();
-  }
-
-  if (!role || (!rawEmail && !rawMobile)) {
-    return res.status(400).json({
-      error:
-        "role is required plus login ID: use loginId (email or mobile) or legacy email/mobile fields.",
-    });
-  }
-  if (password === undefined || password === null) {
-    return res.status(400).json({ error: "password is required" });
-  }
-
-  const result = rawEmail
-    ? await query(
-        "SELECT * FROM users WHERE LOWER(TRIM(COALESCE(email,''))) = LOWER(?) AND role = ? LIMIT 1",
-        [rawEmail, role]
-      )
-    : await query("SELECT * FROM users WHERE mobile = ? AND role = ? LIMIT 1", [rawMobile, role]);
-  if (!result.rowCount) {
-    return res.status(404).json({ error: "User not found" });
-  }
-  const userRow = result.rows[0];
-  const storedHash = userRow.password_hash;
-  if (!storedHash) {
-    return res.status(401).json({ error: "Password not set for this account." });
-  }
-  if (storedHash !== hashPassword(String(password))) {
-    return res.status(401).json({ error: "Invalid user ID or password" });
-  }
-
+async function buildAuthLoginResponse(userRow, role) {
   let customer = null;
   let technician = null;
   let dealer = null;
@@ -1850,12 +1806,132 @@ app.post("/auth/login", asyncRoute(async (req, res) => {
     dealer = await findDealerForUser(userRow);
   }
 
-  res.json({
+  return {
     user: publicUser(userRow),
     customer,
     technician,
-    dealer
+    dealer,
+  };
+}
+
+async function findUserForAuth({ loginId, mobile, email, role }) {
+  const lid = cleanString(loginId);
+  let rawEmail = cleanString(email).toLowerCase();
+  let rawMobile = normalizeLoginMobile(mobile);
+
+  if (lid) {
+    if (lid.includes("@")) {
+      rawEmail = lid.toLowerCase();
+      rawMobile = "";
+    } else {
+      const digitsOnly = normalizeLoginMobile(lid);
+      if (digitsOnly.length >= 10) {
+        rawMobile = digitsOnly;
+        rawEmail = "";
+      } else {
+        rawEmail = lid.toLowerCase();
+        rawMobile = "";
+      }
+    }
+  }
+
+  if (!role || (!rawEmail && !rawMobile)) {
+    const err = new Error("role is required plus login ID: use loginId (email or mobile) or legacy email/mobile fields.");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const result = rawEmail
+    ? await query(
+        "SELECT * FROM users WHERE LOWER(TRIM(COALESCE(email,''))) = LOWER(?) AND role = ? LIMIT 1",
+        [rawEmail, role]
+      )
+    : await query(
+        `SELECT * FROM users WHERE RIGHT(${sqlNormalizeMobileColumn("mobile")}, 10) = ? AND role = ? LIMIT 1`,
+        [rawMobile, role]
+      );
+  if (!result.rowCount) {
+    const err = new Error("User not found");
+    err.statusCode = 404;
+    throw err;
+  }
+  return { userRow: result.rows[0], rawEmail, rawMobile };
+}
+
+app.post("/auth/login", asyncRoute(async (req, res) => {
+  const password = req.body.password;
+  const { role } = req.body;
+  if (password === undefined || password === null) {
+    return res.status(400).json({ error: "password is required" });
+  }
+
+  const { userRow } = await findUserForAuth(req.body);
+  const storedHash = userRow.password_hash;
+  if (!storedHash) {
+    return res.status(401).json({ error: "Password not set for this account." });
+  }
+  if (storedHash !== hashPassword(String(password))) {
+    return res.status(401).json({ error: "Invalid user ID or password" });
+  }
+
+  res.json(await buildAuthLoginResponse(userRow, role));
+}));
+
+app.post("/auth/request-otp", asyncRoute(async (req, res) => {
+  const { role } = req.body;
+  const { userRow, rawMobile } = await findUserForAuth(req.body);
+  if (!rawMobile) {
+    return res.status(400).json({ error: "Enter a mobile number to request OTP." });
+  }
+  if (String(userRow.status || "Active").toLowerCase() !== "active") {
+    return res.status(403).json({ error: "This login account is not active." });
+  }
+
+  const otp = String(crypto.randomInt(100000, 1000000));
+  const token = crypto.randomUUID();
+  loginOtpChallenges.set(token, {
+    userId: userRow.id,
+    role,
+    mobile: rawMobile,
+    otp,
+    attempts: 0,
+    expiresAt: Date.now() + LOGIN_OTP_TTL_MS,
   });
+
+  res.json({
+    token,
+    expiresInSeconds: Math.floor(LOGIN_OTP_TTL_MS / 1000),
+    message: "OTP sent to registered mobile number.",
+    devOtp: process.env.SMS_PROVIDER ? undefined : otp,
+  });
+}));
+
+app.post("/auth/verify-otp", asyncRoute(async (req, res) => {
+  const token = cleanString(req.body.token);
+  const otp = normalizeMobileValue(req.body.otp);
+  const challenge = loginOtpChallenges.get(token);
+  if (!token || !challenge) {
+    return res.status(400).json({ error: "OTP session expired. Send OTP again." });
+  }
+  if (Date.now() > challenge.expiresAt) {
+    loginOtpChallenges.delete(token);
+    return res.status(400).json({ error: "OTP expired. Send OTP again." });
+  }
+  if (challenge.attempts >= 5) {
+    loginOtpChallenges.delete(token);
+    return res.status(429).json({ error: "Too many wrong OTP attempts. Send OTP again." });
+  }
+  if (otp !== challenge.otp) {
+    challenge.attempts += 1;
+    return res.status(401).json({ error: "Invalid OTP." });
+  }
+
+  const result = await query("SELECT * FROM users WHERE id = ? AND role = ? LIMIT 1", [challenge.userId, challenge.role]);
+  loginOtpChallenges.delete(token);
+  if (!result.rowCount) {
+    return res.status(404).json({ error: "User not found" });
+  }
+  res.json(await buildAuthLoginResponse(result.rows[0], challenge.role));
 }));
 
 /** Customer / Technician: logged-in profile — change login password after verifying old one. */
