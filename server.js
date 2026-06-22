@@ -845,15 +845,22 @@ function parseQrProductCopies(value) {
   }
 }
 
-function productCopyKey(row) {
-  return cleanString(row?.product_id || row?.product_name || "Product");
+function productCopyKeys(row) {
+  return [
+    cleanString(row?.product_id),
+    cleanString(row?.product_name),
+    cleanString(row?.name),
+  ].filter(Boolean);
 }
 
 function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1, copiesByProduct = new Map()) {
   const labelCopies = parseQrLabelCopies(copies);
   const printRows = [];
   rows.forEach((row) => {
-    const rowCopies = copiesByProduct.get(productCopyKey(row)) || labelCopies;
+    const rowCopies = productCopyKeys(row).reduce(
+      (matchedCopies, key) => matchedCopies || copiesByProduct.get(key),
+      0
+    ) || labelCopies;
     for (let index = 0; index < rowCopies; index += 1) {
       printRows.push(row);
     }
