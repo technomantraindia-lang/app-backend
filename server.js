@@ -830,11 +830,31 @@ function parseQrLabelCopies(value) {
   return Math.min(copies, 100);
 }
 
-function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1) {
+function parseQrProductCopies(value) {
+  if (!value) return new Map();
+  try {
+    const parsed = JSON.parse(String(value));
+    if (!parsed || typeof parsed !== "object") return new Map();
+    return new Map(
+      Object.entries(parsed)
+        .map(([key, copies]) => [String(key), parseQrLabelCopies(copies)])
+        .filter(([key]) => key)
+    );
+  } catch {
+    return new Map();
+  }
+}
+
+function productCopyKey(row) {
+  return cleanString(row?.product_id || row?.product_name || "Product");
+}
+
+function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1, copiesByProduct = new Map()) {
   const labelCopies = parseQrLabelCopies(copies);
   const printRows = [];
   rows.forEach((row) => {
-    for (let index = 0; index < labelCopies; index += 1) {
+    const rowCopies = copiesByProduct.get(productCopyKey(row)) || labelCopies;
+    for (let index = 0; index < rowCopies; index += 1) {
       printRows.push(row);
     }
   });
@@ -935,7 +955,7 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1)
 <body>
   <div class="toolbar">
     <button onclick="window.print()">Print / Save as PDF</button>
-    <div class="hint">Thermal 2-UP label layout: each sticker is 2 inch height x 1 inch width. Printing ${labelCopies} label copy/copies per QR. Disable browser headers/footers and use zero/minimum margins.</div>
+    <div class="hint">Thermal 2-UP label layout: each sticker is 2 inch height x 1 inch width. Disable browser headers/footers and use zero/minimum margins.</div>
   </div>
   <main>${pageHtml || "<p>No QR codes found for this dispatch.</p>"}</main>
 </body>
@@ -7692,6 +7712,34 @@ app.get("/dispatch/batches", asyncRoute(async (_req, res) => {
      ORDER BY MAX(s.dispatched_at) DESC, s.batch_no DESC
      LIMIT 200`
   );
+  const batchNos = result.rows.map((row) => row.batch_no).filter(Boolean);
+  const productLinesByBatch = new Map();
+  if (batchNos.length) {
+    const lineResult = await query(
+      `SELECT
+         s.batch_no,
+         COALESCE(p.id, '') AS product_id,
+         COALESCE(p.name, 'Product') AS product_name,
+         COUNT(s.id) AS unit_count,
+         SUM(CASE WHEN s.qr_status = 'Printed' THEN 1 ELSE 0 END) AS qr_ready_count
+       FROM serial_numbers s
+       LEFT JOIN products p ON p.id = s.product_id
+       WHERE s.batch_no IN (${batchNos.map(() => "?").join(",")})
+       GROUP BY s.batch_no, p.id, p.name
+       ORDER BY p.name ASC`,
+      batchNos
+    );
+    lineResult.rows.forEach((line) => {
+      const batchLines = productLinesByBatch.get(line.batch_no) || [];
+      batchLines.push({
+        productId: line.product_id || line.product_name || "Product",
+        productName: line.product_name || "Product",
+        unitCount: Number(line.unit_count || 0),
+        qrReadyCount: Number(line.qr_ready_count || 0),
+      });
+      productLinesByBatch.set(line.batch_no, batchLines);
+    });
+  }
   res.json({
     batches: result.rows.map((row) => ({
       batchNo: row.batch_no,
@@ -7705,6 +7753,7 @@ app.get("/dispatch/batches", asyncRoute(async (_req, res) => {
       unitCount: Number(row.unit_count || 0),
       qrReadyCount: Number(row.qr_ready_count || 0),
       productSummary: row.product_summary || "",
+      productLines: productLinesByBatch.get(row.batch_no) || [],
       printSheetUrl: `/dispatch/qr-print-sheet?batchNo=${encodeURIComponent(row.batch_no)}`,
     })),
   });
@@ -7713,6 +7762,7 @@ app.get("/dispatch/batches", asyncRoute(async (_req, res) => {
 app.get("/dispatch/qr-print-sheet", asyncRoute(async (req, res) => {
   const batchNo = cleanString(req.query.batchNo || req.query.batch_no);
   const copies = parseQrLabelCopies(req.query.copies || req.query.quantity || req.query.qty);
+  const copiesByProduct = parseQrProductCopies(req.query.productCopies || req.query.product_copies);
   const requested = cleanString(req.query.serials)
     .split(",")
     .map(cleanSerialNo)
@@ -7739,7 +7789,7 @@ app.get("/dispatch/qr-print-sheet", asyncRoute(async (req, res) => {
     params
   );
   const title = batchNo ? `Dispatch QR Sheet · ${batchNo}` : "Dispatch QR Sheet";
-  res.type("html").send(buildDispatchQrPrintHtml(result.rows, title, copies));
+  res.type("html").send(buildDispatchQrPrintHtml(result.rows, title, copies, copiesByProduct));
 }));
 
 app.post("/dispatch-mapping", asyncRoute(async (req, res) => {
