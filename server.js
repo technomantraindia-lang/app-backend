@@ -822,10 +822,25 @@ async function allocateDispatchSerialNumbers(product, quantity, tx) {
   return serials;
 }
 
-function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet") {
+function parseQrLabelCopies(value) {
+  const copies = Number.parseInt(value, 10);
+  if (!Number.isFinite(copies) || copies < 1) {
+    return 1;
+  }
+  return Math.min(copies, 100);
+}
+
+function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1) {
+  const labelCopies = parseQrLabelCopies(copies);
+  const printRows = [];
+  rows.forEach((row) => {
+    for (let index = 0; index < labelCopies; index += 1) {
+      printRows.push(row);
+    }
+  });
   const pages = [];
-  for (let index = 0; index < rows.length; index += 2) {
-    pages.push(rows.slice(index, index + 2));
+  for (let index = 0; index < printRows.length; index += 2) {
+    pages.push(printRows.slice(index, index + 2));
   }
   const pageHtml = pages
     .map((chunk) => {
@@ -920,7 +935,7 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet") {
 <body>
   <div class="toolbar">
     <button onclick="window.print()">Print / Save as PDF</button>
-    <div class="hint">Thermal 2-UP label layout: each sticker is 2 inch height x 1 inch width. Disable browser headers/footers and use zero/minimum margins.</div>
+    <div class="hint">Thermal 2-UP label layout: each sticker is 2 inch height x 1 inch width. Printing ${labelCopies} label copy/copies per QR. Disable browser headers/footers and use zero/minimum margins.</div>
   </div>
   <main>${pageHtml || "<p>No QR codes found for this dispatch.</p>"}</main>
 </body>
@@ -2023,6 +2038,77 @@ app.post("/auth/change-password", asyncRoute(async (req, res) => {
   await query("UPDATE users SET password_hash = ? WHERE id = ?", [hashPassword(String(newPassword)), userId]);
 
   res.json({ ok: true });
+}));
+
+/** Logged-in user profile — read fresh details from database. */
+app.get("/auth/profile", asyncRoute(async (req, res) => {
+  const userId = cleanString(req.query.userId);
+  const role = cleanString(req.query.role);
+  if (!userId || !role) {
+    return res.status(400).json({ error: "userId and role are required." });
+  }
+  const result = await query(
+    "SELECT id, role, name, mobile, email, status, created_at FROM users WHERE id = ? AND role = ? LIMIT 1",
+    [userId, role]
+  );
+  if (!result.rowCount) {
+    return res.status(404).json({ error: "Profile not found." });
+  }
+  res.json({ user: publicUser(result.rows[0]) });
+}));
+
+/** Logged-in user profile — update name, mobile and email in users table. */
+app.patch("/auth/profile", asyncRoute(async (req, res) => {
+  const userId = cleanString(req.body.userId);
+  const role = cleanString(req.body.role);
+  const name = cleanString(req.body.name);
+  const mobile = normalizeMobileValue(req.body.mobile);
+  const email = normalizeEmail(req.body.email);
+
+  if (!userId || !role) {
+    return res.status(400).json({ error: "userId and role are required." });
+  }
+  if (!name) {
+    return res.status(400).json({ error: "Name is required." });
+  }
+  if (!mobile || mobile.length < 10) {
+    return res.status(400).json({ error: "Enter a valid mobile number." });
+  }
+  if (!email) {
+    return res.status(400).json({ error: "Email is required." });
+  }
+
+  const existing = await query("SELECT id FROM users WHERE id = ? AND role = ? LIMIT 1", [userId, role]);
+  if (!existing.rowCount) {
+    return res.status(404).json({ error: "Profile not found." });
+  }
+
+  const mobileConflict = await query(
+    "SELECT id FROM users WHERE mobile = ? AND id <> ? LIMIT 1",
+    [mobile, userId]
+  );
+  if (mobileConflict.rowCount) {
+    return res.status(409).json({ error: "This mobile number is already used by another account." });
+  }
+
+  const emailConflict = await query(
+    "SELECT id FROM users WHERE LOWER(TRIM(COALESCE(email,''))) = ? AND role = ? AND id <> ? LIMIT 1",
+    [email, role, userId]
+  );
+  if (emailConflict.rowCount) {
+    return res.status(409).json({ error: "This email is already used for this role." });
+  }
+
+  await query(
+    "UPDATE users SET name = ?, mobile = ?, email = ? WHERE id = ? AND role = ?",
+    [name, mobile, email, userId, role]
+  );
+
+  const updated = await query(
+    "SELECT id, role, name, mobile, email, status, created_at FROM users WHERE id = ? LIMIT 1",
+    [userId]
+  );
+  res.json({ user: publicUser(updated.rows[0]), message: "Profile updated." });
 }));
 
 app.get("/accounts", asyncRoute(async (_req, res) => {
@@ -7626,6 +7712,7 @@ app.get("/dispatch/batches", asyncRoute(async (_req, res) => {
 
 app.get("/dispatch/qr-print-sheet", asyncRoute(async (req, res) => {
   const batchNo = cleanString(req.query.batchNo || req.query.batch_no);
+  const copies = parseQrLabelCopies(req.query.copies || req.query.quantity || req.query.qty);
   const requested = cleanString(req.query.serials)
     .split(",")
     .map(cleanSerialNo)
@@ -7652,7 +7739,7 @@ app.get("/dispatch/qr-print-sheet", asyncRoute(async (req, res) => {
     params
   );
   const title = batchNo ? `Dispatch QR Sheet · ${batchNo}` : "Dispatch QR Sheet";
-  res.type("html").send(buildDispatchQrPrintHtml(result.rows, title));
+  res.type("html").send(buildDispatchQrPrintHtml(result.rows, title, copies));
 }));
 
 app.post("/dispatch-mapping", asyncRoute(async (req, res) => {
