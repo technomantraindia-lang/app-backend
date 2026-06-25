@@ -37,6 +37,7 @@ const customerOnlyAccountCreators = ["Front Desk"];
 const dealerCreatableRoles = ["Customer", "Technician"];
 const loginOtpChallenges = new Map();
 const selfSaleOtpChallenges = new Map();
+const customerAccountOtpChallenges = new Map();
 const LOGIN_OTP_TTL_MS = 5 * 60 * 1000;
 
 function normalizeEmail(email) {
@@ -48,8 +49,33 @@ function normalizeMobileValue(mobile) {
 }
 
 function normalizeLoginMobile(value) {
-  const digits = normalizeMobileValue(value);
-  return digits.length > 10 ? digits.slice(-10) : digits;
+  let digits = normalizeMobileValue(value);
+  if (!digits) {
+    return "";
+  }
+  const dial = "91";
+  if (digits.length > 10 && digits.startsWith(dial)) {
+    digits = digits.slice(dial.length);
+  }
+  if (digits.length > 10) {
+    digits = digits.slice(-10);
+  }
+  return digits.slice(0, 10);
+}
+
+function normalizeStoredMobile(mobile, countryDial) {
+  const dial = cleanString(countryDial) || "91";
+  return normalizeLoginMobile(
+    dial === "91" ? mobile : `${normalizeMobileValue(dial)}${normalizeMobileValue(mobile)}`
+  );
+}
+
+function requireTenDigitMobile(mobile, countryDial) {
+  const national = normalizeStoredMobile(mobile, countryDial);
+  if (national.length !== 10) {
+    return { ok: false, error: "Enter a valid 10 digit mobile number." };
+  }
+  return { ok: true, national };
 }
 
 function renderSmsTemplate(template, values) {
@@ -62,6 +88,11 @@ async function sendLoginOtpSms(mobile, otp) {
     return { sent: false, reason: "not_configured" };
   }
 
+  let targetMobile = normalizeMobileValue(mobile);
+  if (targetMobile.length === 10) {
+    targetMobile = `91${targetMobile}`;
+  }
+
   const message = `Your Hitaishi CRM login OTP is ${otp}. It is valid for 5 minutes.`;
   const method = cleanString(process.env.SMS_OTP_METHOD || "POST").toUpperCase();
   const headers = { Accept: "application/json" };
@@ -71,14 +102,14 @@ async function sendLoginOtpSms(mobile, otp) {
     headers[authHeader] = authValue;
   }
 
-  const url = renderSmsTemplate(smsUrlTemplate, { mobile, otp, message });
+  const url = renderSmsTemplate(smsUrlTemplate, { mobile: targetMobile, otp, message });
   const options = { method, headers };
   if (method !== "GET") {
     headers["Content-Type"] = "application/json";
     const bodyTemplate = cleanString(process.env.SMS_OTP_BODY_TEMPLATE);
     options.body = bodyTemplate
-      ? renderSmsTemplate(bodyTemplate, { mobile, otp, message })
-      : JSON.stringify({ mobile, otp, message });
+      ? renderSmsTemplate(bodyTemplate, { mobile: targetMobile, otp, message })
+      : JSON.stringify({ mobile: targetMobile, otp, message });
   }
 
   const response = await fetch(url, options);
@@ -96,16 +127,33 @@ function sqlNormalizeMobileColumn(column) {
   return `REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(${column}, ' ', ''), '-', ''), '+', ''), '(', ''), ')', ''), '.', '')`;
 }
 
+/** Resolve dealer profile for login — by user_id, then last 10 digits of mobile (auto-links user_id when missing). */
 async function findDealerForUser(userRow) {
-  const dealerMobile = normalizeMobileValue(userRow?.mobile);
-  if (!dealerMobile) {
+  if (!userRow?.id) {
     return null;
   }
-  const result = await query(
-    `SELECT * FROM dealers WHERE ${sqlNormalizeMobileColumn("mobile")} = ? LIMIT 1`,
+  await ensureDealersUserIdSchema();
+  const byUser = await query("SELECT * FROM dealers WHERE user_id = ? LIMIT 1", [userRow.id]);
+  if (byUser.rowCount) {
+    return byUser.rows[0];
+  }
+  const dealerMobile = normalizeLoginMobile(userRow.mobile);
+  if (dealerMobile.length < 10) {
+    return null;
+  }
+  const byMobile = await query(
+    `SELECT * FROM dealers WHERE RIGHT(${sqlNormalizeMobileColumn("mobile")}, 10) = ? LIMIT 1`,
     [dealerMobile]
   );
-  return result.rowCount ? result.rows[0] : null;
+  if (!byMobile.rowCount) {
+    return null;
+  }
+  const dealer = byMobile.rows[0];
+  if (!dealer.user_id) {
+    await query("UPDATE dealers SET user_id = ? WHERE id = ?", [userRow.id, dealer.id]);
+    dealer.user_id = userRow.id;
+  }
+  return dealer;
 }
 
 /** Dealer table id from profile id or dealer login user id. */
@@ -1415,6 +1463,10 @@ async function ensureSerialNumbersSchema() {
   }
 }
 
+async function ensureDealersUserIdSchema() {
+  await ensureTableColumn("dealers", "user_id", "ALTER TABLE dealers ADD COLUMN user_id CHAR(36) NULL AFTER id");
+}
+
 async function ensureDealerCreatedBySchema() {
   for (const [tableName, columnName, ddl] of [
     ["customers", "created_by_dealer_id", "ALTER TABLE customers ADD COLUMN created_by_dealer_id CHAR(36) NULL AFTER pincode"],
@@ -2047,7 +2099,7 @@ app.post("/auth/verify-otp", asyncRoute(async (req, res) => {
 app.post("/admin/self-sale/request-otp", asyncRoute(async (req, res) => {
   await ensureCustomersVillageSchema();
   const name = cleanString(req.body.name);
-  const mobile = normalizeMobileValue(req.body.mobile);
+  const mobile = normalizeStoredMobile(req.body.mobile, req.body.countryDial);
   const city = cleanString(req.body.city);
   const village = cleanString(req.body.village);
   const pincode = cleanString(req.body.pincode);
@@ -2055,15 +2107,17 @@ app.post("/admin/self-sale/request-otp", asyncRoute(async (req, res) => {
   if (!name || !mobile || !city || !village || !pincode) {
     return res.status(400).json({ error: "Customer name, phone number, city, village and pin code are required." });
   }
-  if (mobile.length < 10) {
-    return res.status(400).json({ error: "Enter a valid mobile number." });
+  const mobileCheck = requireTenDigitMobile(mobile);
+  if (!mobileCheck.ok) {
+    return res.status(400).json({ error: mobileCheck.error });
   }
+  const storedMobile = mobileCheck.national;
 
-  const existingUser = await query("SELECT id FROM users WHERE mobile = ? LIMIT 1", [mobile]);
+  const existingUser = await query("SELECT id FROM users WHERE mobile = ? LIMIT 1", [storedMobile]);
   if (existingUser.rowCount) {
     return res.status(409).json({ error: "This mobile number already has a login account." });
   }
-  const existingCustomer = await query("SELECT id FROM customers WHERE mobile = ? LIMIT 1", [mobile]);
+  const existingCustomer = await query("SELECT id FROM customers WHERE mobile = ? LIMIT 1", [storedMobile]);
   if (existingCustomer.rowCount) {
     return res.status(409).json({ error: "This mobile number already has a customer profile." });
   }
@@ -2072,7 +2126,7 @@ app.post("/admin/self-sale/request-otp", asyncRoute(async (req, res) => {
   const token = crypto.randomUUID();
   purgeExpiredOtpChallenges(selfSaleOtpChallenges);
   selfSaleOtpChallenges.set(token, {
-    payload: { name, mobile, city, village, pincode },
+    payload: { name, mobile: storedMobile, city, village, pincode },
     otp,
     attempts: 0,
     expiresAt: Date.now() + LOGIN_OTP_TTL_MS,
@@ -2080,7 +2134,7 @@ app.post("/admin/self-sale/request-otp", asyncRoute(async (req, res) => {
 
   let smsResult;
   try {
-    smsResult = await sendLoginOtpSms(mobile, otp);
+    smsResult = await sendLoginOtpSms(storedMobile, otp);
   } catch (err) {
     selfSaleOtpChallenges.delete(token);
     throw err;
@@ -2156,6 +2210,157 @@ app.post("/admin/self-sale/verify-otp", asyncRoute(async (req, res) => {
   });
 }));
 
+app.post("/accounts/customer/request-otp", asyncRoute(async (req, res) => {
+  await ensureCustomersVillageSchema();
+  const createdByRole = cleanString(req.body.createdByRole);
+  const name = cleanString(req.body.name);
+  const mobile = normalizeStoredMobile(req.body.mobile, req.body.countryDial);
+  const city = cleanString(req.body.city);
+  const state = cleanString(req.body.state);
+  const pincode = cleanString(req.body.pincode);
+  const address = cleanString(req.body.address);
+  const village = cleanString(req.body.village);
+  const dealerId = cleanString(req.body.dealerId || req.body.dealer_id);
+
+  if (!["Admin", "Dealer", "Front Desk"].includes(createdByRole)) {
+    return res.status(403).json({ error: "You are not allowed to create customer login accounts." });
+  }
+  if (!name || !mobile || !city) {
+    return res.status(400).json({ error: "Customer name, mobile number and city are required." });
+  }
+  const mobileCheck = requireTenDigitMobile(mobile);
+  if (!mobileCheck.ok) {
+    return res.status(400).json({ error: mobileCheck.error });
+  }
+  const storedMobile = mobileCheck.national;
+
+  let creatorDealerId = null;
+  if (createdByRole === "Dealer") {
+    const dealerProfile = await resolveDealerRecord(dealerId);
+    if (!dealerProfile) {
+      return res.status(400).json({
+        error: "Dealer profile is required. Link your login mobile with Dealer Management in Admin.",
+      });
+    }
+    creatorDealerId = dealerProfile.id;
+  } else if (createdByRole === "Admin") {
+    if (!dealerId) {
+      return res.status(400).json({ error: "Select a dealer for this customer account." });
+    }
+    const dealerProfile = await resolveDealerRecord(dealerId);
+    if (!dealerProfile) {
+      return res.status(400).json({ error: "Dealer not found." });
+    }
+    creatorDealerId = dealerProfile.id;
+  }
+
+  const existingUser = await query("SELECT id FROM users WHERE mobile = ? LIMIT 1", [storedMobile]);
+  if (existingUser.rowCount) {
+    return res.status(409).json({ error: "This mobile number already has a login account." });
+  }
+  const existingCustomer = await query("SELECT id FROM customers WHERE mobile = ? LIMIT 1", [storedMobile]);
+  if (existingCustomer.rowCount) {
+    return res.status(409).json({ error: "This mobile number already has a customer profile." });
+  }
+
+  const otp = String(crypto.randomInt(100000, 1000000));
+  const token = crypto.randomUUID();
+  purgeExpiredOtpChallenges(customerAccountOtpChallenges);
+  customerAccountOtpChallenges.set(token, {
+    payload: {
+      createdByRole,
+      dealerId: creatorDealerId,
+      name,
+      mobile: storedMobile,
+      city,
+      state: state || null,
+      pincode: pincode || null,
+      address: address || null,
+      village: village || null,
+    },
+    otp,
+    attempts: 0,
+    expiresAt: Date.now() + LOGIN_OTP_TTL_MS,
+  });
+
+  let smsResult;
+  try {
+    smsResult = await sendLoginOtpSms(storedMobile, otp);
+  } catch (err) {
+    customerAccountOtpChallenges.delete(token);
+    throw err;
+  }
+
+  res.json({
+    token,
+    expiresInSeconds: Math.floor(LOGIN_OTP_TTL_MS / 1000),
+    message: smsResult.sent
+      ? "OTP sent to customer mobile number."
+      : "SMS gateway is not configured. Use development OTP for testing.",
+    smsSent: Boolean(smsResult.sent),
+    devOtp: smsResult.sent ? undefined : otp,
+  });
+}));
+
+app.post("/accounts/customer/verify-otp", asyncRoute(async (req, res) => {
+  await ensureCustomersVillageSchema();
+  const token = cleanString(req.body.token);
+  const otp = normalizeMobileValue(req.body.otp);
+  const challenge = customerAccountOtpChallenges.get(token);
+  if (!token || !challenge) {
+    return res.status(400).json({ error: "OTP session expired. Send OTP again." });
+  }
+  if (Date.now() > challenge.expiresAt) {
+    customerAccountOtpChallenges.delete(token);
+    return res.status(400).json({ error: "OTP expired. Send OTP again." });
+  }
+  if (challenge.attempts >= 5) {
+    customerAccountOtpChallenges.delete(token);
+    return res.status(429).json({ error: "Too many wrong OTP attempts. Send OTP again." });
+  }
+  if (otp !== challenge.otp) {
+    challenge.attempts += 1;
+    return res.status(401).json({ error: "Invalid OTP." });
+  }
+
+  const { dealerId, name, mobile, city, state, pincode, address, village } = challenge.payload;
+  const created = await withTransaction(async (run) => {
+    const existingUser = await run("SELECT id FROM users WHERE mobile = ? LIMIT 1", [mobile]);
+    if (existingUser.rowCount) {
+      const err = new Error("This mobile number already has a login account.");
+      err.statusCode = 409;
+      throw err;
+    }
+    const existingCustomer = await run("SELECT id FROM customers WHERE mobile = ? LIMIT 1", [mobile]);
+    if (existingCustomer.rowCount) {
+      const err = new Error("This mobile number already has a customer profile.");
+      err.statusCode = 409;
+      throw err;
+    }
+
+    const userId = crypto.randomUUID();
+    const customerId = crypto.randomUUID();
+    await run(
+      "INSERT INTO users (id, role, name, mobile, email, password_hash, status) VALUES (?, 'Customer', ?, ?, NULL, NULL, 'Active')",
+      [userId, name, mobile]
+    );
+    await run(
+      "INSERT INTO customers (id, user_id, name, mobile, address, city, village, state, pincode, created_by_dealer_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [customerId, userId, name, mobile, address || null, city, village || null, state || null, pincode || null, dealerId || null]
+    );
+
+    const userResult = await run("SELECT * FROM users WHERE id = ? LIMIT 1", [userId]);
+    const customerResult = await run("SELECT * FROM customers WHERE id = ? LIMIT 1", [customerId]);
+    return { user: publicUser(userResult.rows[0]), customer: customerResult.rows[0] };
+  });
+
+  customerAccountOtpChallenges.delete(token);
+  res.status(201).json({
+    ...created,
+    message: "Customer mobile verified and login account created.",
+  });
+}));
+
 /** Customer / Technician: logged-in profile - change login password after verifying old one. */
 app.post("/auth/change-password", asyncRoute(async (req, res) => {
   const { userId, role, email, oldPassword, newPassword } = req.body;
@@ -2214,7 +2419,7 @@ app.patch("/auth/profile", asyncRoute(async (req, res) => {
   const userId = cleanString(req.body.userId);
   const role = cleanString(req.body.role);
   const name = cleanString(req.body.name);
-  const mobile = normalizeMobileValue(req.body.mobile);
+  const mobile = normalizeStoredMobile(req.body.mobile, req.body.countryDial);
   const email = normalizeEmail(req.body.email);
 
   if (!userId || !role) {
@@ -2223,8 +2428,9 @@ app.patch("/auth/profile", asyncRoute(async (req, res) => {
   if (!name) {
     return res.status(400).json({ error: "Name is required." });
   }
-  if (!mobile || mobile.length < 10) {
-    return res.status(400).json({ error: "Enter a valid mobile number." });
+  const mobileCheck = requireTenDigitMobile(mobile);
+  if (!mobileCheck.ok) {
+    return res.status(400).json({ error: mobileCheck.error });
   }
   if (!email) {
     return res.status(400).json({ error: "Email is required." });
@@ -2237,7 +2443,7 @@ app.patch("/auth/profile", asyncRoute(async (req, res) => {
 
   const mobileConflict = await query(
     "SELECT id FROM users WHERE mobile = ? AND id <> ? LIMIT 1",
-    [mobile, userId]
+    [mobileCheck.national, userId]
   );
   if (mobileConflict.rowCount) {
     return res.status(409).json({ error: "This mobile number is already used by another account." });
@@ -2253,7 +2459,7 @@ app.patch("/auth/profile", asyncRoute(async (req, res) => {
 
   await query(
     "UPDATE users SET name = ?, mobile = ?, email = ? WHERE id = ? AND role = ?",
-    [name, mobile, email, userId, role]
+    [name, mobileCheck.national, email, userId, role]
   );
 
   const updated = await query(
@@ -2524,7 +2730,7 @@ app.post("/accounts", asyncRoute(async (req, res) => {
 
   const cleanRole = typeof role === "string" ? role.trim() : "";
   const cleanName = typeof name === "string" ? name.trim() : "";
-  const cleanMobile = normalizeMobileValue(mobile);
+  const cleanMobile = normalizeStoredMobile(mobile, req.body.countryDial);
   const cleanEmail = normalizeEmail(email);
   const cleanCreatedByRole = typeof createdByRole === "string" ? createdByRole.trim() : "";
   const cleanPassword = typeof password === "string" ? password : "";
@@ -2562,11 +2768,16 @@ app.post("/accounts", asyncRoute(async (req, res) => {
   if (!accountRoles.includes(cleanRole)) {
     return res.status(400).json({ error: "Select a valid role." });
   }
+  if (cleanRole === "Customer") {
+    return res.status(400).json({
+      error: "Customer login must be created with mobile OTP verification. Use Send OTP flow.",
+    });
+  }
   if (!cleanName || !cleanMobile || !cleanEmail || !cleanPassword) {
     return res.status(400).json({ error: "name, mobile, email, and password are required." });
   }
-  if (cleanMobile.length < 10) {
-    return res.status(400).json({ error: "Enter a valid mobile number." });
+  if (cleanMobile.length !== 10) {
+    return res.status(400).json({ error: "Enter a valid 10 digit mobile number." });
   }
   if (cleanPassword.length < 8) {
     return res.status(400).json({ error: "Password must be at least 8 characters." });
@@ -2617,10 +2828,12 @@ app.post("/accounts", asyncRoute(async (req, res) => {
   }
 
   if (cleanRole === "Dealer") {
+    await ensureDealersUserIdSchema();
     const finalDealerNo = cleanString(dealerNo) || await getNextDealerNo();
+    const storedMobile = normalizeLoginMobile(cleanMobile) || cleanMobile;
     await query(
-      "INSERT INTO dealers (dealer_no, name, contact_person, mobile, address, city, state) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      [finalDealerNo, cleanName, contactPerson || null, cleanMobile, address || null, city || null, state || null]
+      "INSERT INTO dealers (user_id, dealer_no, name, contact_person, mobile, address, city, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      [userId, finalDealerNo, cleanName, contactPerson || null, storedMobile, address || null, city || null, state || null]
     );
     const result = await query("SELECT * FROM dealers WHERE dealer_no = ? LIMIT 1", [finalDealerNo]);
     dealer = result.rows[0] || null;
@@ -2634,26 +2847,9 @@ app.post("/accounts", asyncRoute(async (req, res) => {
   });
 }));
 
-app.post("/customers", asyncRoute(async (req, res) => {
-  const { name, mobile, email, password, address, city, state, pincode } = req.body;
-  if (!name || !mobile) {
-    return res.status(400).json({ error: "name and mobile are required" });
-  }
-
-  await query(
-    "INSERT INTO users (role, name, mobile, email, password_hash) VALUES ('Customer', ?, ?, ?, ?)",
-    [name, mobile, email ? String(email).trim().toLowerCase() || null : null, password ? hashPassword(password) : null]
-  );
-  const user = await query("SELECT * FROM users WHERE mobile = ? AND role = 'Customer' LIMIT 1", [mobile]);
-  await query(
-    "INSERT INTO customers (user_id, name, mobile, address, city, state, pincode) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    [user.rows[0].id, name, mobile, address || null, city || null, state || null, pincode || null]
-  );
-  const customer = await query("SELECT * FROM customers WHERE mobile = ? LIMIT 1", [mobile]);
-
-  res.status(201).json({
-    user: publicUser(user.rows[0]),
-    customer: customer.rows[0]
+app.post("/customers", asyncRoute(async (_req, res) => {
+  return res.status(403).json({
+    error: "Self-registration is disabled. Ask your dealer or admin to create your customer account.",
   });
 }));
 
@@ -2898,27 +3094,9 @@ app.delete("/customers/:id", asyncRoute(async (req, res) => {
   });
 }));
 
-app.post("/technicians", asyncRoute(async (req, res) => {
-  await ensureTechniciansSchema();
-  const { name, mobile, email, password, city, serviceAreas, pincode } = req.body;
-  if (!name || !mobile) {
-    return res.status(400).json({ error: "name and mobile are required" });
-  }
-
-  await query(
-    "INSERT INTO users (role, name, mobile, email, password_hash, status) VALUES ('Technician', ?, ?, ?, ?, 'Pending')",
-    [name, mobile, email ? String(email).trim().toLowerCase() || null : null, password ? hashPassword(password) : null]
-  );
-  const user = await query("SELECT * FROM users WHERE mobile = ? AND role = 'Technician' LIMIT 1", [mobile]);
-  await query(
-    "INSERT INTO technicians (user_id, name, mobile, city, pincode, service_areas) VALUES (?, ?, ?, ?, ?, ?)",
-    [user.rows[0].id, name, mobile, city || null, cleanString(pincode) || null, serviceAreas || null]
-  );
-  const technician = await query("SELECT * FROM technicians WHERE mobile = ? LIMIT 1", [mobile]);
-
-  res.status(201).json({
-    user: publicUser(user.rows[0]),
-    technician: technician.rows[0]
+app.post("/technicians", asyncRoute(async (_req, res) => {
+  return res.status(403).json({
+    error: "Self-registration is disabled. Ask your dealer or admin to create your technician account.",
   });
 }));
 
@@ -4539,14 +4717,19 @@ app.get("/dealers/:id/created-technicians", asyncRoute(async (req, res) => {
 
 app.post("/dealers", asyncRoute(async (req, res) => {
   const { dealerNo, name, contactPerson, mobile, address, city, state } = req.body;
-  if (!name || !mobile) {
+  const storedMobile = normalizeStoredMobile(mobile, req.body.countryDial);
+  if (!name || !storedMobile) {
     return res.status(400).json({ error: "name and mobile are required" });
+  }
+  const mobileCheck = requireTenDigitMobile(storedMobile);
+  if (!mobileCheck.ok) {
+    return res.status(400).json({ error: mobileCheck.error });
   }
 
   const finalDealerNo = cleanString(dealerNo) || await getNextDealerNo();
   await query(
     "INSERT INTO dealers (dealer_no, name, contact_person, mobile, address, city, state) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    [finalDealerNo, name, contactPerson || null, mobile, address || null, city || null, state || null]
+    [finalDealerNo, name, contactPerson || null, mobileCheck.national, address || null, city || null, state || null]
   );
   const result = await query("SELECT * FROM dealers WHERE dealer_no = ? LIMIT 1", [finalDealerNo]);
   res.status(201).json({ dealer: result.rows[0] });
@@ -4557,7 +4740,7 @@ app.patch("/dealers/:id", asyncRoute(async (req, res) => {
   const dealerNo = cleanString(req.body.dealerNo || req.body.dealer_no);
   const name = cleanString(req.body.name);
   const contactPerson = cleanString(req.body.contactPerson || req.body.contact_person) || null;
-  const mobile = normalizeMobileValue(req.body.mobile);
+  const mobile = normalizeStoredMobile(req.body.mobile, req.body.countryDial);
   const address = cleanString(req.body.address) || null;
   const city = cleanString(req.body.city) || null;
   const state = cleanString(req.body.state) || null;
@@ -4565,6 +4748,10 @@ app.patch("/dealers/:id", asyncRoute(async (req, res) => {
 
   if (!id || !dealerNo || !name || !mobile) {
     return res.status(400).json({ error: "Dealer id, dealer number, name, and mobile are required." });
+  }
+  const mobileCheck = requireTenDigitMobile(mobile);
+  if (!mobileCheck.ok) {
+    return res.status(400).json({ error: mobileCheck.error });
   }
 
   const duplicate = await query("SELECT id FROM dealers WHERE LOWER(TRIM(dealer_no)) = LOWER(?) AND id <> ? LIMIT 1", [dealerNo, id]);
@@ -4576,7 +4763,7 @@ app.patch("/dealers/:id", asyncRoute(async (req, res) => {
     `UPDATE dealers
      SET dealer_no = ?, name = ?, contact_person = ?, mobile = ?, address = ?, city = ?, state = ?, status = ?
      WHERE id = ?`,
-    [dealerNo, name, contactPerson, mobile, address, city, state, status, id]
+    [dealerNo, name, contactPerson, mobileCheck.national, address, city, state, status, id]
   );
   if (!result.affectedRows) {
     return res.status(404).json({ error: "Dealer not found." });

@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS users (
 
 CREATE TABLE IF NOT EXISTS dealers (
   id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
+  user_id CHAR(36),
   dealer_no VARCHAR(60) NOT NULL UNIQUE,
   name VARCHAR(180) NOT NULL,
   contact_person VARCHAR(160),
