@@ -4641,6 +4641,83 @@ app.post("/product-categories", asyncRoute(async (req, res) => {
   res.status(201).json({ category: result.rows[0] });
 }));
 
+app.patch("/product-categories/:id", asyncRoute(async (req, res) => {
+  const id = cleanString(req.params.id);
+  const name = cleanString(req.body.name);
+  if (!id) {
+    return res.status(400).json({ error: "Category id is required." });
+  }
+  if (!name) {
+    return res.status(400).json({ error: "Category name is required." });
+  }
+
+  const existing = await query("SELECT * FROM product_categories WHERE id = ? LIMIT 1", [id]);
+  if (!existing.rowCount) {
+    return res.status(404).json({ error: "Category not found." });
+  }
+  const category = existing.rows[0];
+
+  const nameConflict = await query(
+    "SELECT id FROM product_categories WHERE LOWER(TRIM(name)) = LOWER(?) AND id <> ? LIMIT 1",
+    [name, id]
+  );
+  if (nameConflict.rowCount) {
+    return res.status(409).json({ error: "Category name already exists." });
+  }
+
+  const productCountResult = await query("SELECT COUNT(*) AS total FROM products WHERE category_id = ?", [id]);
+  const hasProducts = Number(productCountResult.rows?.[0]?.total || 0) > 0;
+
+  if (hasProducts) {
+    await query("UPDATE product_categories SET name = ? WHERE id = ?", [name, id]);
+    await query("UPDATE products SET category = ? WHERE category_id = ?", [name, id]);
+  } else {
+    const model = parseSequenceSeed(req.body.modelStart || req.body.model_start, "Model starting code");
+    const serial = parseSequenceSeed(req.body.serialStart || req.body.serial_start, "Serial starting code");
+    const sequences = applyCategorySequencePrefixes(name, model, serial);
+    await query(
+      `UPDATE product_categories
+       SET name = ?, model_prefix = ?, model_number_width = ?, model_start_number = ?, next_model_number = ?,
+           serial_prefix = ?, serial_number_width = ?, serial_start_number = ?, next_serial_number = ?
+       WHERE id = ?`,
+      [
+        name,
+        sequences.model.prefix,
+        sequences.model.width,
+        sequences.model.nextNumber,
+        sequences.model.nextNumber,
+        sequences.serial.prefix,
+        sequences.serial.width,
+        sequences.serial.nextNumber,
+        sequences.serial.nextNumber,
+        id,
+      ]
+    );
+  }
+
+  const result = await query(
+    `SELECT
+       c.*,
+       CONCAT(c.model_prefix, LPAD(COALESCE(c.model_start_number, c.next_model_number), c.model_number_width, '0')) AS starting_model_no,
+       CONCAT(c.serial_prefix, LPAD(COALESCE(c.serial_start_number, c.next_serial_number), c.serial_number_width, '0')) AS starting_serial_no,
+       CONCAT(c.model_prefix, LPAD(c.next_model_number, c.model_number_width, '0')) AS next_model_no,
+       CONCAT(c.serial_prefix, LPAD(c.next_serial_number, c.serial_number_width, '0')) AS next_serial_no,
+       COUNT(p.id) AS product_count
+     FROM product_categories c
+     LEFT JOIN products p ON p.category_id = c.id
+     WHERE c.id = ?
+     GROUP BY c.id
+     LIMIT 1`,
+    [id]
+  );
+  res.json({
+    category: result.rows[0],
+    message: hasProducts
+      ? "Category name updated. Model/serial codes are locked because products already exist."
+      : "Category updated.",
+  });
+}));
+
 app.delete("/product-categories/:id", asyncRoute(async (req, res) => {
   const id = cleanString(req.params.id);
   const linked = await query("SELECT id FROM products WHERE category_id = ? LIMIT 1", [id]);
