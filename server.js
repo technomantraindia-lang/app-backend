@@ -2803,6 +2803,101 @@ app.get("/customers/by-mobile/:mobile", asyncRoute(async (req, res) => {
   });
 }));
 
+app.delete("/customers/:id", asyncRoute(async (req, res) => {
+  const customerId = cleanString(req.params.id);
+  if (!customerId) {
+    return res.status(400).json({ error: "Customer id is required." });
+  }
+
+  const existing = await query("SELECT * FROM customers WHERE id = ? LIMIT 1", [customerId]);
+  if (!existing.rowCount) {
+    return res.status(404).json({ error: "Customer not found." });
+  }
+  const customer = existing.rows[0];
+
+  const deleted = await withTransaction(async (tx) => {
+    const counts = {
+      attachments: 0,
+      payments: 0,
+      quotations: 0,
+      tasks: 0,
+      complaints: 0,
+      warranties: 0,
+      feedback: 0,
+      customers: 0,
+      users: 0,
+    };
+    const add = (key, result) => {
+      counts[key] += Number(result?.affectedRows || 0);
+    };
+    const placeholders = (items) => items.map(() => "?").join(",");
+    const idsFrom = (result) => result.rows.map((row) => row.id).filter(Boolean);
+    const deleteAttachments = async (entityType, ids) => {
+      if (!ids.length) return;
+      try {
+        add(
+          "attachments",
+          await tx(
+            `DELETE FROM attachments WHERE entity_type = ? AND entity_id IN (${placeholders(ids)})`,
+            [entityType, ...ids]
+          )
+        );
+      } catch (err) {
+        if (err?.code !== "ER_NO_SUCH_TABLE") {
+          throw err;
+        }
+      }
+    };
+
+    const customerIds = [customerId];
+    const warranties = await tx(`SELECT id FROM warranties WHERE customer_id IN (${placeholders(customerIds)})`, customerIds);
+    const warrantyIds = idsFrom(warranties);
+    const complaints = await tx(`SELECT id FROM complaints WHERE customer_id IN (${placeholders(customerIds)})`, customerIds);
+    const complaintIds = idsFrom(complaints);
+    const tasks = complaintIds.length
+      ? await tx(`SELECT id FROM tasks WHERE complaint_id IN (${placeholders(complaintIds)})`, complaintIds)
+      : { rows: [] };
+    const taskIds = idsFrom(tasks);
+
+    await deleteAttachments("Customer", customerIds);
+    await deleteAttachments("customers", customerIds);
+    await deleteAttachments("Warranty", warrantyIds);
+    await deleteAttachments("warranties", warrantyIds);
+    await deleteAttachments("Complaint", complaintIds);
+    await deleteAttachments("complaints", complaintIds);
+    await deleteAttachments("Task", taskIds);
+    await deleteAttachments("tasks", taskIds);
+
+    if (taskIds.length) {
+      add("payments", await tx(`DELETE FROM payments WHERE task_id IN (${placeholders(taskIds)})`, taskIds));
+      add("tasks", await tx(`DELETE FROM tasks WHERE id IN (${placeholders(taskIds)})`, taskIds));
+    }
+    if (complaintIds.length) {
+      add("quotations", await tx(`DELETE FROM quotations WHERE complaint_id IN (${placeholders(complaintIds)})`, complaintIds));
+      add("feedback", await tx(`DELETE FROM feedback WHERE complaint_id IN (${placeholders(complaintIds)})`, complaintIds));
+      add("complaints", await tx(`DELETE FROM complaints WHERE id IN (${placeholders(complaintIds)})`, complaintIds));
+    }
+    if (warrantyIds.length) {
+      add("warranties", await tx(`DELETE FROM warranties WHERE id IN (${placeholders(warrantyIds)})`, warrantyIds));
+    }
+    add("feedback", await tx(`DELETE FROM feedback WHERE customer_id IN (${placeholders(customerIds)})`, customerIds));
+    add("customers", await tx(`DELETE FROM customers WHERE id IN (${placeholders(customerIds)})`, customerIds));
+
+    if (customer.user_id) {
+      const userDelete = await tx("DELETE FROM users WHERE id = ? AND role = 'Customer'", [customer.user_id]);
+      counts.users = userDelete.affectedRows;
+    }
+    return counts;
+  });
+
+  res.json({
+    ok: true,
+    deletedCustomer: customer,
+    deleted,
+    message: "Customer and linked records deleted.",
+  });
+}));
+
 app.post("/technicians", asyncRoute(async (req, res) => {
   await ensureTechniciansSchema();
   const { name, mobile, email, password, city, serviceAreas, pincode } = req.body;
