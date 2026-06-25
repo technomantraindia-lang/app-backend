@@ -156,6 +156,34 @@ async function findDealerForUser(userRow) {
   return dealer;
 }
 
+/** Create dealer profile when login exists but dealers row is missing (legacy/orphan logins). */
+async function ensureDealerProfileForUser(userRow, runQuery = query) {
+  let existing = await findDealerForUser(userRow);
+  if (existing) {
+    const currentNo = cleanString(existing.dealer_no);
+    if (!currentNo || currentNo === "Pending Dealer No") {
+      const finalDealerNo = await getNextDealerNo(runQuery);
+      await runQuery("UPDATE dealers SET dealer_no = ? WHERE id = ?", [finalDealerNo, existing.id]);
+      existing.dealer_no = finalDealerNo;
+    }
+    return existing;
+  }
+  const storedMobile = normalizeLoginMobile(userRow?.mobile);
+  const cleanName = cleanString(userRow?.name);
+  if (!userRow?.id || storedMobile.length !== 10 || !cleanName) {
+    return null;
+  }
+  await ensureDealersUserIdSchema();
+  const finalDealerNo = await getNextDealerNo(runQuery);
+  await runQuery(
+    `INSERT INTO dealers (user_id, dealer_no, name, contact_person, mobile, status)
+     VALUES (?, ?, ?, ?, ?, 'Active')`,
+    [userRow.id, finalDealerNo, cleanName, cleanName, storedMobile]
+  );
+  const created = await runQuery("SELECT * FROM dealers WHERE user_id = ? LIMIT 1", [userRow.id]);
+  return created.rowCount ? created.rows[0] : null;
+}
+
 /** Dealer table id from profile id or dealer login user id. */
 async function resolveDealerRecord(idOrUserId) {
   const key = cleanString(idOrUserId);
@@ -1950,6 +1978,9 @@ async function buildAuthLoginResponse(userRow, role) {
   }
   if (role === "Dealer") {
     dealer = await findDealerForUser(userRow);
+    if (!dealer) {
+      dealer = await ensureDealerProfileForUser(userRow);
+    }
   }
 
   return {
@@ -3545,52 +3576,83 @@ app.patch("/payments/:id", asyncRoute(async (req, res) => {
 }));
 
 app.get("/dealers", asyncRoute(async (_req, res) => {
-  const result = await query(
-    `SELECT
-       d.id AS id,
-       u.id AS user_id,
-       COALESCE(d.dealer_no, 'Pending Dealer No') AS dealer_no,
-       COALESCE(d.name, u.name) AS name,
-       COALESCE(d.contact_person, u.name) AS contact_person,
-       COALESCE(d.mobile, u.mobile) AS mobile,
-       d.address,
-       d.city,
-       d.state,
-       COALESCE(d.status, u.status, 'Active') AS status,
-       COALESCE(d.created_at, u.created_at) AS created_at
-     FROM users u
-     LEFT JOIN dealers d ON ${sqlNormalizeMobileColumn("d.mobile")} = ${sqlNormalizeMobileColumn("u.mobile")}
-     WHERE u.role = 'Dealer'
-     UNION
-     SELECT
-       d.id,
-       NULL AS user_id,
-       d.dealer_no,
-       d.name,
-       d.contact_person,
-       d.mobile,
-       d.address,
-       d.city,
-       d.state,
-       d.status,
-       d.created_at
-     FROM dealers d
-     LEFT JOIN users u ON ${sqlNormalizeMobileColumn("u.mobile")} = ${sqlNormalizeMobileColumn("d.mobile")} AND u.role = 'Dealer'
-     WHERE u.id IS NULL
-     ORDER BY created_at DESC`
+  await ensureDealersUserIdSchema();
+  const usersResult = await query(
+    "SELECT * FROM users WHERE role = 'Dealer' ORDER BY created_at DESC LIMIT 800"
   );
   const dealers = [];
-  for (const row of result.rows) {
-    const entry = { ...row };
-    if (row.id) {
-      try {
-        entry.stats = await getDealerDashboardStats(row.id);
-      } catch {
-        entry.stats = null;
-      }
+  const seenDealerIds = new Set();
+
+  for (const userRow of usersResult.rows) {
+    const dealer = await ensureDealerProfileForUser(userRow);
+    if (!dealer?.id) {
+      continue;
+    }
+    seenDealerIds.add(String(dealer.id));
+    const entry = {
+      id: dealer.id,
+      user_id: userRow.id,
+      dealer_no: dealer.dealer_no,
+      name: dealer.name || userRow.name,
+      contact_person: dealer.contact_person || userRow.name,
+      mobile: dealer.mobile || userRow.mobile,
+      address: dealer.address,
+      city: dealer.city,
+      state: dealer.state,
+      status: dealer.status || userRow.status || "Active",
+      created_at: dealer.created_at || userRow.created_at,
+    };
+    try {
+      entry.stats = await getDealerDashboardStats(dealer.id);
+    } catch {
+      entry.stats = null;
     }
     dealers.push(entry);
   }
+
+  const orphanResult = await query(
+    `SELECT d.*
+     FROM dealers d
+     LEFT JOIN users u ON u.id = d.user_id AND u.role = 'Dealer'
+     WHERE u.id IS NULL
+       AND NOT EXISTS (
+         SELECT 1
+         FROM users u2
+         WHERE u2.role = 'Dealer'
+           AND (
+             u2.id = d.user_id
+             OR RIGHT(${sqlNormalizeMobileColumn("u2.mobile")}, 10) = RIGHT(${sqlNormalizeMobileColumn("d.mobile")}, 10)
+           )
+       )
+     ORDER BY d.created_at DESC
+     LIMIT 200`
+  );
+  for (const dealer of orphanResult.rows) {
+    if (!dealer?.id || seenDealerIds.has(String(dealer.id))) {
+      continue;
+    }
+    const entry = {
+      id: dealer.id,
+      user_id: dealer.user_id || null,
+      dealer_no: dealer.dealer_no,
+      name: dealer.name,
+      contact_person: dealer.contact_person,
+      mobile: dealer.mobile,
+      address: dealer.address,
+      city: dealer.city,
+      state: dealer.state,
+      status: dealer.status || "Active",
+      created_at: dealer.created_at,
+    };
+    try {
+      entry.stats = await getDealerDashboardStats(dealer.id);
+    } catch {
+      entry.stats = null;
+    }
+    dealers.push(entry);
+  }
+
+  dealers.sort((a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime());
   res.json({ dealers });
 }));
 
