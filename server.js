@@ -982,7 +982,19 @@ function serialQrPayload(serialNo) {
   return `hitaishi://serial?serial=${encodeURIComponent(serialNo)}`;
 }
 
-function dispatchUnitQrPayload({ productId, productName, modelNo, serialNo, dealerId, dealerNo, dealerName }) {
+function dispatchUnitQrPayload({
+  productId,
+  productName,
+  modelNo,
+  serialNo,
+  dealerId,
+  dealerNo,
+  dealerName,
+  customerId,
+  customerName,
+  customerMobile,
+  dispatchType,
+}) {
   const params = new URLSearchParams();
   if (productId) params.set("productId", productId);
   if (productName) params.set("name", productName);
@@ -991,6 +1003,10 @@ function dispatchUnitQrPayload({ productId, productName, modelNo, serialNo, deal
   if (dealerId) params.set("dealerId", dealerId);
   if (dealerNo) params.set("dealerNo", dealerNo);
   if (dealerName) params.set("dealerName", dealerName);
+  if (customerId) params.set("customerId", customerId);
+  if (customerName) params.set("customerName", customerName);
+  if (customerMobile) params.set("customerMobile", customerMobile);
+  if (dispatchType) params.set("dispatchType", dispatchType);
   return `hitaishi://unit?${params.toString()}`;
 }
 
@@ -1116,6 +1132,10 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
             dealerId: serial.dealer_id,
             dealerNo: serial.dealer_no,
             dealerName: serial.dealer_name,
+            customerId: serial.dispatched_customer_id,
+            customerName: serial.customer_name,
+            customerMobile: serial.customer_mobile,
+            dispatchType: serial.dispatched_customer_id ? "selfSale" : "",
           });
         const qrUrl = `/serial-numbers/${encodeURIComponent(serial.serial_no)}/qr.svg?download=1`;
         cells.push(`
@@ -1627,6 +1647,7 @@ async function ensureSerialNumbersSchema() {
     ["replacement_case_id", "ALTER TABLE serial_numbers ADD COLUMN replacement_case_id CHAR(36) NULL AFTER installation_required"],
     ["replacement_for_customer_id", "ALTER TABLE serial_numbers ADD COLUMN replacement_for_customer_id CHAR(36) NULL AFTER replacement_case_id"],
     ["replacement_label", "ALTER TABLE serial_numbers ADD COLUMN replacement_label VARCHAR(255) NULL AFTER replacement_for_customer_id"],
+    ["dispatched_customer_id", "ALTER TABLE serial_numbers ADD COLUMN dispatched_customer_id CHAR(36) NULL AFTER dealer_id"],
   ];
 
   for (const [columnName, ddl] of columns) {
@@ -3024,7 +3045,7 @@ app.post("/customers", asyncRoute(async (_req, res) => {
   });
 }));
 
-app.get("/customers", asyncRoute(async (_req, res) => {
+app.get("/customers", asyncRoute(async (req, res) => {
   let hasVillageColumn = true;
   try {
     await ensureCustomersVillageSchema();
@@ -3032,9 +3053,14 @@ app.get("/customers", asyncRoute(async (_req, res) => {
     console.warn("customers.village migration skipped:", err?.message || err);
     hasVillageColumn = false;
   }
+  await ensureDealerCreatedBySchema();
   await syncCustomerProfilesFromUsers();
   const villageSelect = hasVillageColumn ? "c.village" : "NULL AS village";
   const villageGroup = hasVillageColumn ? "c.village," : "";
+  const selfSaleOnly =
+    String(req.query.selfSale || req.query.self_sale || "").toLowerCase() === "true" ||
+    String(req.query.type || "").toLowerCase() === "self-sale";
+  const selfSaleClause = selfSaleOnly ? "WHERE c.created_by_dealer_id IS NULL" : "";
   const result = await query(
     `SELECT
        c.id,
@@ -3046,6 +3072,7 @@ app.get("/customers", asyncRoute(async (_req, res) => {
        ${villageSelect},
        c.state,
        c.pincode,
+       c.created_by_dealer_id,
        c.created_at,
        u.email,
        COALESCE(u.status, 'Active') AS user_status,
@@ -3055,6 +3082,7 @@ app.get("/customers", asyncRoute(async (_req, res) => {
      LEFT JOIN users u ON u.id = c.user_id
      LEFT JOIN warranties w ON w.customer_id = c.id
      LEFT JOIN complaints comp ON comp.customer_id = c.id
+     ${selfSaleClause}
      GROUP BY
        c.id,
        c.user_id,
@@ -3065,6 +3093,7 @@ app.get("/customers", asyncRoute(async (_req, res) => {
        ${villageGroup}
        c.state,
        c.pincode,
+       c.created_by_dealer_id,
        c.created_at,
        u.email,
        u.status
@@ -4985,7 +5014,6 @@ app.post("/dealers", asyncRoute(async (req, res) => {
 
 app.patch("/dealers/:id", asyncRoute(async (req, res) => {
   const id = cleanString(req.params.id);
-  const dealerNo = cleanString(req.body.dealerNo || req.body.dealer_no);
   const name = cleanString(req.body.name);
   const contactPerson = cleanString(req.body.contactPerson || req.body.contact_person) || null;
   const mobile = normalizeStoredMobile(req.body.mobile, req.body.countryDial);
@@ -4994,24 +5022,28 @@ app.patch("/dealers/:id", asyncRoute(async (req, res) => {
   const state = cleanString(req.body.state) || null;
   const status = cleanString(req.body.status) || "Active";
 
-  if (!id || !dealerNo || !name || !mobile) {
-    return res.status(400).json({ error: "Dealer id, dealer number, name, and mobile are required." });
+  if (!id || !name || !mobile) {
+    return res.status(400).json({ error: "Dealer id, name, and mobile are required." });
   }
   const mobileCheck = requireTenDigitMobile(mobile);
   if (!mobileCheck.ok) {
     return res.status(400).json({ error: mobileCheck.error });
   }
 
-  const duplicate = await query("SELECT id FROM dealers WHERE LOWER(TRIM(dealer_no)) = LOWER(?) AND id <> ? LIMIT 1", [dealerNo, id]);
-  if (duplicate.rowCount) {
-    return res.status(409).json({ error: "This dealer number already exists." });
+  const existing = await query("SELECT dealer_no FROM dealers WHERE id = ? LIMIT 1", [id]);
+  if (!existing.rowCount) {
+    return res.status(404).json({ error: "Dealer not found." });
+  }
+  const dealerNo = cleanString(existing.rows[0].dealer_no);
+  if (!dealerNo) {
+    return res.status(400).json({ error: "Dealer number is missing on this profile." });
   }
 
   const result = await query(
     `UPDATE dealers
-     SET dealer_no = ?, name = ?, contact_person = ?, mobile = ?, address = ?, city = ?, state = ?, status = ?
+     SET name = ?, contact_person = ?, mobile = ?, address = ?, city = ?, state = ?, status = ?
      WHERE id = ?`,
-    [dealerNo, name, contactPerson, mobileCheck.national, address, city, state, status, id]
+    [name, contactPerson, mobileCheck.national, address, city, state, status, id]
   );
   if (!result.affectedRows) {
     return res.status(404).json({ error: "Dealer not found." });
@@ -5881,6 +5913,7 @@ async function activateWarrantyFromSerial({ customerId, serialNo, purchaseDate, 
        s.id,
        s.serial_no,
        s.dealer_id,
+       s.dispatched_customer_id,
        s.qr_status,
        s.qr_payload,
        s.installation_required AS serial_installation_required,
@@ -5925,13 +5958,26 @@ async function activateWarrantyFromSerial({ customerId, serialNo, purchaseDate, 
     throw err;
   }
 
+  if (row.dispatched_customer_id) {
+    if (actingDealerId) {
+      const err = new Error("This unit is dispatched for self-sale. The customer must scan the QR to activate warranty.");
+      err.statusCode = 403;
+      throw err;
+    }
+    if (String(row.dispatched_customer_id) !== String(customerId)) {
+      const err = new Error("This product QR is assigned to another self-sale customer.");
+      err.statusCode = 403;
+      throw err;
+    }
+  }
+
   if (actingDealerId && row.dealer_id && String(row.dealer_id) !== String(actingDealerId)) {
     const err = new Error("This product QR is mapped to another dealer.");
     err.statusCode = 403;
     throw err;
   }
 
-  const warrantyDealerId = row.dealer_id || actingDealerId || null;
+  const warrantyDealerId = row.dispatched_customer_id ? null : (row.dealer_id || actingDealerId || null);
 
   const existing = await query(
     "SELECT * FROM warranties WHERE serial_id = ? ORDER BY created_at DESC LIMIT 1",
@@ -7980,14 +8026,18 @@ app.get("/serial-numbers/:serialNo", asyncRoute(async (req, res) => {
        d.dealer_no,
        d.name AS dealer_name,
        d.mobile AS dealer_mobile,
+       cust.name AS dispatched_customer_name,
+       cust.mobile AS dispatched_customer_mobile,
        w.warranty_no,
        w.status AS warranty_status,
+       w.customer_id AS warranty_customer_id,
        w.installation_status,
        w.start_date,
        w.expiry_date
      FROM serial_numbers s
      LEFT JOIN products p ON p.id = s.product_id
      LEFT JOIN dealers d ON d.id = s.dealer_id
+     LEFT JOIN customers cust ON cust.id = s.dispatched_customer_id
      LEFT JOIN warranties w ON w.serial_id = s.id
      WHERE LOWER(TRIM(s.serial_no)) = LOWER(TRIM(?))
      ORDER BY w.created_at DESC
@@ -8353,6 +8403,179 @@ app.post("/dispatch/to-dealer", asyncRoute(async (req, res) => {
   });
 }));
 
+app.post("/dispatch/to-self-sale-customer", asyncRoute(async (req, res) => {
+  await ensureSerialNumbersSchema();
+  await ensureProductsQrSchema();
+  await ensureDealerCreatedBySchema();
+  const customerId = cleanString(req.body.customerId || req.body.customer_id);
+  const categoryId = cleanString(req.body.categoryId || req.body.category_id);
+  const invoiceNo = cleanString(req.body.invoiceNo || req.body.invoice_no) || null;
+  const challanNo = cleanString(req.body.challanNo || req.body.challan_no) || null;
+  const dispatchDate = cleanDate(req.body.dispatchDate || req.body.dispatch_date);
+  const batchNo = cleanString(req.body.batchNo || req.body.batch_no) || `SSD-${Date.now()}`;
+
+  if (!customerId) {
+    return res.status(400).json({ error: "Select a self-sale customer to dispatch products." });
+  }
+
+  const customerResult = await query(
+    `SELECT c.id, c.name, c.mobile, c.created_by_dealer_id, COALESCE(u.status, 'Active') AS user_status
+     FROM customers c
+     LEFT JOIN users u ON u.id = c.user_id
+     WHERE c.id = ?
+     LIMIT 1`,
+    [customerId]
+  );
+  if (!customerResult.rowCount) {
+    return res.status(404).json({ error: "Customer not found." });
+  }
+  const customer = customerResult.rows[0];
+  if (customer.created_by_dealer_id) {
+    return res.status(400).json({ error: "Selected customer is not a self-sale customer. Choose a customer created via Self Sale." });
+  }
+  if (String(customer.user_status || "Active") !== "Active") {
+    return res.status(400).json({ error: "Selected self-sale customer account is not active." });
+  }
+
+  let dispatchItems = Array.isArray(req.body.items)
+    ? req.body.items
+        .map((item) => ({
+          productName: cleanString(item.productName || item.product_name || item.name),
+          quantity: Number(item.quantity),
+          installationRequired: parseInstallationRequired(
+            item.installationRequired ?? item.installation_required,
+            false
+          ),
+        }))
+        .filter((item) => item.productName && Number.isInteger(item.quantity) && item.quantity > 0)
+    : [];
+
+  let resolvedCategoryId = categoryId;
+
+  if (!dispatchItems.length) {
+    const productId = cleanString(req.body.productId || req.body.product_id);
+    const productName = cleanString(req.body.productName || req.body.product_name);
+    const modelNo = cleanString(req.body.modelNo || req.body.model_no);
+    const quantity = Number(req.body.quantity);
+    if (!productId && !productName && !modelNo) {
+      return res.status(400).json({ error: "Select a category and product quantities to dispatch." });
+    }
+    if (!Number.isInteger(quantity) || quantity < 1 || quantity > 500) {
+      return res.status(400).json({ error: "Quantity must be a whole number between 1 and 500." });
+    }
+    const product = await resolveProductFromMaster({ productId, productName, modelNo });
+    dispatchItems = [{
+      productName: product.name,
+      quantity,
+      installationRequired: parseInstallationRequired(
+        req.body.installationRequired ?? req.body.installation_required,
+        false
+      ),
+    }];
+    if (!resolvedCategoryId && product.category_id) {
+      resolvedCategoryId = cleanString(product.category_id);
+    }
+  }
+
+  if (!resolvedCategoryId) {
+    return res.status(400).json({ error: "Select a product category." });
+  }
+
+  const categoryResult = await query("SELECT id, name FROM product_categories WHERE id = ? LIMIT 1", [resolvedCategoryId]);
+  if (!categoryResult.rowCount) {
+    return res.status(404).json({ error: "Category not found." });
+  }
+
+  const totalRequested = dispatchItems.reduce((sum, item) => sum + item.quantity, 0);
+  if (totalRequested < 1 || totalRequested > 500) {
+    return res.status(400).json({ error: "Total dispatch quantity must be between 1 and 500." });
+  }
+
+  const dispatchedSerialNos = await withTransaction(async (tx) => {
+    const serialNos = [];
+    for (const item of dispatchItems) {
+      const units = await fetchAvailableSerialUnits({
+        categoryId: resolvedCategoryId,
+        productName: item.productName,
+        limit: item.quantity,
+        tx,
+      });
+      if (units.length < item.quantity) {
+        const err = new Error(
+          `Only ${units.length} unit(s) available for ${item.productName}. ${item.quantity} requested.`
+        );
+        err.statusCode = 409;
+        throw err;
+      }
+      for (const unit of units) {
+        const qrPayload = dispatchUnitQrPayload({
+          productId: unit.product_id,
+          productName: unit.product_name,
+          modelNo: unit.model_no,
+          serialNo: unit.serial_no,
+          customerId: customer.id,
+          customerName: customer.name,
+          customerMobile: customer.mobile,
+          dispatchType: "selfSale",
+        });
+        await tx(
+          `UPDATE serial_numbers
+           SET dispatched_customer_id = ?,
+               dealer_id = NULL,
+               invoice_no = ?,
+               challan_no = ?,
+               batch_no = ?,
+               dispatch_date = ?,
+               qr_status = 'Printed',
+               qr_payload = ?,
+               qr_printed_at = NOW(),
+               dispatch_status = 'Dispatched',
+               dispatched_at = NOW(),
+               installation_required = ?
+           WHERE id = ?`,
+          [
+            customer.id,
+            invoiceNo,
+            challanNo,
+            batchNo,
+            dispatchDate,
+            qrPayload,
+            item.installationRequired ? 1 : 0,
+            unit.id,
+          ]
+        );
+        serialNos.push(unit.serial_no);
+      }
+    }
+    return serialNos;
+  });
+
+  const detail = await query(
+    `SELECT s.*, p.name AS product_name, p.model_no, c.name AS customer_name, c.mobile AS customer_mobile
+     FROM serial_numbers s
+     LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN customers c ON c.id = s.dispatched_customer_id
+     WHERE s.batch_no = ?
+     ORDER BY s.serial_no ASC`,
+    [batchNo]
+  );
+
+  const productSummary = [...new Set(detail.rows.map((row) => row.product_name))].join(", ");
+  res.status(201).json({
+    batchNo,
+    dispatchType: "selfSale",
+    category: categoryResult.rows[0],
+    customer: { id: customer.id, name: customer.name, mobile: customer.mobile },
+    count: dispatchedSerialNos.length,
+    items: dispatchItems,
+    serials: detail.rows,
+    serialNumbers: detail.rows.map((row) => row.serial_no),
+    printSheetUrl: `/dispatch/qr-print-sheet?batchNo=${encodeURIComponent(batchNo)}`,
+    message: `${dispatchedSerialNos.length} QR code(s) generated for self-sale customer ${customer.name}. Customer can scan to activate warranty.`,
+    productSummary,
+  });
+}));
+
 app.get("/dispatch/dashboard", asyncRoute(async (_req, res) => {
   await ensureReplaceReturnSchema();
   const [
@@ -8448,12 +8671,16 @@ app.get("/dispatch/stock", asyncRoute(async (_req, res) => {
 }));
 
 app.get("/dispatch/batches", asyncRoute(async (_req, res) => {
+  await ensureSerialNumbersSchema();
   const result = await query(
     `SELECT
        s.batch_no,
        s.dealer_id,
        d.dealer_no,
        d.name AS dealer_name,
+       s.dispatched_customer_id,
+       c.name AS customer_name,
+       c.mobile AS customer_mobile,
        MIN(s.dispatch_date) AS dispatch_date,
        MAX(s.dispatched_at) AS dispatched_at,
        MAX(s.invoice_no) AS invoice_no,
@@ -8462,12 +8689,14 @@ app.get("/dispatch/batches", asyncRoute(async (_req, res) => {
        SUM(CASE WHEN s.qr_status = 'Printed' THEN 1 ELSE 0 END) AS qr_ready_count,
        GROUP_CONCAT(DISTINCT p.name ORDER BY p.name SEPARATOR ', ') AS product_summary
      FROM serial_numbers s
-     INNER JOIN dealers d ON d.id = s.dealer_id
+     LEFT JOIN dealers d ON d.id = s.dealer_id
+     LEFT JOIN customers c ON c.id = s.dispatched_customer_id
      LEFT JOIN products p ON p.id = s.product_id
      WHERE s.dispatch_status = 'Dispatched'
        AND s.batch_no IS NOT NULL
        AND TRIM(s.batch_no) <> ''
-     GROUP BY s.batch_no, s.dealer_id, d.dealer_no, d.name
+       AND (s.dealer_id IS NOT NULL OR s.dispatched_customer_id IS NOT NULL)
+     GROUP BY s.batch_no, s.dealer_id, d.dealer_no, d.name, s.dispatched_customer_id, c.name, c.mobile
      ORDER BY MAX(s.dispatched_at) DESC, s.batch_no DESC
      LIMIT 200`
   );
@@ -8502,9 +8731,13 @@ app.get("/dispatch/batches", asyncRoute(async (_req, res) => {
   res.json({
     batches: result.rows.map((row) => ({
       batchNo: row.batch_no,
+      dispatchType: row.dispatched_customer_id ? "selfSale" : "dealer",
       dealerId: row.dealer_id,
       dealerNo: row.dealer_no,
       dealerName: row.dealer_name,
+      customerId: row.dispatched_customer_id,
+      customerName: row.customer_name,
+      customerMobile: row.customer_mobile,
       dispatchDate: row.dispatch_date,
       dispatchedAt: row.dispatched_at,
       invoiceNo: row.invoice_no,
@@ -8538,10 +8771,12 @@ app.get("/dispatch/qr-print-sheet", asyncRoute(async (req, res) => {
     return res.status(400).json({ error: "batchNo or serials query is required." });
   }
   const result = await query(
-    `SELECT s.*, p.name AS product_name, p.model_no, d.dealer_no, d.name AS dealer_name
+    `SELECT s.*, p.name AS product_name, p.model_no, d.dealer_no, d.name AS dealer_name,
+            c.name AS customer_name, c.mobile AS customer_mobile
      FROM serial_numbers s
      LEFT JOIN products p ON p.id = s.product_id
      LEFT JOIN dealers d ON d.id = s.dealer_id
+     LEFT JOIN customers c ON c.id = s.dispatched_customer_id
      WHERE ${clauses.join(" AND ")}
      ORDER BY s.serial_no ASC
      LIMIT 500`,

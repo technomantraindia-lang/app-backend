@@ -121,6 +121,7 @@ CREATE TABLE IF NOT EXISTS serial_numbers (
   id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
   product_id CHAR(36),
   dealer_id CHAR(36),
+  dispatched_customer_id CHAR(36),
   serial_no VARCHAR(120) NOT NULL UNIQUE,
   invoice_no VARCHAR(120),
   challan_no VARCHAR(120),
