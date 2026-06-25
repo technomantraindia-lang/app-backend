@@ -7,6 +7,7 @@
     "dev": "node server.js",
     "migrate": "node migrate.js",
     "ensure-admin": "node ensure-admin.js",
+    "relink-dealer": "node relink-dealer.js",
     "start": "node server.js"
   },
   "dependencies": {

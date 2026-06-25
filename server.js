@@ -2,12 +2,16 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import crypto from "crypto";
+import path from "path";
+import { fileURLToPath } from "url";
 import { createRequire } from "module";
 import { query, withTransaction } from "./db.js";
 
 dotenv.config();
 
 const require = createRequire(import.meta.url);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const adminWebsitePath = path.join(__dirname, "..", "admin-website");
 const QRCode = require("qrcode-terminal/vendor/QRCode");
 const QRErrorCorrectLevel = require("qrcode-terminal/vendor/QRCode/QRErrorCorrectLevel");
 
@@ -16,6 +20,11 @@ const port = process.env.PORT || 4000;
 
 app.use(cors());
 app.use(express.json());
+
+app.use("/admin", express.static(adminWebsitePath));
+app.get("/admin", (_req, res) => {
+  res.redirect(301, "/admin/");
+});
 
 function hashPassword(password) {
   return crypto.createHash("sha256").update(String(password)).digest("hex");
@@ -156,9 +165,143 @@ async function findDealerForUser(userRow) {
   return dealer;
 }
 
+function parseDealerNoSequence(dealerNo) {
+  const match = String(dealerNo || "").match(/(\d+)/);
+  return match ? Number(match[1]) : Number.MAX_SAFE_INTEGER;
+}
+
+function normalizeDealerNoInput(value) {
+  const raw = cleanString(value);
+  if (!raw) {
+    return "";
+  }
+  if (/^DLR\d+$/i.test(raw)) {
+    return raw.toUpperCase();
+  }
+  if (/^\d+$/.test(raw)) {
+    return `DLR${String(Number(raw)).padStart(6, "0")}`;
+  }
+  return raw;
+}
+
+async function moveDealerForeignKeys(fromDealerId, toDealerId, runQuery = query) {
+  if (!fromDealerId || !toDealerId || fromDealerId === toDealerId) {
+    return;
+  }
+  const updates = [
+    ["serial_numbers", "dealer_id"],
+    ["warranties", "dealer_id"],
+    ["complaints", "dealer_id"],
+    ["customers", "created_by_dealer_id"],
+    ["technicians", "created_by_dealer_id"],
+    ["replace_return_cases", "dealer_id"],
+  ];
+  for (const [table, column] of updates) {
+    await runQuery(`UPDATE ${table} SET ${column} = ? WHERE ${column} = ?`, [toDealerId, fromDealerId]);
+  }
+}
+
+async function deleteDealerIfOrphan(dealerId, runQuery = query) {
+  const checks = await runQuery(
+    `SELECT
+       (SELECT COUNT(*) FROM serial_numbers WHERE dealer_id = ?) AS serials,
+       (SELECT COUNT(*) FROM warranties WHERE dealer_id = ?) AS warranties,
+       (SELECT COUNT(*) FROM complaints WHERE dealer_id = ?) AS complaints,
+       (SELECT COUNT(*) FROM customers WHERE created_by_dealer_id = ?) AS customers,
+       (SELECT COUNT(*) FROM technicians WHERE created_by_dealer_id = ?) AS technicians`,
+    [dealerId, dealerId, dealerId, dealerId, dealerId]
+  );
+  const row = checks.rows[0] || {};
+  const total =
+    Number(row.serials || 0) +
+    Number(row.warranties || 0) +
+    Number(row.complaints || 0) +
+    Number(row.customers || 0) +
+    Number(row.technicians || 0);
+  if (total > 0) {
+    return false;
+  }
+  await runQuery("DELETE FROM dealers WHERE id = ?", [dealerId]);
+  return true;
+}
+
+async function relinkDealerLoginToTarget(userRow, targetDealer, runQuery = query) {
+  if (!userRow?.id || !targetDealer?.id) {
+    return null;
+  }
+  const storedMobile = normalizeLoginMobile(userRow.mobile);
+  const linked = await findDealerForUser(userRow);
+  if (linked && linked.id !== targetDealer.id) {
+    await moveDealerForeignKeys(linked.id, targetDealer.id, runQuery);
+    await runQuery("UPDATE dealers SET user_id = NULL WHERE id = ?", [linked.id]);
+    await deleteDealerIfOrphan(linked.id, runQuery);
+  }
+  await runQuery(
+    `UPDATE dealers
+     SET user_id = ?,
+         mobile = ?,
+         name = COALESCE(NULLIF(name, ''), ?),
+         contact_person = COALESCE(NULLIF(contact_person, ''), ?),
+         status = COALESCE(NULLIF(status, ''), 'Active')
+     WHERE id = ?`,
+    [userRow.id, storedMobile, cleanString(userRow.name), cleanString(userRow.name), targetDealer.id]
+  );
+  const refreshed = await runQuery("SELECT * FROM dealers WHERE id = ? LIMIT 1", [targetDealer.id]);
+  return refreshed.rowCount ? refreshed.rows[0] : null;
+}
+
+/** Prefer the earliest dealer_no when duplicate profiles exist for the same dealer name. */
+async function repairPreferredDealerLinkForUser(userRow, runQuery = query) {
+  const cleanName = cleanString(userRow?.name);
+  if (!cleanName) {
+    return null;
+  }
+  const preferredResult = await runQuery(
+    `SELECT * FROM dealers WHERE LOWER(TRIM(name)) = LOWER(?) ORDER BY dealer_no ASC, created_at ASC`,
+    [cleanName]
+  );
+  if (!preferredResult.rowCount) {
+    return null;
+  }
+  const preferred = preferredResult.rows[0];
+  const linked = await findDealerForUser(userRow);
+  if (!linked) {
+    if (!preferred.user_id || String(preferred.user_id) === String(userRow.id)) {
+      return relinkDealerLoginToTarget(userRow, preferred, runQuery);
+    }
+    return null;
+  }
+  if (linked.id === preferred.id) {
+    return linked;
+  }
+  if (parseDealerNoSequence(preferred.dealer_no) < parseDealerNoSequence(linked.dealer_no)) {
+    return relinkDealerLoginToTarget(userRow, preferred, runQuery);
+  }
+  return linked;
+}
+
 /** Create dealer profile when login exists but dealers row is missing (legacy/orphan logins). */
 async function ensureDealerProfileForUser(userRow, runQuery = query) {
-  let existing = await findDealerForUser(userRow);
+  let existing = await repairPreferredDealerLinkForUser(userRow, runQuery);
+  if (!existing) {
+    existing = await findDealerForUser(userRow);
+  }
+  if (!existing) {
+    const cleanName = cleanString(userRow?.name);
+    const unlinked = cleanName
+      ? await runQuery(
+          `SELECT * FROM dealers
+           WHERE LOWER(TRIM(name)) = LOWER(?)
+             AND (user_id IS NULL OR user_id = '')
+           ORDER BY dealer_no ASC, created_at ASC
+           LIMIT 1`,
+          [cleanName]
+        )
+      : { rowCount: 0, rows: [] };
+    if (unlinked.rowCount) {
+      existing = await relinkDealerLoginToTarget(userRow, unlinked.rows[0], runQuery);
+    }
+  }
   if (existing) {
     const currentNo = cleanString(existing.dealer_no);
     if (!currentNo || currentNo === "Pending Dealer No") {
@@ -1977,10 +2120,7 @@ async function buildAuthLoginResponse(userRow, role) {
     technician = await findTechnicianForUser(userRow);
   }
   if (role === "Dealer") {
-    dealer = await findDealerForUser(userRow);
-    if (!dealer) {
-      dealer = await ensureDealerProfileForUser(userRow);
-    }
+    dealer = await ensureDealerProfileForUser(userRow);
   }
 
   return {
@@ -3654,6 +3794,52 @@ app.get("/dealers", asyncRoute(async (_req, res) => {
 
   dealers.sort((a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime());
   res.json({ dealers });
+}));
+
+app.post("/dealers/relink-login", asyncRoute(async (req, res) => {
+  await ensureDealersUserIdSchema();
+  const loginMobile = normalizeLoginMobile(req.body.loginMobile || req.body.mobile);
+  const userName = cleanString(req.body.name || req.body.userName);
+  const dealerNo = normalizeDealerNoInput(req.body.dealerNo || req.body.dealer_no || req.body.dealerNumber);
+
+  let userRow = null;
+  if (loginMobile.length === 10) {
+    const userResult = await query(
+      `SELECT * FROM users WHERE role = 'Dealer' AND RIGHT(${sqlNormalizeMobileColumn("mobile")}, 10) = ? LIMIT 1`,
+      [loginMobile]
+    );
+    userRow = userResult.rowCount ? userResult.rows[0] : null;
+  }
+  if (!userRow && userName) {
+    const userResult = await query(
+      "SELECT * FROM users WHERE role = 'Dealer' AND LOWER(TRIM(name)) = LOWER(?) LIMIT 1",
+      [userName]
+    );
+    userRow = userResult.rowCount ? userResult.rows[0] : null;
+  }
+  if (!userRow) {
+    return res.status(404).json({ error: "Dealer login not found." });
+  }
+  if (!dealerNo) {
+    return res.status(400).json({ error: "dealerNo is required (e.g. 1 or DLR000001)." });
+  }
+
+  const targetResult = await query(
+    "SELECT * FROM dealers WHERE LOWER(TRIM(dealer_no)) = LOWER(?) LIMIT 1",
+    [dealerNo]
+  );
+  if (!targetResult.rowCount) {
+    return res.status(404).json({ error: `Dealer profile ${dealerNo} not found.` });
+  }
+
+  const dealer = await relinkDealerLoginToTarget(userRow, targetResult.rows[0]);
+  if (!dealer) {
+    return res.status(500).json({ error: "Could not link dealer login." });
+  }
+  res.json({
+    dealer,
+    message: `Dealer login linked to ${dealer.dealer_no}.`,
+  });
 }));
 
 app.get("/dealers/by-user/:userId", asyncRoute(async (req, res) => {
@@ -9059,4 +9245,5 @@ try {
 
 app.listen(port, "0.0.0.0", () => {
   console.log(`Hitaishi CRM API listening on http://0.0.0.0:${port} (reachable from phone via your PC LAN IP)`);
+  console.log(`Admin website: http://localhost:${port}/admin/`);
 });
