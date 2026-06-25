@@ -2658,8 +2658,16 @@ app.post("/customers", asyncRoute(async (req, res) => {
 }));
 
 app.get("/customers", asyncRoute(async (_req, res) => {
-  await ensureCustomersVillageSchema();
+  let hasVillageColumn = true;
+  try {
+    await ensureCustomersVillageSchema();
+  } catch (err) {
+    console.warn("customers.village migration skipped:", err?.message || err);
+    hasVillageColumn = false;
+  }
   await syncCustomerProfilesFromUsers();
+  const villageSelect = hasVillageColumn ? "c.village" : "NULL AS village";
+  const villageGroup = hasVillageColumn ? "c.village," : "";
   const result = await query(
     `SELECT
        c.id,
@@ -2668,7 +2676,7 @@ app.get("/customers", asyncRoute(async (_req, res) => {
        c.mobile,
        c.address,
        c.city,
-       c.village,
+       ${villageSelect},
        c.state,
        c.pincode,
        c.created_at,
@@ -2687,7 +2695,7 @@ app.get("/customers", asyncRoute(async (_req, res) => {
        c.mobile,
        c.address,
        c.city,
-       c.village,
+       ${villageGroup}
        c.state,
        c.pincode,
        c.created_at,
@@ -2700,7 +2708,14 @@ app.get("/customers", asyncRoute(async (_req, res) => {
 }));
 
 app.get("/customers/by-mobile/:mobile", asyncRoute(async (req, res) => {
-  await ensureCustomersVillageSchema();
+  let hasVillageColumn = true;
+  try {
+    await ensureCustomersVillageSchema();
+  } catch (err) {
+    console.warn("customers.village migration skipped:", err?.message || err);
+    hasVillageColumn = false;
+  }
+  const villageSelect = hasVillageColumn ? "c.village" : "NULL AS village";
   const cleanMobile = normalizeMobileValue(req.params.mobile);
   if (cleanMobile.length < 10) {
     return res.status(400).json({ error: "Enter a valid 10-digit mobile number." });
@@ -2716,7 +2731,7 @@ app.get("/customers/by-mobile/:mobile", asyncRoute(async (req, res) => {
        c.mobile,
        c.address,
        c.city,
-       c.village,
+       ${villageSelect},
        c.state,
        c.pincode,
        c.created_at,
