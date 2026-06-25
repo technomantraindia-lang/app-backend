@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS customers (
   mobile VARCHAR(30) NOT NULL UNIQUE,
   address TEXT,
   city VARCHAR(120),
+  village VARCHAR(120),
   state VARCHAR(120),
   pincode VARCHAR(20),
   created_by_dealer_id CHAR(36),

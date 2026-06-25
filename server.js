@@ -36,6 +36,7 @@ const accountCreatorRoles = ["Admin", "Dealer"];
 const customerOnlyAccountCreators = ["Front Desk"];
 const dealerCreatableRoles = ["Customer", "Technician"];
 const loginOtpChallenges = new Map();
+const selfSaleOtpChallenges = new Map();
 const LOGIN_OTP_TTL_MS = 5 * 60 * 1000;
 
 function normalizeEmail(email) {
@@ -252,6 +253,14 @@ async function findTechnicianForUser(userRow) {
 
 function cleanString(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function purgeExpiredOtpChallenges(store) {
+  for (const [key, value] of store.entries()) {
+    if (Date.now() > value.expiresAt) {
+      store.delete(key);
+    }
+  }
 }
 
 /** 0 = no warranty period (product treated as expired). Years input is converted to months. */
@@ -1426,6 +1435,10 @@ async function ensureDealerCreatedBySchema() {
   }
 }
 
+async function ensureCustomersVillageSchema() {
+  await ensureTableColumn("customers", "village", "ALTER TABLE customers ADD COLUMN village VARCHAR(120) NULL AFTER city");
+}
+
 async function ensureTasksSchema() {
   const columns = [
     ["completed_at", "ALTER TABLE tasks ADD COLUMN completed_at TIMESTAMP NULL AFTER status"],
@@ -2031,7 +2044,119 @@ app.post("/auth/verify-otp", asyncRoute(async (req, res) => {
   res.json(await buildAuthLoginResponse(result.rows[0], challenge.role));
 }));
 
-/** Customer / Technician: logged-in profile — change login password after verifying old one. */
+app.post("/admin/self-sale/request-otp", asyncRoute(async (req, res) => {
+  await ensureCustomersVillageSchema();
+  const name = cleanString(req.body.name);
+  const mobile = normalizeMobileValue(req.body.mobile);
+  const city = cleanString(req.body.city);
+  const village = cleanString(req.body.village);
+  const pincode = cleanString(req.body.pincode);
+
+  if (!name || !mobile || !city || !village || !pincode) {
+    return res.status(400).json({ error: "Customer name, phone number, city, village and pin code are required." });
+  }
+  if (mobile.length < 10) {
+    return res.status(400).json({ error: "Enter a valid mobile number." });
+  }
+
+  const existingUser = await query("SELECT id FROM users WHERE mobile = ? LIMIT 1", [mobile]);
+  if (existingUser.rowCount) {
+    return res.status(409).json({ error: "This mobile number already has a login account." });
+  }
+  const existingCustomer = await query("SELECT id FROM customers WHERE mobile = ? LIMIT 1", [mobile]);
+  if (existingCustomer.rowCount) {
+    return res.status(409).json({ error: "This mobile number already has a customer profile." });
+  }
+
+  const otp = String(crypto.randomInt(100000, 1000000));
+  const token = crypto.randomUUID();
+  purgeExpiredOtpChallenges(selfSaleOtpChallenges);
+  selfSaleOtpChallenges.set(token, {
+    payload: { name, mobile, city, village, pincode },
+    otp,
+    attempts: 0,
+    expiresAt: Date.now() + LOGIN_OTP_TTL_MS,
+  });
+
+  let smsResult;
+  try {
+    smsResult = await sendLoginOtpSms(mobile, otp);
+  } catch (err) {
+    selfSaleOtpChallenges.delete(token);
+    throw err;
+  }
+
+  res.json({
+    token,
+    expiresInSeconds: Math.floor(LOGIN_OTP_TTL_MS / 1000),
+    message: smsResult.sent
+      ? "OTP sent to customer mobile number."
+      : "SMS gateway is not configured. Use development OTP for testing.",
+    smsSent: Boolean(smsResult.sent),
+    devOtp: smsResult.sent ? undefined : otp,
+  });
+}));
+
+app.post("/admin/self-sale/verify-otp", asyncRoute(async (req, res) => {
+  await ensureCustomersVillageSchema();
+  const token = cleanString(req.body.token);
+  const otp = normalizeMobileValue(req.body.otp);
+  const challenge = selfSaleOtpChallenges.get(token);
+  if (!token || !challenge) {
+    return res.status(400).json({ error: "OTP session expired. Send OTP again." });
+  }
+  if (Date.now() > challenge.expiresAt) {
+    selfSaleOtpChallenges.delete(token);
+    return res.status(400).json({ error: "OTP expired. Send OTP again." });
+  }
+  if (challenge.attempts >= 5) {
+    selfSaleOtpChallenges.delete(token);
+    return res.status(429).json({ error: "Too many wrong OTP attempts. Send OTP again." });
+  }
+  if (otp !== challenge.otp) {
+    challenge.attempts += 1;
+    return res.status(401).json({ error: "Invalid OTP." });
+  }
+
+  const { name, mobile, city, village, pincode } = challenge.payload;
+  const created = await withTransaction(async (run) => {
+    const existingUser = await run("SELECT id FROM users WHERE mobile = ? LIMIT 1", [mobile]);
+    if (existingUser.rowCount) {
+      const err = new Error("This mobile number already has a login account.");
+      err.statusCode = 409;
+      throw err;
+    }
+    const existingCustomer = await run("SELECT id FROM customers WHERE mobile = ? LIMIT 1", [mobile]);
+    if (existingCustomer.rowCount) {
+      const err = new Error("This mobile number already has a customer profile.");
+      err.statusCode = 409;
+      throw err;
+    }
+
+    const userId = crypto.randomUUID();
+    const customerId = crypto.randomUUID();
+    await run(
+      "INSERT INTO users (id, role, name, mobile, email, password_hash, status) VALUES (?, 'Customer', ?, ?, NULL, NULL, 'Active')",
+      [userId, name, mobile]
+    );
+    await run(
+      "INSERT INTO customers (id, user_id, name, mobile, address, city, village, state, pincode, created_by_dealer_id) VALUES (?, ?, ?, ?, NULL, ?, ?, NULL, ?, NULL)",
+      [customerId, userId, name, mobile, city, village, pincode]
+    );
+
+    const userResult = await run("SELECT * FROM users WHERE id = ? LIMIT 1", [userId]);
+    const customerResult = await run("SELECT * FROM customers WHERE id = ? LIMIT 1", [customerId]);
+    return { user: publicUser(userResult.rows[0]), customer: customerResult.rows[0] };
+  });
+
+  selfSaleOtpChallenges.delete(token);
+  res.status(201).json({
+    ...created,
+    message: "Customer mobile verified and self-sale account created.",
+  });
+}));
+
+/** Customer / Technician: logged-in profile - change login password after verifying old one. */
 app.post("/auth/change-password", asyncRoute(async (req, res) => {
   const { userId, role, email, oldPassword, newPassword } = req.body;
   const emailTrim = typeof email === "string" ? email.trim().toLowerCase() : "";
@@ -2533,6 +2658,7 @@ app.post("/customers", asyncRoute(async (req, res) => {
 }));
 
 app.get("/customers", asyncRoute(async (_req, res) => {
+  await ensureCustomersVillageSchema();
   await syncCustomerProfilesFromUsers();
   const result = await query(
     `SELECT
@@ -2542,6 +2668,7 @@ app.get("/customers", asyncRoute(async (_req, res) => {
        c.mobile,
        c.address,
        c.city,
+       c.village,
        c.state,
        c.pincode,
        c.created_at,
@@ -2560,6 +2687,7 @@ app.get("/customers", asyncRoute(async (_req, res) => {
        c.mobile,
        c.address,
        c.city,
+       c.village,
        c.state,
        c.pincode,
        c.created_at,
@@ -2572,6 +2700,7 @@ app.get("/customers", asyncRoute(async (_req, res) => {
 }));
 
 app.get("/customers/by-mobile/:mobile", asyncRoute(async (req, res) => {
+  await ensureCustomersVillageSchema();
   const cleanMobile = normalizeMobileValue(req.params.mobile);
   if (cleanMobile.length < 10) {
     return res.status(400).json({ error: "Enter a valid 10-digit mobile number." });
@@ -2587,6 +2716,7 @@ app.get("/customers/by-mobile/:mobile", asyncRoute(async (req, res) => {
        c.mobile,
        c.address,
        c.city,
+       c.village,
        c.state,
        c.pincode,
        c.created_at,
@@ -8476,6 +8606,7 @@ app.use((error, _req, res, _next) => {
 
 try {
   await ensureSerialNumbersSchema();
+  await ensureCustomersVillageSchema();
   await ensureProductCategoriesSchema();
   await ensureProductsQrSchema();
   await ensureComplaintsSchema();
