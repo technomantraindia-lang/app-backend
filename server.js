@@ -1111,6 +1111,7 @@ function productCopyKeys(row) {
 
 function buildWarrantyQrLabel({ payload, title = "PLEASE REGISTER", qrUrl = "", serial = "", model = "", product = "" }) {
   return `
+    <div class="label-print-slot">
     <section class="warranty-label">
       <div class="label-main">
         <header class="label-header">
@@ -1155,7 +1156,8 @@ function buildWarrantyQrLabel({ payload, title = "PLEASE REGISTER", qrUrl = "", 
       <div class="print-meta">
         ${escapeHtml([product, model, serial].filter(Boolean).join(" | "))}
       </div>
-    </section>`;
+    </section>
+    </div>`;
 }
 
 function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1, copiesByProduct = new Map()) {
@@ -1203,15 +1205,37 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
 <head>
   <meta charset="utf-8" />
   <title>${escapeHtml(title)}</title>
+  <style id="pageSizeStyle">@page { size: 60mm 40mm; margin: 0; }</style>
   <style>
-    @page { size: 60mm 40mm; margin: 0; }
     * { box-sizing: border-box; }
     html, body { margin: 0; padding: 0; background: #f3f4f6; color: #050505; }
     body { font-family: Arial, Helvetica, sans-serif; }
     .toolbar { padding: 12px 16px; border-bottom: 1px solid #d1d5db; }
-    .toolbar button { padding: 8px 14px; font-size: 14px; cursor: pointer; }
-    .hint { font-size: 12px; color: #4b5563; margin-top: 6px; max-width: 720px; line-height: 1.45; }
+    .toolbar-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+    .toolbar label { font-size: 14px; font-weight: 700; }
+    .toolbar select { min-height: 36px; padding: 6px 10px; font-size: 14px; border: 1px solid #9ca3af; border-radius: 6px; background: #fff; }
+    .toolbar button { padding: 8px 14px; font-size: 14px; cursor: pointer; border: 1px solid #111; border-radius: 6px; background: #111; color: #fff; font-weight: 700; }
+    .hint { font-size: 12px; color: #4b5563; margin-top: 8px; max-width: 760px; line-height: 1.45; }
     main { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 10px 0; }
+    .label-print-slot {
+      overflow: hidden;
+      margin: 0 auto;
+      page-break-after: always;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .label-print-slot:last-child { page-break-after: auto; }
+    body[data-rotate="0"] .label-print-slot,
+    body[data-rotate="180"] .label-print-slot {
+      width: 60mm;
+      height: 40mm;
+    }
+    body[data-rotate="90"] .label-print-slot,
+    body[data-rotate="270"] .label-print-slot {
+      width: 40mm;
+      height: 60mm;
+    }
     .warranty-label {
       position: relative;
       width: 60mm;
@@ -1221,9 +1245,13 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
       border: 0.18mm solid #181818;
       border-radius: 2mm;
       box-shadow: 0 1mm 3.2mm rgba(0, 0, 0, 0.18);
-      page-break-after: always;
+      flex-shrink: 0;
+      transform-origin: center center;
     }
-    .warranty-label:last-child { page-break-after: auto; }
+    body[data-rotate="0"] .warranty-label { transform: rotate(0deg); }
+    body[data-rotate="90"] .warranty-label { transform: rotate(90deg); }
+    body[data-rotate="180"] .warranty-label { transform: rotate(180deg); }
+    body[data-rotate="270"] .warranty-label { transform: rotate(270deg); }
     .label-main {
       height: 31.85mm;
       display: grid;
@@ -1435,27 +1463,109 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
     .empty-state { padding: 16px; color: #374151; }
     @media print {
       .toolbar { display: none; }
-      html, body { width: 60mm; min-height: 40mm; margin: 0; padding: 0; background: #fff; }
       main { display: block; }
-      .warranty-label {
+      body[data-rotate="0"] html, body[data-rotate="0"] body,
+      body[data-rotate="180"] html, body[data-rotate="180"] body {
+        width: 60mm; min-height: 40mm; margin: 0; padding: 0; background: #fff;
+      }
+      body[data-rotate="90"] html, body[data-rotate="90"] body,
+      body[data-rotate="270"] html, body[data-rotate="270"] body {
+        width: 40mm; min-height: 60mm; margin: 0; padding: 0; background: #fff;
+      }
+      .label-print-slot {
         margin: 0 auto;
+        page-break-after: always;
+        break-after: page;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .label-print-slot:last-child { page-break-after: auto; break-after: auto; }
+      body[data-rotate="0"] .label-print-slot,
+      body[data-rotate="180"] .label-print-slot { width: 60mm; height: 40mm; }
+      body[data-rotate="90"] .label-print-slot,
+      body[data-rotate="270"] .label-print-slot { width: 40mm; height: 60mm; }
+      .warranty-label {
+        margin: 0;
         width: 60mm;
         height: 40mm;
         box-shadow: none;
         border-radius: 2mm;
-        page-break-after: always;
-        break-after: page;
+        transform-origin: center center;
       }
-      .warranty-label:last-child { page-break-after: auto; break-after: auto; }
+      body[data-rotate="0"] .warranty-label { transform: rotate(0deg); }
+      body[data-rotate="90"] .warranty-label { transform: rotate(90deg); }
+      body[data-rotate="180"] .warranty-label { transform: rotate(180deg); }
+      body[data-rotate="270"] .warranty-label { transform: rotate(270deg); }
     }
   </style>
 </head>
-<body>
+<body data-rotate="0">
   <div class="toolbar">
-    <button onclick="window.print()">Print / Save as PDF</button>
-    <div class="hint">60×40mm horizontal label (Zenpert 4T200). Print: paper 60mm×40mm, Scale 100%, margins none, headers/footers off.</div>
+    <div class="toolbar-row">
+      <label for="labelRotation">Label rotation</label>
+      <select id="labelRotation" aria-label="Label rotation">
+        <option value="0" selected>0° — Normal (60×40 horizontal)</option>
+        <option value="90">90° — Clockwise (40×60 vertical)</option>
+        <option value="180">180° — Upside down</option>
+        <option value="270">270° — Counter-clockwise</option>
+      </select>
+      <button id="printBtn" type="button">Print / Save as PDF</button>
+    </div>
+    <div class="hint" id="rotationHint">0° Normal — 60×40mm page. Print Scale 100%, margins none, headers/footers off.</div>
   </div>
   <main>${pageHtml || '<p class="empty-state">No QR codes found for this dispatch.</p>'}</main>
+  <script>
+    (function () {
+      var select = document.getElementById("labelRotation");
+      var hint = document.getElementById("rotationHint");
+      var pageStyle = document.getElementById("pageSizeStyle");
+      var hints = {
+        "0": "0° Normal — page 60×40mm. Label as designed (wide). Zenpert 4T200: Scale 100%, margins none.",
+        "90": "90° Clockwise — page 40×60mm. Label rotated right. Use if printer feeds tall labels.",
+        "180": "180° Upside down — page 60×40mm. Label flipped. Use if print comes inverted.",
+        "270": "270° Counter-clockwise — page 40×60mm. Label rotated left."
+      };
+      function normalizeRotation(value) {
+        var num = Number.parseInt(String(value || "0"), 10);
+        if (num === 90 || num === 180 || num === 270) return String(num);
+        return "0";
+      }
+      function applyRotation(value) {
+        var rotate = normalizeRotation(value);
+        document.body.dataset.rotate = rotate;
+        if (pageStyle) {
+          pageStyle.textContent = (rotate === "90" || rotate === "270")
+            ? "@page { size: 40mm 60mm; margin: 0; }"
+            : "@page { size: 60mm 40mm; margin: 0; }";
+        }
+        if (hint) hint.textContent = hints[rotate] || hints["0"];
+        try { localStorage.setItem("hitaishi.labelRotate", rotate); } catch (e) {}
+      }
+      var saved = "";
+      try {
+        saved = localStorage.getItem("hitaishi.labelRotate")
+          || (localStorage.getItem("hitaishi.labelOrient") === "vertical" ? "90" : "0")
+          || "";
+      } catch (e) {}
+      var params = new URLSearchParams(window.location.search);
+      var initial = params.get("rotate") || params.get("orient") || saved || "0";
+      if (initial === "vertical") initial = "90";
+      if (initial === "horizontal") initial = "0";
+      if (select) {
+        select.value = normalizeRotation(initial);
+        applyRotation(select.value);
+        select.addEventListener("change", function () { applyRotation(select.value); });
+      }
+      var printBtn = document.getElementById("printBtn");
+      if (printBtn) {
+        printBtn.addEventListener("click", function () {
+          applyRotation(select ? select.value : "0");
+          window.print();
+        });
+      }
+    })();
+  </script>
 </body>
 </html>`;
 }
