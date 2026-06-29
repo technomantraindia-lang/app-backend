@@ -1097,6 +1097,56 @@ function productCopyKeys(row) {
   ].filter(Boolean);
 }
 
+function buildWarrantyQrLabel({ payload, title = "PLEASE REGISTER", qrUrl = "", serial = "", model = "", product = "" }) {
+  return `
+    <section class="warranty-label">
+      <div class="label-main">
+        <div class="label-copy">
+          <header class="label-header">
+            <div class="headline">${escapeHtml(title)}</div>
+            <div class="subhead">to activate warranty</div>
+          </header>
+          <div class="rule"></div>
+          <div class="scan-row">
+            <div class="scan-icon person-icon" aria-hidden="true">
+              <span></span>
+            </div>
+            <div>
+              <div class="scan-title">DEALER SCAN</div>
+              <div class="scan-text">Dealer scans to activate warranty</div>
+            </div>
+          </div>
+          <div class="rule"></div>
+          <div class="scan-row">
+            <div class="scan-icon group-icon" aria-hidden="true">
+              <span></span><span></span>
+            </div>
+            <div>
+              <div class="scan-title">CUSTOMER SCAN</div>
+              <div class="scan-text">If dealer does not scan, customer can scan to activate warranty</div>
+            </div>
+          </div>
+        </div>
+        <div class="qr-panel">
+          <div class="qr-wrap">
+            ${qrSvg(payload, 220)}
+            <div class="qr-shield" aria-hidden="true"></div>
+          </div>
+          <a class="download" href="${escapeHtml(qrUrl)}">Download QR</a>
+        </div>
+      </div>
+      <footer class="label-footer">
+        <div class="footer-mark" aria-hidden="true"></div>
+        <div class="footer-warning">DON'T BUY IF DON'T SCAN</div>
+        <div class="footer-divider"></div>
+        <div class="footer-brand">HITAISHI TECHNOLOGIES PVT. LTD.</div>
+      </footer>
+      <div class="print-meta">
+        ${escapeHtml([product, model, serial].filter(Boolean).join(" | "))}
+      </div>
+    </section>`;
+}
+
 function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1, copiesByProduct = new Map()) {
   const labelCopies = parseQrLabelCopies(copies);
   const printRows = [];
@@ -1109,46 +1159,31 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
       printRows.push(row);
     }
   });
-  const pages = [];
-  for (let index = 0; index < printRows.length; index += 2) {
-    pages.push(printRows.slice(index, index + 2));
-  }
-  const pageHtml = pages
-    .map((chunk) => {
-      const cells = [];
-      for (let slot = 0; slot < 2; slot += 1) {
-        const serial = chunk[slot];
-        if (!serial) {
-          cells.push('<div class="label empty"></div>');
-          continue;
-        }
-        const payload =
-          serial.qr_payload ||
-          dispatchUnitQrPayload({
-            productId: serial.product_id,
-            productName: serial.product_name,
-            modelNo: serial.model_no,
-            serialNo: serial.serial_no,
-            dealerId: serial.dealer_id,
-            dealerNo: serial.dealer_no,
-            dealerName: serial.dealer_name,
-            customerId: serial.dispatched_customer_id,
-            customerName: serial.customer_name,
-            customerMobile: serial.customer_mobile,
-            dispatchType: serial.dispatched_customer_id ? "selfSale" : "",
-          });
-        const qrUrl = `/serial-numbers/${encodeURIComponent(serial.serial_no)}/qr.svg?download=1`;
-        cells.push(`
-          <div class="label">
-            <div class="qr">${qrSvg(payload, 96)}</div>
-            <div class="brand">Hitaishi CRM</div>
-            <div class="product">${escapeHtml(serial.product_name || "Product")}</div>
-            <div class="serial">${escapeHtml(serial.serial_no)}</div>
-            <div class="meta">${escapeHtml(serial.model_no || "")}</div>
-            <a class="download" href="${qrUrl}">Download QR</a>
-          </div>`);
-      }
-      return `<section class="roll-row">${cells.join("")}</section>`;
+  const pageHtml = printRows
+    .map((serial) => {
+      const payload =
+        serial.qr_payload ||
+        dispatchUnitQrPayload({
+          productId: serial.product_id,
+          productName: serial.product_name,
+          modelNo: serial.model_no,
+          serialNo: serial.serial_no,
+          dealerId: serial.dealer_id,
+          dealerNo: serial.dealer_no,
+          dealerName: serial.dealer_name,
+          customerId: serial.dispatched_customer_id,
+          customerName: serial.customer_name,
+          customerMobile: serial.customer_mobile,
+          dispatchType: serial.dispatched_customer_id ? "selfSale" : "",
+        });
+      const qrUrl = `/serial-numbers/${encodeURIComponent(serial.serial_no)}/qr.svg?download=1`;
+      return buildWarrantyQrLabel({
+        payload,
+        qrUrl,
+        serial: serial.serial_no,
+        model: serial.model_no,
+        product: serial.product_name || "Product",
+      });
     })
     .join("");
 
@@ -1158,61 +1193,242 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
   <meta charset="utf-8" />
   <title>${escapeHtml(title)}</title>
   <style>
-    @page { size: 2in 2in; margin: 0; }
+    @page { size: 60mm 40mm; margin: 0; }
     * { box-sizing: border-box; }
-    body { font-family: Arial, sans-serif; margin: 0; color: #111827; background: #fff; }
+    html, body { margin: 0; padding: 0; background: #f3f4f6; color: #050505; }
+    body { font-family: Arial, Helvetica, sans-serif; }
     .toolbar { padding: 12px 16px; border-bottom: 1px solid #d1d5db; }
     .toolbar button { padding: 8px 14px; font-size: 14px; cursor: pointer; }
     .hint { font-size: 12px; color: #4b5563; margin-top: 6px; }
-    main { display: flex; flex-direction: column; align-items: center; }
-    .roll-row {
-      width: 2in;
-      height: 2in;
-      margin: 10px auto;
-      display: grid;
-      grid-template-columns: repeat(2, 1in);
-      grid-template-rows: 2in;
-      gap: 0;
+    main { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 10px 0; }
+    .warranty-label {
+      position: relative;
+      width: 60mm;
+      height: 40mm;
+      overflow: hidden;
+      background: #fff;
+      border: 0.28mm solid #111;
+      border-radius: 1.8mm;
+      box-shadow: 0 1mm 3mm rgba(0, 0, 0, 0.16);
       page-break-after: always;
     }
-    .roll-row:last-child { page-break-after: auto; }
-    .label {
-      width: 1in;
-      height: 2in;
-      padding: 0.06in 0.04in;
-      text-align: center;
+    .warranty-label:last-child { page-break-after: auto; }
+    .label-main {
+      height: 33.1mm;
+      display: grid;
+      grid-template-columns: 33.5mm 1fr;
+      column-gap: 1.6mm;
+      padding: 2.2mm 2.4mm 1.5mm 3mm;
+    }
+    .label-copy { min-width: 0; }
+    .label-header { line-height: 1; }
+    .headline {
+      font-size: 4.55mm;
+      line-height: 0.9;
+      font-weight: 900;
+      letter-spacing: 0;
+      white-space: nowrap;
+    }
+    .subhead {
+      margin-top: 0.6mm;
+      font-size: 2.7mm;
+      line-height: 1;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+    .rule { height: 0.25mm; background: #111; margin: 2.05mm 0 1.65mm; }
+    .scan-row {
       display: flex;
-      flex-direction: column;
+      align-items: center;
+      gap: 1.8mm;
+      min-height: 8.2mm;
+    }
+    .scan-icon {
+      position: relative;
+      flex: 0 0 7.3mm;
+      width: 7.3mm;
+      height: 7.3mm;
+      border-radius: 50%;
+      background: #050505;
+    }
+    .scan-icon:before {
+      content: "";
+      position: absolute;
+      left: 2.25mm;
+      top: 1.35mm;
+      width: 2.8mm;
+      height: 2.8mm;
+      border-radius: 50%;
+      background: #fff;
+    }
+    .scan-icon:after {
+      content: "";
+      position: absolute;
+      left: 1.55mm;
+      top: 4.35mm;
+      width: 4.2mm;
+      height: 1.75mm;
+      border-radius: 2mm 2mm 0.45mm 0.45mm;
+      background: #fff;
+    }
+    .group-icon span:first-child:before,
+    .group-icon span:first-child:after,
+    .group-icon span:nth-child(2):before,
+    .group-icon span:nth-child(2):after {
+      content: "";
+      position: absolute;
+      background: #fff;
+    }
+    .group-icon:before,
+    .group-icon:after { display: none; }
+    .group-icon span:first-child:before {
+      left: 1.35mm;
+      top: 1.65mm;
+      width: 2.3mm;
+      height: 2.3mm;
+      border-radius: 50%;
+    }
+    .group-icon span:first-child:after {
+      left: 0.8mm;
+      top: 4.35mm;
+      width: 3.8mm;
+      height: 1.55mm;
+      border-radius: 2mm 2mm 0.45mm 0.45mm;
+    }
+    .group-icon span:nth-child(2):before {
+      left: 3.55mm;
+      top: 1.55mm;
+      width: 2.25mm;
+      height: 2.25mm;
+      border-radius: 50%;
+    }
+    .group-icon span:nth-child(2):after {
+      left: 3.1mm;
+      top: 4.15mm;
+      width: 3.7mm;
+      height: 1.55mm;
+      border-radius: 2mm 2mm 0.45mm 0.45mm;
+    }
+    .scan-title {
+      font-size: 2.45mm;
+      line-height: 1;
+      font-weight: 900;
+      letter-spacing: 0;
+      white-space: nowrap;
+    }
+    .scan-text {
+      margin-top: 0.75mm;
+      font-size: 2mm;
+      line-height: 1.12;
+      font-weight: 700;
+    }
+    .qr-panel {
+      display: flex;
       align-items: center;
       justify-content: center;
-      break-inside: avoid;
-      overflow: hidden;
-      border: 1px dashed #cbd5e1;
+      min-width: 0;
     }
-    .label.empty { visibility: hidden; }
-    .qr svg { width: 0.74in; height: 0.74in; display: block; }
-    .brand { font-weight: 700; font-size: 7px; line-height: 1.05; margin-top: 0.025in; max-width: 0.9in; }
-    .product { font-size: 7.5px; font-weight: 800; line-height: 1.05; margin-top: 0.025in; max-width: 0.9in; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow-wrap: anywhere; }
-    .serial { font-size: 7px; font-weight: 800; line-height: 1.05; margin-top: 0.025in; max-width: 0.9in; overflow-wrap: anywhere; }
-    .meta { font-size: 6.5px; color: #374151; line-height: 1.05; margin-top: 0.018in; max-width: 0.9in; overflow-wrap: anywhere; }
-    .download { display: inline-block; margin-top: 4px; color: #0f3f6b; font-size: 9px; text-decoration: none; }
+    .qr-wrap {
+      position: relative;
+      width: 22.8mm;
+      height: 22.8mm;
+      border: 0.35mm solid #111;
+      border-radius: 1.2mm;
+      padding: 1.1mm;
+      background: #fff;
+      overflow: hidden;
+    }
+    .qr-wrap svg { width: 100%; height: 100%; display: block; }
+    .qr-shield {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 5.8mm;
+      height: 6.7mm;
+      transform: translate(-50%, -50%);
+      background: #050505;
+      clip-path: polygon(50% 0, 92% 14%, 86% 68%, 50% 100%, 14% 68%, 8% 14%);
+    }
+    .qr-shield:after {
+      content: "";
+      position: absolute;
+      left: 1.95mm;
+      top: 2.45mm;
+      width: 2mm;
+      height: 1.05mm;
+      border-left: 0.6mm solid #fff;
+      border-bottom: 0.6mm solid #fff;
+      transform: rotate(-45deg);
+    }
+    .label-footer {
+      height: 6.9mm;
+      display: flex;
+      align-items: center;
+      gap: 1.6mm;
+      padding: 0 3mm;
+      background: #050505;
+      color: #fff;
+      font-weight: 900;
+      white-space: nowrap;
+    }
+    .footer-mark {
+      position: relative;
+      flex: 0 0 4.6mm;
+      width: 4.6mm;
+      height: 5.1mm;
+      border: 0.45mm solid #fff;
+      border-radius: 1mm 1mm 1.7mm 1.7mm;
+      clip-path: polygon(50% 0, 100% 18%, 88% 74%, 50% 100%, 12% 74%, 0 18%);
+    }
+    .footer-mark:after {
+      content: "";
+      position: absolute;
+      left: 1.3mm;
+      top: 1.65mm;
+      width: 1.65mm;
+      height: 0.85mm;
+      border-left: 0.35mm solid #fff;
+      border-bottom: 0.35mm solid #fff;
+      transform: rotate(-45deg);
+    }
+    .footer-warning { font-size: 2.1mm; }
+    .footer-divider { height: 4.6mm; width: 0.25mm; background: rgba(255, 255, 255, 0.9); }
+    .footer-brand { font-size: 1.95mm; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+    .print-meta {
+      position: absolute;
+      left: 3mm;
+      right: 3mm;
+      bottom: 7.1mm;
+      color: transparent;
+      font-size: 1.4mm;
+      line-height: 1;
+      white-space: nowrap;
+      overflow: hidden;
+    }
+    .download { position: absolute; left: -9999px; }
+    .empty-state { padding: 16px; color: #374151; }
     @media print {
       .toolbar { display: none; }
-      .download { display: none; }
-      html, body { width: 2in; min-height: 2in; margin: 0; padding: 0; }
+      html, body { width: 60mm; min-height: 40mm; margin: 0; padding: 0; background: #fff; }
       main { display: block; }
-      .roll-row { margin: 0; width: 2in; height: 2in; page-break-after: always; break-after: page; }
-      .roll-row:last-child { page-break-after: auto; break-after: auto; }
-      .label { border: 0; }
+      .warranty-label {
+        margin: 0;
+        width: 60mm;
+        height: 40mm;
+        box-shadow: none;
+        page-break-after: always;
+        break-after: page;
+      }
+      .warranty-label:last-child { page-break-after: auto; break-after: auto; }
     }
   </style>
 </head>
 <body>
   <div class="toolbar">
     <button onclick="window.print()">Print / Save as PDF</button>
-    <div class="hint">Thermal 2-UP label layout: each sticker is 2 inch height x 1 inch width. Disable browser headers/footers and use zero/minimum margins.</div>
+    <div class="hint">60mm x 40mm warranty QR label. Disable browser headers/footers and use zero/minimum margins.</div>
   </div>
-  <main>${pageHtml || "<p>No QR codes found for this dispatch.</p>"}</main>
+  <main>${pageHtml || '<p class="empty-state">No QR codes found for this dispatch.</p>'}</main>
 </body>
 </html>`;
 }
