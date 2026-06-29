@@ -1141,7 +1141,6 @@ function buildWarrantyQrLabel({ payload, title = "PLEASE REGISTER", qrUrl = "", 
         <div class="qr-panel">
           <div class="qr-wrap">
             ${qrSvg(payload, 220)}
-            <div class="qr-shield" aria-hidden="true"></div>
           </div>
           <a class="download" href="${escapeHtml(qrUrl)}">Download QR</a>
         </div>
@@ -1218,47 +1217,47 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
       height: 4cm;
       overflow: hidden;
       background: #fff;
-      border: 0.18mm solid #111;
-      border-radius: 1.5mm;
-      box-shadow: 0 1mm 3mm rgba(0, 0, 0, 0.16);
+      border: 0.16mm solid #181818;
+      border-radius: 1.35mm;
+      box-shadow: 0 1mm 3mm rgba(0, 0, 0, 0.18);
       page-break-after: always;
     }
     .warranty-label:last-child { page-break-after: auto; }
     .label-main {
-      height: 32.7mm;
+      height: 32.25mm;
       display: grid;
-      grid-template-columns: 34.2mm 1fr;
-      column-gap: 1.2mm;
-      padding: 2.05mm 2mm 1.25mm 2.8mm;
+      grid-template-columns: 33.5mm 1fr;
+      column-gap: 1.55mm;
+      padding: 2.2mm 2.25mm 1.15mm 3mm;
     }
     .label-copy { min-width: 0; }
     .label-header { line-height: 1; }
     .headline {
-      font-size: 4.8mm;
-      line-height: 0.86;
+      font-size: 4.9mm;
+      line-height: 0.88;
       font-weight: 900;
       letter-spacing: 0;
       white-space: nowrap;
     }
     .subhead {
-      margin-top: 0.65mm;
-      font-size: 2.55mm;
+      margin-top: 0.7mm;
+      font-size: 2.7mm;
       line-height: 1;
       font-weight: 800;
       white-space: nowrap;
     }
-    .rule { height: 0.23mm; background: #111; margin: 1.8mm 0 1.45mm; }
+    .rule { height: 0.22mm; background: #111; margin: 1.65mm 0 1.35mm; }
     .scan-row {
       display: flex;
       align-items: center;
-      gap: 1.55mm;
-      min-height: 8mm;
+      gap: 1.75mm;
+      min-height: 8.15mm;
     }
     .scan-icon {
       position: relative;
-      flex: 0 0 7.1mm;
-      width: 7.1mm;
-      height: 7.1mm;
+      flex: 0 0 7.25mm;
+      width: 7.25mm;
+      height: 7.25mm;
       border-radius: 50%;
       background: #050505;
     }
@@ -1321,7 +1320,7 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
       border-radius: 2mm 2mm 0.45mm 0.45mm;
     }
     .scan-title {
-      font-size: 2.35mm;
+      font-size: 2.45mm;
       line-height: 1;
       font-weight: 900;
       letter-spacing: 0;
@@ -1329,8 +1328,8 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
     }
     .scan-text {
       margin-top: 0.55mm;
-      font-size: 1.72mm;
-      line-height: 1.08;
+      font-size: 1.78mm;
+      line-height: 1.1;
       font-weight: 700;
     }
     .qr-panel {
@@ -1341,42 +1340,21 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
     }
     .qr-wrap {
       position: relative;
-      width: 21.4mm;
-      height: 23.8mm;
-      border: 0.35mm solid #111;
+      width: 22.05mm;
+      height: 22.05mm;
+      border: 0.34mm solid #111;
       border-radius: 1.2mm;
-      padding: 0.9mm;
+      padding: 0.75mm;
       background: #fff;
       overflow: hidden;
     }
     .qr-wrap svg { width: 100%; height: 100%; display: block; object-fit: contain; }
-    .qr-shield {
-      position: absolute;
-      left: 50%;
-      top: 50%;
-      width: 5.8mm;
-      height: 6.7mm;
-      transform: translate(-50%, -50%);
-      background: #050505;
-      clip-path: polygon(50% 0, 92% 14%, 86% 68%, 50% 100%, 14% 68%, 8% 14%);
-    }
-    .qr-shield:after {
-      content: "";
-      position: absolute;
-      left: 1.95mm;
-      top: 2.45mm;
-      width: 2mm;
-      height: 1.05mm;
-      border-left: 0.6mm solid #fff;
-      border-bottom: 0.6mm solid #fff;
-      transform: rotate(-45deg);
-    }
     .label-footer {
-      height: 7.3mm;
+      height: 7.75mm;
       display: flex;
       align-items: center;
-      gap: 1.15mm;
-      padding: 0 2.6mm;
+      gap: 1.35mm;
+      padding: 0 2.9mm;
       background: #050505;
       color: #fff;
       font-weight: 900;
@@ -1402,9 +1380,9 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
       border-bottom: 0.35mm solid #fff;
       transform: rotate(-45deg);
     }
-    .footer-warning { font-size: 1.75mm; flex: 0 0 22.7mm; }
-    .footer-divider { height: 4.6mm; width: 0.22mm; background: rgba(255, 255, 255, 0.9); }
-    .footer-brand { font-size: 1.45mm; flex: 1; min-width: 0; overflow: hidden; text-overflow: clip; }
+    .footer-warning { font-size: 1.8mm; flex: 0 0 22.9mm; }
+    .footer-divider { height: 4.65mm; width: 0.22mm; background: rgba(255, 255, 255, 0.9); }
+    .footer-brand { font-size: 1.5mm; flex: 1; min-width: 0; overflow: hidden; text-overflow: clip; }
     .print-meta {
       position: absolute;
       left: 3mm;
