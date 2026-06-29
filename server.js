@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import crypto from "crypto";
+import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { createRequire } from "module";
@@ -12,6 +13,7 @@ dotenv.config();
 const require = createRequire(import.meta.url);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const adminWebsitePath = path.join(__dirname, "..", "admin-website");
+const adminIndexPath = path.join(adminWebsitePath, "index.html");
 const QRCode = require("qrcode-terminal/vendor/QRCode");
 const QRErrorCorrectLevel = require("qrcode-terminal/vendor/QRCode/QRErrorCorrectLevel");
 
@@ -21,10 +23,19 @@ const port = process.env.PORT || 4000;
 app.use(cors());
 app.use(express.json());
 
-app.use("/admin", express.static(adminWebsitePath));
-app.get("/admin", (_req, res) => {
-  res.redirect(301, "/admin/");
+app.get(["/admin", "/admin/"], (_req, res) => {
+  if (!fs.existsSync(adminIndexPath)) {
+    return res.status(503).send("Admin website files are missing from this deployment.");
+  }
+  res.sendFile(adminIndexPath);
 });
+app.use("/admin", express.static(adminWebsitePath, {
+  index: false,
+  redirect: false,
+  setHeaders(res) {
+    res.setHeader("Cache-Control", "no-cache");
+  },
+}));
 
 function hashPassword(password) {
   return crypto.createHash("sha256").update(String(password)).digest("hex");
