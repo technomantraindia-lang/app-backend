@@ -1111,6 +1111,7 @@ function productCopyKeys(row) {
 
 function buildWarrantyQrLabel({ payload, title = "PLEASE REGISTER", qrUrl = "", serial = "", model = "", product = "" }) {
   return `
+    <div class="label-print-slot">
     <section class="warranty-label">
       <div class="label-main">
         <header class="label-header">
@@ -1155,7 +1156,8 @@ function buildWarrantyQrLabel({ payload, title = "PLEASE REGISTER", qrUrl = "", 
       <div class="print-meta">
         ${escapeHtml([product, model, serial].filter(Boolean).join(" | "))}
       </div>
-    </section>`;
+    </section>
+    </div>`;
 }
 
 function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1, copiesByProduct = new Map()) {
@@ -1204,14 +1206,23 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
   <meta charset="utf-8" />
   <title>${escapeHtml(title)}</title>
   <style>
-    @page { size: 60mm 40mm; margin: 0; }
+    @page { size: 40mm 60mm; margin: 0; }
     * { box-sizing: border-box; }
     html, body { margin: 0; padding: 0; background: #f3f4f6; color: #050505; }
     body { font-family: Arial, Helvetica, sans-serif; }
     .toolbar { padding: 12px 16px; border-bottom: 1px solid #d1d5db; }
     .toolbar button { padding: 8px 14px; font-size: 14px; cursor: pointer; }
-    .hint { font-size: 12px; color: #4b5563; margin-top: 6px; }
+    .hint { font-size: 12px; color: #4b5563; margin-top: 6px; max-width: 720px; line-height: 1.45; }
     main { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 10px 0; }
+    .label-print-slot {
+      width: 40mm;
+      height: 60mm;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      margin: 0 auto;
+    }
     .warranty-label {
       position: relative;
       width: 60mm;
@@ -1221,9 +1232,10 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
       border: 0.18mm solid #181818;
       border-radius: 2mm;
       box-shadow: 0 1mm 3.2mm rgba(0, 0, 0, 0.18);
-      page-break-after: always;
+      transform: rotate(90deg);
+      transform-origin: center center;
+      flex-shrink: 0;
     }
-    .warranty-label:last-child { page-break-after: auto; }
     .label-main {
       height: 31.85mm;
       display: grid;
@@ -1435,24 +1447,31 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
     .empty-state { padding: 16px; color: #374151; }
     @media print {
       .toolbar { display: none; }
-      html, body { width: 60mm; min-height: 40mm; margin: 0; padding: 0; background: #fff; }
+      html, body { width: 40mm; min-height: 60mm; margin: 0; padding: 0; background: #fff; }
       main { display: block; }
+      .label-print-slot {
+        width: 40mm;
+        height: 60mm;
+        margin: 0;
+        page-break-after: always;
+        break-after: page;
+      }
+      .label-print-slot:last-child { page-break-after: auto; break-after: auto; }
       .warranty-label {
         margin: 0;
         width: 60mm;
         height: 4cm;
         box-shadow: none;
-        page-break-after: always;
-        break-after: page;
+        border-radius: 2mm;
+        transform: rotate(90deg);
       }
-      .warranty-label:last-child { page-break-after: auto; break-after: auto; }
     }
   </style>
 </head>
 <body>
   <div class="toolbar">
     <button onclick="window.print()">Print / Save as PDF</button>
-    <div class="hint">60mm x 40mm warranty QR label. In print dialog select 60mm x 40mm, Landscape, Scale 100%, margins none, headers/footers off.</div>
+    <div class="hint">Zenpert 4T200 / 60×40mm labels: page is 40×60mm vertical (label auto-rotated). Print Scale 100%, margins none, headers/footers off. If upside-down on printer, tell admin to flip rotation.</div>
   </div>
   <main>${pageHtml || '<p class="empty-state">No QR codes found for this dispatch.</p>'}</main>
 </body>
