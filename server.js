@@ -3971,8 +3971,9 @@ app.patch("/payments/:id", asyncRoute(async (req, res) => {
   res.json({ payment: result.rows[0] });
 }));
 
-app.get("/dealers", asyncRoute(async (_req, res) => {
+app.get("/dealers", asyncRoute(async (req, res) => {
   await ensureDealersUserIdSchema();
+  const includeStats = ["1", "true", "yes"].includes(String(req.query.includeStats || "").toLowerCase());
   const usersResult = await query(
     "SELECT * FROM users WHERE role = 'Dealer' ORDER BY created_at DESC LIMIT 800"
   );
@@ -3998,10 +3999,12 @@ app.get("/dealers", asyncRoute(async (_req, res) => {
       status: dealer.status || userRow.status || "Active",
       created_at: dealer.created_at || userRow.created_at,
     };
-    try {
-      entry.stats = await getDealerDashboardStats(dealer.id);
-    } catch {
-      entry.stats = null;
+    if (includeStats) {
+      try {
+        entry.stats = await getDealerDashboardStats(dealer.id);
+      } catch {
+        entry.stats = null;
+      }
     }
     dealers.push(entry);
   }
@@ -4040,10 +4043,12 @@ app.get("/dealers", asyncRoute(async (_req, res) => {
       status: dealer.status || "Active",
       created_at: dealer.created_at,
     };
-    try {
-      entry.stats = await getDealerDashboardStats(dealer.id);
-    } catch {
-      entry.stats = null;
+    if (includeStats) {
+      try {
+        entry.stats = await getDealerDashboardStats(dealer.id);
+      } catch {
+        entry.stats = null;
+      }
     }
     dealers.push(entry);
   }
