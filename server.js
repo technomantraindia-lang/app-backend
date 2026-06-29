@@ -1140,7 +1140,7 @@ function buildWarrantyQrLabel({ payload, title = "PLEASE REGISTER", qrUrl = "", 
         </div>
         <div class="qr-panel">
           <div class="qr-wrap">
-            ${qrSvg(payload, 220)}
+            ${qrSvg(payload, 280, 2)}
           </div>
           <a class="download" href="${escapeHtml(qrUrl)}">Download QR</a>
         </div>
@@ -1224,19 +1224,20 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
     }
     .warranty-label:last-child { page-break-after: auto; }
     .label-main {
+      position: relative;
       height: 31.85mm;
-      display: grid;
-      grid-template-columns: 33mm 1fr;
-      column-gap: 1.65mm;
       padding: 2.35mm 2.35mm 1mm 3mm;
     }
-    .label-copy { min-width: 0; }
+    .label-copy {
+      min-width: 0;
+      padding-right: 26mm;
+    }
     .label-header { line-height: 1; }
     .headline {
-      font-size: 4.8mm;
-      line-height: 0.9;
+      font-size: 4.35mm;
+      line-height: 0.92;
       font-weight: 900;
-      letter-spacing: 0;
+      letter-spacing: -0.02mm;
       white-space: nowrap;
     }
     .subhead {
@@ -1333,22 +1334,22 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
       font-weight: 700;
     }
     .qr-panel {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      min-width: 0;
+      position: absolute;
+      top: 1.6mm;
+      right: 1.6mm;
+      width: 24.8mm;
+      height: 24.8mm;
     }
     .qr-wrap {
-      position: relative;
-      width: 22.2mm;
-      height: 22.2mm;
-      border: 0.38mm solid #111;
-      border-radius: 1.55mm;
-      padding: 0.9mm;
+      width: 100%;
+      height: 100%;
+      border: 0.32mm solid #111;
+      border-radius: 1.2mm;
+      padding: 0.2mm;
       background: #fff;
       overflow: hidden;
     }
-    .qr-wrap svg { width: 100%; height: 100%; display: block; object-fit: contain; }
+    .qr-wrap svg { width: 100%; height: 100%; display: block; }
     .label-footer {
       height: 8.15mm;
       display: flex;
@@ -1743,19 +1744,19 @@ async function resolveProductFromMaster({ productId, productName, modelNo }) {
   throw err;
 }
 
-function qrSvg(payload, size = 220) {
+function qrSvg(payload, size = 220, quiet = 4) {
   const qr = new QRCode(-1, QRErrorCorrectLevel.M);
   qr.addData(payload);
   qr.make();
   const count = qr.getModuleCount();
-  const quiet = 4;
-  const cell = size / (count + quiet * 2);
-  const total = (count + quiet * 2) * cell;
+  const quietModules = Math.max(1, Number(quiet) || 4);
+  const cell = size / (count + quietModules * 2);
+  const total = (count + quietModules * 2) * cell;
   const rects = [];
   for (let row = 0; row < count; row += 1) {
     for (let col = 0; col < count; col += 1) {
       if (qr.isDark(row, col)) {
-        rects.push(`<rect x="${(col + quiet) * cell}" y="${(row + quiet) * cell}" width="${cell}" height="${cell}"/>`);
+        rects.push(`<rect x="${(col + quietModules) * cell}" y="${(row + quietModules) * cell}" width="${cell}" height="${cell}"/>`);
       }
     }
   }
