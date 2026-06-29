@@ -8,10 +8,11 @@ import { fileURLToPath } from "url";
 import { createRequire } from "module";
 import { query, withTransaction } from "./db.js";
 
-dotenv.config();
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+dotenv.config({ path: path.join(__dirname, "..", ".env") });
+dotenv.config({ path: path.join(__dirname, ".env") });
 
 const require = createRequire(import.meta.url);
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const adminWebsitePath = path.join(__dirname, "..", "admin-website");
 const adminIndexPath = path.join(adminWebsitePath, "index.html");
 const QRCode = require("qrcode-terminal/vendor/QRCode");
@@ -1112,17 +1113,17 @@ function buildWarrantyQrLabel({ payload, title = "PLEASE REGISTER", qrUrl = "", 
   return `
     <section class="warranty-label">
       <div class="label-main">
-        <div class="label-copy">
-          <header class="label-header">
-            <div class="headline">${escapeHtml(title)}</div>
-            <div class="subhead">to activate warranty</div>
-          </header>
+        <header class="label-header">
+          <div class="headline">${escapeHtml(title)}</div>
+          <div class="subhead">to activate warranty</div>
+        </header>
+        <div class="label-scans">
           <div class="rule"></div>
           <div class="scan-row">
             <div class="scan-icon person-icon" aria-hidden="true">
               <span></span>
             </div>
-            <div>
+            <div class="scan-copy">
               <div class="scan-title">DEALER SCAN</div>
               <div class="scan-text">Dealer scans to activate warranty</div>
             </div>
@@ -1132,7 +1133,7 @@ function buildWarrantyQrLabel({ payload, title = "PLEASE REGISTER", qrUrl = "", 
             <div class="scan-icon group-icon" aria-hidden="true">
               <span></span><span></span>
             </div>
-            <div>
+            <div class="scan-copy">
               <div class="scan-title">CUSTOMER SCAN</div>
               <div class="scan-text">If dealer does not scan, customer can scan to activate warranty</div>
             </div>
@@ -1140,7 +1141,7 @@ function buildWarrantyQrLabel({ payload, title = "PLEASE REGISTER", qrUrl = "", 
         </div>
         <div class="qr-panel">
           <div class="qr-wrap">
-            ${qrSvg(payload, 280, 2)}
+            ${qrSvg(payload, 260, 2)}
           </div>
           <a class="download" href="${escapeHtml(qrUrl)}">Download QR</a>
         </div>
@@ -1224,61 +1225,84 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
     }
     .warranty-label:last-child { page-break-after: auto; }
     .label-main {
-      position: relative;
       height: 31.85mm;
-      padding: 2.35mm 2.35mm 1mm 3mm;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 21.8mm;
+      grid-template-rows: auto 1fr;
+      grid-template-areas:
+        "header ."
+        "scans qr";
+      column-gap: 1.15mm;
+      padding: 2.35mm 2.1mm 1.5mm 2.8mm;
+      align-items: start;
     }
-    .label-copy {
+    .label-header {
+      grid-area: header;
+      line-height: 1;
       min-width: 0;
-      padding-right: 26mm;
+      max-width: 100%;
     }
-    .label-header { line-height: 1; }
+    .label-scans {
+      grid-area: scans;
+      min-width: 0;
+      max-width: 100%;
+      padding-bottom: 0.85mm;
+    }
     .headline {
-      font-size: 4.35mm;
-      line-height: 0.92;
+      font-size: 3.72mm;
+      line-height: 1;
       font-weight: 900;
-      letter-spacing: -0.02mm;
+      letter-spacing: -0.06mm;
       white-space: nowrap;
     }
     .subhead {
       margin-top: 0.55mm;
-      font-size: 2.45mm;
+      font-size: 2.4mm;
       line-height: 1;
       font-weight: 800;
-      white-space: nowrap;
     }
-    .rule { height: 0.22mm; background: #111; margin: 1.45mm 0 1.2mm; opacity: 0.95; }
+    .rule { height: 0.22mm; background: #111; margin: 1.35mm 0 1.15mm; opacity: 0.95; }
     .scan-row {
       display: flex;
       align-items: center;
-      gap: 1.55mm;
-      min-height: 7.75mm;
+      gap: 1.45mm;
+      min-height: 7.5mm;
+    }
+    .scan-copy {
+      min-width: 0;
+      flex: 1;
     }
     .scan-icon {
       position: relative;
-      flex: 0 0 6.9mm;
-      width: 6.9mm;
-      height: 6.9mm;
+      flex: 0 0 5.4mm;
+      width: 5.4mm;
+      height: 5.4mm;
       border-radius: 50%;
       background: #050505;
+    }
+    .person-icon:before {
+      content: "";
+      left: 1.66mm;
+      top: 1mm;
+      width: 2.08mm;
+      height: 2.08mm;
+    }
+    .person-icon:after {
+      content: "";
+      left: 1.14mm;
+      top: 3.24mm;
+      width: 3.14mm;
+      height: 1.3mm;
     }
     .scan-icon:before {
       content: "";
       position: absolute;
-      left: 2.12mm;
-      top: 1.28mm;
-      width: 2.65mm;
-      height: 2.65mm;
       border-radius: 50%;
       background: #fff;
     }
     .scan-icon:after {
       content: "";
       position: absolute;
-      left: 1.45mm;
-      top: 4.13mm;
-      width: 4mm;
-      height: 1.65mm;
       border-radius: 2mm 2mm 0.45mm 0.45mm;
       background: #fff;
     }
@@ -1292,32 +1316,37 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
     }
     .group-icon:before,
     .group-icon:after { display: none; }
+    .scan-icon.group-icon {
+      flex: 0 0 5.4mm;
+      width: 5.4mm;
+      height: 5.4mm;
+    }
     .group-icon span:first-child:before {
-      left: 1.35mm;
-      top: 1.65mm;
-      width: 2.3mm;
-      height: 2.3mm;
+      left: 1.05mm;
+      top: 1.28mm;
+      width: 1.8mm;
+      height: 1.8mm;
       border-radius: 50%;
     }
     .group-icon span:first-child:after {
-      left: 0.8mm;
-      top: 4.35mm;
-      width: 3.8mm;
-      height: 1.55mm;
+      left: 0.62mm;
+      top: 3.38mm;
+      width: 3mm;
+      height: 1.22mm;
       border-radius: 2mm 2mm 0.45mm 0.45mm;
     }
     .group-icon span:nth-child(2):before {
-      left: 3.55mm;
-      top: 1.55mm;
-      width: 2.25mm;
-      height: 2.25mm;
+      left: 2.78mm;
+      top: 1.2mm;
+      width: 1.75mm;
+      height: 1.75mm;
       border-radius: 50%;
     }
     .group-icon span:nth-child(2):after {
-      left: 3.1mm;
-      top: 4.15mm;
-      width: 3.7mm;
-      height: 1.55mm;
+      left: 2.42mm;
+      top: 3.22mm;
+      width: 2.88mm;
+      height: 1.22mm;
       border-radius: 2mm 2mm 0.45mm 0.45mm;
     }
     .scan-title {
@@ -1334,18 +1363,20 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
       font-weight: 700;
     }
     .qr-panel {
-      position: absolute;
-      top: 1.6mm;
-      right: 1.6mm;
-      width: 24.8mm;
-      height: 24.8mm;
+      grid-area: qr;
+      width: 21.8mm;
+      height: 21.8mm;
+      align-self: center;
+      justify-self: end;
+      position: relative;
+      margin-top: 0.4mm;
     }
     .qr-wrap {
       width: 100%;
       height: 100%;
-      border: 0.32mm solid #111;
-      border-radius: 1.2mm;
-      padding: 0.2mm;
+      border: 0.38mm solid #111;
+      border-radius: 1.55mm;
+      padding: 0.4mm;
       background: #fff;
       overflow: hidden;
     }
@@ -1354,8 +1385,8 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
       height: 8.15mm;
       display: flex;
       align-items: center;
-      gap: 1.1mm;
-      padding: 0 2.65mm;
+      gap: 0.8mm;
+      padding: 0 2.1mm;
       background: #050505;
       color: #fff;
       font-weight: 900;
@@ -1366,24 +1397,29 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
       flex: 0 0 4.6mm;
       width: 4.6mm;
       height: 5.1mm;
-      border: 0.45mm solid #fff;
+      background: #fff;
+      border: none;
       border-radius: 1mm 1mm 1.7mm 1.7mm;
       clip-path: polygon(50% 0, 100% 18%, 88% 74%, 50% 100%, 12% 74%, 0 18%);
     }
-    .footer-mark:after {
-      content: "";
-      position: absolute;
-      left: 1.3mm;
-      top: 1.65mm;
-      width: 1.65mm;
-      height: 0.85mm;
-      border-left: 0.35mm solid #fff;
-      border-bottom: 0.35mm solid #fff;
-      transform: rotate(-45deg);
+    .footer-warning {
+      font-size: 1.42mm;
+      flex: 0 0 auto;
+      letter-spacing: -0.03mm;
     }
-    .footer-warning { font-size: 1.72mm; flex: 0 0 22.3mm; }
-    .footer-divider { height: 4.6mm; width: 0.22mm; background: rgba(255, 255, 255, 0.9); }
-    .footer-brand { font-size: 1.43mm; flex: 1; min-width: 0; overflow: hidden; text-overflow: clip; }
+    .footer-divider {
+      height: 4.6mm;
+      width: 0.22mm;
+      flex: 0 0 0.22mm;
+      background: rgba(255, 255, 255, 0.9);
+    }
+    .footer-brand {
+      font-size: 1.22mm;
+      flex: 1 1 auto;
+      min-width: 0;
+      letter-spacing: -0.04mm;
+      font-weight: 800;
+    }
     .print-meta {
       position: absolute;
       left: 3mm;
@@ -9697,6 +9733,8 @@ try {
 }
 
 app.listen(port, "0.0.0.0", () => {
-  console.log(`Hitaishi CRM API listening on http://0.0.0.0:${port} (reachable from phone via your PC LAN IP)`);
+  console.log(`Hitaishi CRM API listening on http://localhost:${port}`);
   console.log(`Admin website: http://localhost:${port}/admin/`);
+  console.log(`Health check: http://localhost:${port}/health`);
+  console.log("Stop with Ctrl+C. Changes need server restart.");
 });
