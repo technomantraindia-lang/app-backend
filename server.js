@@ -5246,7 +5246,7 @@ app.patch("/dealers/:id", asyncRoute(async (req, res) => {
     return res.status(400).json({ error: mobileCheck.error });
   }
 
-  const existing = await query("SELECT dealer_no FROM dealers WHERE id = ? LIMIT 1", [id]);
+  const existing = await query("SELECT dealer_no, user_id FROM dealers WHERE id = ? LIMIT 1", [id]);
   if (!existing.rowCount) {
     return res.status(404).json({ error: "Dealer not found." });
   }
@@ -5263,6 +5263,13 @@ app.patch("/dealers/:id", asyncRoute(async (req, res) => {
   );
   if (!result.affectedRows) {
     return res.status(404).json({ error: "Dealer not found." });
+  }
+  const linkedUserId = cleanString(existing.rows[0].user_id);
+  if (linkedUserId) {
+    await query(
+      "UPDATE users SET name = ?, mobile = ?, status = ? WHERE id = ? AND role = 'Dealer'",
+      [name, mobileCheck.national, status, linkedUserId]
+    );
   }
   const row = await query("SELECT * FROM dealers WHERE id = ? LIMIT 1", [id]);
   res.json({ dealer: row.rows[0] });
