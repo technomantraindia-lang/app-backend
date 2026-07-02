@@ -1208,6 +1208,11 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
   <style id="pageSizeStyle">@page { size: 60mm 40mm; margin: 0; }</style>
   <style>
     * { box-sizing: border-box; }
+    :root { --label-print-scale: 0.78; }
+    html, body, .warranty-label, .label-footer, .scan-icon, .footer-mark, .footer-divider {
+      -webkit-print-color-adjust: exact;
+      print-color-adjust: exact;
+    }
     html, body { margin: 0; padding: 0; background: #f3f4f6; color: #050505; }
     body { font-family: Arial, Helvetica, sans-serif; }
     .toolbar { padding: 12px 16px; border-bottom: 1px solid #d1d5db; }
@@ -1218,9 +1223,13 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
     .hint { font-size: 12px; color: #4b5563; margin-top: 8px; max-width: 760px; line-height: 1.45; }
     main { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 10px 0; }
     .label-print-slot {
+      position: relative;
       overflow: hidden;
       margin: 0 auto;
       page-break-after: always;
+      break-after: page;
+      page-break-inside: avoid;
+      break-inside: avoid;
       display: flex;
       align-items: center;
       justify-content: center;
@@ -1241,6 +1250,8 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
       width: 60mm;
       height: 40mm;
       overflow: hidden;
+      display: flex;
+      flex-direction: column;
       background: #fff;
       border: 0.18mm solid #181818;
       border-radius: 2mm;
@@ -1248,12 +1259,13 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
       flex-shrink: 0;
       transform-origin: center center;
     }
-    body[data-rotate="0"] .warranty-label { transform: rotate(0deg); }
-    body[data-rotate="90"] .warranty-label { transform: rotate(90deg); }
-    body[data-rotate="180"] .warranty-label { transform: rotate(180deg); }
-    body[data-rotate="270"] .warranty-label { transform: rotate(270deg); }
+    body[data-rotate="0"] .warranty-label { transform: scale(var(--label-print-scale)) rotate(0deg); }
+    body[data-rotate="90"] .warranty-label { transform: scale(var(--label-print-scale)) rotate(90deg); }
+    body[data-rotate="180"] .warranty-label { transform: scale(var(--label-print-scale)) rotate(180deg); }
+    body[data-rotate="270"] .warranty-label { transform: scale(var(--label-print-scale)) rotate(270deg); }
     .label-main {
-      height: 31.85mm;
+      flex: 1 1 auto;
+      min-height: 0;
       display: grid;
       grid-template-columns: minmax(0, 1fr) 21.8mm;
       grid-template-rows: auto 1fr;
@@ -1410,7 +1422,7 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
     }
     .qr-wrap svg { width: 100%; height: 100%; display: block; }
     .label-footer {
-      height: 8.15mm;
+      flex: 0 0 7.85mm;
       display: flex;
       align-items: center;
       gap: 0.8mm;
@@ -1463,7 +1475,7 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
     .empty-state { padding: 16px; color: #374151; }
     @media print {
       .toolbar { display: none; }
-      main { display: block; }
+      main { display: block; padding: 0; margin: 0; }
       body[data-rotate="0"] html, body[data-rotate="0"] body,
       body[data-rotate="180"] html, body[data-rotate="180"] body {
         width: 60mm; min-height: 40mm; margin: 0; padding: 0; background: #fff;
@@ -1473,9 +1485,11 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
         width: 40mm; min-height: 60mm; margin: 0; padding: 0; background: #fff;
       }
       .label-print-slot {
-        margin: 0 auto;
+        margin: 0;
         page-break-after: always;
         break-after: page;
+        page-break-inside: avoid;
+        break-inside: avoid;
         display: flex;
         align-items: center;
         justify-content: center;
@@ -1487,16 +1501,17 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
       body[data-rotate="270"] .label-print-slot { width: 40mm; height: 60mm; }
       .warranty-label {
         margin: 0;
+        position: relative;
         width: 60mm;
         height: 40mm;
         box-shadow: none;
         border-radius: 2mm;
         transform-origin: center center;
       }
-      body[data-rotate="0"] .warranty-label { transform: rotate(0deg); }
-      body[data-rotate="90"] .warranty-label { transform: rotate(90deg); }
-      body[data-rotate="180"] .warranty-label { transform: rotate(180deg); }
-      body[data-rotate="270"] .warranty-label { transform: rotate(270deg); }
+      body[data-rotate="0"] .warranty-label { transform: scale(var(--label-print-scale)) rotate(0deg); }
+      body[data-rotate="90"] .warranty-label { transform: scale(var(--label-print-scale)) rotate(90deg); }
+      body[data-rotate="180"] .warranty-label { transform: scale(var(--label-print-scale)) rotate(180deg); }
+      body[data-rotate="270"] .warranty-label { transform: scale(var(--label-print-scale)) rotate(270deg); }
     }
   </style>
 </head>
@@ -1512,7 +1527,7 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
       </select>
       <button id="printBtn" type="button">Print / Save as PDF</button>
     </div>
-    <div class="hint" id="rotationHint">0° Normal — 60×40mm page. Print Scale 100%, margins none, headers/footers off.</div>
+    <div class="hint" id="rotationHint">0° Normal — page 60×40mm. Label as designed (wide). Print Scale 100%, margins none.</div>
   </div>
   <main>${pageHtml || '<p class="empty-state">No QR codes found for this dispatch.</p>'}</main>
   <script>
@@ -1521,9 +1536,9 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
       var hint = document.getElementById("rotationHint");
       var pageStyle = document.getElementById("pageSizeStyle");
       var hints = {
-        "0": "0° Normal — page 60×40mm. Label as designed (wide). Zenpert 4T200: Scale 100%, margins none.",
-        "90": "90° Clockwise — page 40×60mm. Label rotated right. Use if printer feeds tall labels.",
-        "180": "180° Upside down — page 60×40mm. Label flipped. Use if print comes inverted.",
+        "0": "0° Normal — page 60×40mm. Label as designed (wide). Print Scale 100%, margins none.",
+        "90": "90° Clockwise — page 40×60mm. Label rotated right.",
+        "180": "180° Upside down — page 60×40mm. Label flipped.",
         "270": "270° Counter-clockwise — page 40×60mm. Label rotated left."
       };
       function normalizeRotation(value) {
