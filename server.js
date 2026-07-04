@@ -1109,6 +1109,21 @@ function productCopyKeys(row) {
   ].filter(Boolean);
 }
 
+function expandQrPrintRows(rows, copies = 1, copiesByProduct = new Map()) {
+  const labelCopies = parseQrLabelCopies(copies);
+  const printRows = [];
+  rows.forEach((row) => {
+    const rowCopies = productCopyKeys(row).reduce(
+      (matchedCopies, key) => matchedCopies || copiesByProduct.get(key),
+      0
+    ) || labelCopies;
+    for (let index = 0; index < rowCopies; index += 1) {
+      printRows.push(row);
+    }
+  });
+  return printRows;
+}
+
 function buildWarrantyQrLabel({ payload, title = "PLEASE REGISTER", qrUrl = "", serial = "", model = "", product = "" }) {
   return `
     <div class="label-print-slot">
@@ -1161,17 +1176,7 @@ function buildWarrantyQrLabel({ payload, title = "PLEASE REGISTER", qrUrl = "", 
 }
 
 function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1, copiesByProduct = new Map()) {
-  const labelCopies = parseQrLabelCopies(copies);
-  const printRows = [];
-  rows.forEach((row) => {
-    const rowCopies = productCopyKeys(row).reduce(
-      (matchedCopies, key) => matchedCopies || copiesByProduct.get(key),
-      0
-    ) || labelCopies;
-    for (let index = 0; index < rowCopies; index += 1) {
-      printRows.push(row);
-    }
-  });
+  const printRows = expandQrPrintRows(rows, copies, copiesByProduct);
   const pageHtml = printRows
     .map((serial) => {
       const payload =
@@ -9128,6 +9133,72 @@ app.get("/dispatch/batches", asyncRoute(async (_req, res) => {
       productLines: productLinesByBatch.get(row.batch_no) || [],
       printSheetUrl: `/dispatch/qr-print-sheet?batchNo=${encodeURIComponent(row.batch_no)}`,
     })),
+  });
+}));
+
+app.get("/dispatch/qr-print-data", asyncRoute(async (req, res) => {
+  const batchNo = cleanString(req.query.batchNo || req.query.batch_no);
+  const copies = parseQrLabelCopies(req.query.copies || req.query.quantity || req.query.qty);
+  const copiesByProduct = parseQrProductCopies(req.query.productCopies || req.query.product_copies);
+  const requested = cleanString(req.query.serials)
+    .split(",")
+    .map(cleanSerialNo)
+    .filter(Boolean);
+  const clauses = [];
+  const params = [];
+  if (batchNo) {
+    clauses.push("s.batch_no = ?");
+    params.push(batchNo);
+  } else if (requested.length) {
+    clauses.push(`s.serial_no IN (${requested.map(() => "?").join(",")})`);
+    params.push(...requested);
+  } else {
+    return res.status(400).json({ error: "batchNo or serials query is required." });
+  }
+  const result = await query(
+    `SELECT s.*, p.name AS product_name, p.model_no, d.dealer_no, d.name AS dealer_name,
+            c.name AS customer_name, c.mobile AS customer_mobile
+     FROM serial_numbers s
+     LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN dealers d ON d.id = s.dealer_id
+     LEFT JOIN customers c ON c.id = s.dispatched_customer_id
+     WHERE ${clauses.join(" AND ")}
+     ORDER BY s.serial_no ASC
+     LIMIT 500`,
+    params
+  );
+  const title = batchNo ? `Dispatch QR Sheet Â· ${batchNo}` : "Dispatch QR Sheet";
+  const rows = expandQrPrintRows(result.rows, copies, copiesByProduct).map((serial) => ({
+    serialNo: serial.serial_no,
+    productId: serial.product_id,
+    productName: serial.product_name || "Product",
+    modelNo: serial.model_no,
+    dealerId: serial.dealer_id,
+    dealerNo: serial.dealer_no,
+    dealerName: serial.dealer_name,
+    customerId: serial.dispatched_customer_id,
+    customerName: serial.customer_name,
+    customerMobile: serial.customer_mobile,
+    qrPayload: serial.qr_payload || dispatchUnitQrPayload({
+      productId: serial.product_id,
+      productName: serial.product_name,
+      modelNo: serial.model_no,
+      serialNo: serial.serial_no,
+      dealerId: serial.dealer_id,
+      dealerNo: serial.dealer_no,
+      dealerName: serial.dealer_name,
+      customerId: serial.dispatched_customer_id,
+      customerName: serial.customer_name,
+      customerMobile: serial.customer_mobile,
+      dispatchType: serial.dispatched_customer_id ? "selfSale" : "",
+    }),
+  }));
+  res.json({
+    batchNo,
+    title,
+    count: rows.length,
+    label: { widthMm: 60, heightMm: 40 },
+    rows,
   });
 }));
 
