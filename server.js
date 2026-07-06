@@ -1696,15 +1696,32 @@ async function productHasActiveWarranty(productId) {
   return Boolean(result.rowCount);
 }
 
-function parseSequenceSeed(raw, label) {
+function parseSequenceSeed(raw, label, options = {}) {
   const value = cleanString(raw);
   if (!value) {
+    if (options.defaultValue !== undefined) {
+      const fallback = cleanString(options.defaultValue);
+      const fallbackSeed = parseSequenceSeed(fallback || "1", label);
+      return {
+        ...fallbackSeed,
+        useCategoryPrefix: true,
+      };
+    }
     const err = new Error(`${label} is required.`);
     err.statusCode = 400;
     throw err;
   }
   const match = value.match(/^(.*?)(\d+)$/);
   if (!match) {
+    if (options.defaultValue !== undefined) {
+      const fallback = cleanString(options.defaultValue);
+      const fallbackSeed = parseSequenceSeed(fallback || "1", label);
+      return {
+        ...fallbackSeed,
+        prefix: value,
+        useCategoryPrefix: false,
+      };
+    }
     const err = new Error(`${label} must end with a number (e.g. RO-001).`);
     err.statusCode = 400;
     throw err;
@@ -1713,6 +1730,7 @@ function parseSequenceSeed(raw, label) {
     prefix: match[1],
     width: match[2].length,
     nextNumber: Number.parseInt(match[2], 10),
+    useCategoryPrefix: false,
   };
 }
 
@@ -1738,11 +1756,11 @@ function applyCategorySequencePrefixes(name, model, serial) {
   return {
     model: {
       ...model,
-      prefix: model.prefix || categoryPrefix,
+      prefix: model.prefix || (model.useCategoryPrefix ? categoryPrefix : ""),
     },
     serial: {
       ...serial,
-      prefix: serial.prefix || categoryPrefix,
+      prefix: serial.prefix || (serial.useCategoryPrefix ? categoryPrefix : ""),
     },
   };
 }
@@ -5468,8 +5486,10 @@ app.post("/product-categories", asyncRoute(async (req, res) => {
   if (!name) {
     return res.status(400).json({ error: "Category name is required." });
   }
-  const model = parseSequenceSeed(req.body.modelStart || req.body.model_start, "Model starting number");
-  const serial = parseSequenceSeed(req.body.serialStart || req.body.serial_start, "Serial starting number");
+  const modelSeed = req.body.modelStart ?? req.body.model_start ?? req.body.modelNoStart ?? req.body.model_no_start;
+  const serialSeed = req.body.serialStart ?? req.body.serial_start ?? req.body.serialNoStart ?? req.body.serial_no_start ?? req.body.serialNumber ?? req.body.serial_number;
+  const model = parseSequenceSeed(modelSeed, "Model starting number", { defaultValue: "1" });
+  const serial = parseSequenceSeed(serialSeed, "Serial starting number", { defaultValue: "1" });
   const sequences = applyCategorySequencePrefixes(name, model, serial);
   const id = crypto.randomUUID();
   await query(
@@ -5524,8 +5544,10 @@ app.patch("/product-categories/:id", asyncRoute(async (req, res) => {
     await query("UPDATE product_categories SET name = ? WHERE id = ?", [name, id]);
     await query("UPDATE products SET category = ? WHERE category_id = ?", [name, id]);
   } else {
-    const model = parseSequenceSeed(req.body.modelStart || req.body.model_start, "Model starting code");
-    const serial = parseSequenceSeed(req.body.serialStart || req.body.serial_start, "Serial starting code");
+    const modelSeed = req.body.modelStart ?? req.body.model_start ?? req.body.modelNoStart ?? req.body.model_no_start;
+    const serialSeed = req.body.serialStart ?? req.body.serial_start ?? req.body.serialNoStart ?? req.body.serial_no_start ?? req.body.serialNumber ?? req.body.serial_number;
+    const model = parseSequenceSeed(modelSeed, "Model starting code", { defaultValue: "1" });
+    const serial = parseSequenceSeed(serialSeed, "Serial starting code", { defaultValue: "1" });
     const sequences = applyCategorySequencePrefixes(name, model, serial);
     await query(
       `UPDATE product_categories
