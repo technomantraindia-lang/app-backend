@@ -2589,22 +2589,7 @@ async function findUserForAuth({ loginId, mobile, email, role }) {
 }
 
 app.post("/auth/login", asyncRoute(async (req, res) => {
-  const password = req.body.password;
-  const { role } = req.body;
-  if (password === undefined || password === null) {
-    return res.status(400).json({ error: "password is required" });
-  }
-
-  const { userRow } = await findUserForAuth(req.body);
-  const storedHash = userRow.password_hash;
-  if (!storedHash) {
-    return res.status(401).json({ error: "Password not set for this account." });
-  }
-  if (storedHash !== hashPassword(String(password))) {
-    return res.status(401).json({ error: "Invalid user ID or password" });
-  }
-
-  res.json(await buildAuthLoginResponse(userRow, role));
+  return res.status(410).json({ error: "Password login is disabled. Use mobile OTP login." });
 }));
 
 app.post("/auth/request-otp", asyncRoute(async (req, res) => {
@@ -6739,7 +6724,6 @@ app.post("/warranties/dealer/activate-from-qr", asyncRoute(async (req, res) => {
   const productId = cleanString(req.body.productId || req.body.product_id || scannedProduct.productId);
   const purchaseDate = cleanDate(req.body.purchaseDate || req.body.purchase_date) || new Date().toISOString().slice(0, 10);
   const invoiceNo = cleanString(req.body.invoiceNo || req.body.invoice_no);
-  const password = typeof req.body.password === "string" ? req.body.password : "";
   const { name, mobile, email, address, city, state, pincode } = req.body;
   const cleanMobile = normalizeMobileValue(mobile);
   const cleanEmail = normalizeEmail(email);
@@ -6773,7 +6757,6 @@ app.post("/warranties/dealer/activate-from-qr", asyncRoute(async (req, res) => {
         `SELECT
            c.id,
            c.user_id,
-           u.password_hash,
            u.email
          FROM customers c
          LEFT JOIN users u ON u.id = c.user_id
@@ -6782,21 +6765,6 @@ app.post("/warranties/dealer/activate-from-qr", asyncRoute(async (req, res) => {
         [cleanMobile]
       )
     : { rowCount: 0, rows: [] };
-  const hasExistingLogin = Boolean(
-    existingCustomer.rowCount &&
-      existingCustomer.rows[0]?.user_id &&
-      existingCustomer.rows[0]?.password_hash &&
-      String(existingCustomer.rows[0].password_hash).trim()
-  );
-  if (!hasExistingLogin) {
-    if (!cleanEmail) {
-      return res.status(400).json({ error: "Login Email ID is required for a new customer account." });
-    }
-    if (!password || password.length < 8) {
-      return res.status(400).json({ error: "Customer login password must be at least 8 characters." });
-    }
-  }
-
   const customer = await findOrCreateCustomer({
     name,
     mobile,
@@ -6805,7 +6773,7 @@ app.post("/warranties/dealer/activate-from-qr", asyncRoute(async (req, res) => {
     city,
     state,
     pincode,
-    password,
+    password: "",
     createdByDealerId: dealerId,
   });
   const warranty = await activateWarrantyFromSerial({
