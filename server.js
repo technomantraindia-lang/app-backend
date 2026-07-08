@@ -59,6 +59,7 @@ const dealerCreatableRoles = ["Customer", "Technician"];
 const loginOtpChallenges = new Map();
 const selfSaleOtpChallenges = new Map();
 const customerAccountOtpChallenges = new Map();
+const accountOtpChallenges = new Map();
 const LOGIN_OTP_TTL_MS = 5 * 60 * 1000;
 
 function normalizeEmail(email) {
@@ -2941,6 +2942,217 @@ app.post("/accounts/customer/verify-otp", asyncRoute(async (req, res) => {
   res.status(201).json({
     ...created,
     message: "Customer mobile verified and login account created.",
+  });
+}));
+
+async function prepareOtpAccountPayload(body) {
+  await ensureTechniciansSchema();
+  const cleanRole = cleanString(body.role);
+  const cleanCreatedByRole = cleanString(body.createdByRole);
+  const cleanName = cleanString(body.name);
+  const mobileCheck = requireTenDigitMobile(body.mobile, body.countryDial);
+  const cleanEmail = normalizeEmail(body.email) || null;
+
+  if (!accountCreatorRoles.includes(cleanCreatedByRole)) {
+    const err = new Error("You are not allowed to create login accounts.");
+    err.statusCode = 403;
+    throw err;
+  }
+  if (!accountRoles.includes(cleanRole)) {
+    const err = new Error("Select a valid role.");
+    err.statusCode = 400;
+    throw err;
+  }
+  if (customerOnlyAccountCreators.includes(cleanCreatedByRole) && cleanRole !== "Customer") {
+    const err = new Error("Only customer login accounts can be created for this role.");
+    err.statusCode = 403;
+    throw err;
+  }
+  if (cleanCreatedByRole === "Dealer" && !dealerCreatableRoles.includes(cleanRole)) {
+    const err = new Error("Dealers can create customer or technician login accounts only.");
+    err.statusCode = 403;
+    throw err;
+  }
+  if (!cleanName || !mobileCheck.ok) {
+    const err = new Error(!cleanName ? "Name is required." : mobileCheck.error);
+    err.statusCode = 400;
+    throw err;
+  }
+
+  let creatorDealerId = null;
+  const linkToDealerRole = cleanRole === "Customer" || cleanRole === "Technician";
+  if (cleanCreatedByRole === "Dealer" && linkToDealerRole) {
+    const dealerProfile = await resolveDealerRecord(cleanString(body.dealerId));
+    if (!dealerProfile) {
+      const err = new Error("Dealer profile is required. Link your login mobile with Dealer Management in Admin.");
+      err.statusCode = 400;
+      throw err;
+    }
+    creatorDealerId = dealerProfile.id;
+  } else if (cleanCreatedByRole === "Admin" && linkToDealerRole) {
+    const dealerProfile = await resolveDealerRecord(cleanString(body.dealerId));
+    if (!dealerProfile) {
+      const err = new Error("Select a dealer. This account will show in that dealer's customer or technician list.");
+      err.statusCode = 400;
+      throw err;
+    }
+    creatorDealerId = dealerProfile.id;
+  }
+
+  const existingMobile = await query("SELECT id FROM users WHERE mobile = ? LIMIT 1", [mobileCheck.national]);
+  if (existingMobile.rowCount) {
+    const err = new Error("This mobile number already has a login account.");
+    err.statusCode = 409;
+    throw err;
+  }
+
+  if (cleanRole === "Customer") {
+    const existingCustomer = await query("SELECT id FROM customers WHERE mobile = ? LIMIT 1", [mobileCheck.national]);
+    if (existingCustomer.rowCount) {
+      const err = new Error("This mobile number already has a customer profile.");
+      err.statusCode = 409;
+      throw err;
+    }
+  }
+
+  if (cleanRole === "Dealer" && cleanString(body.dealerNo)) {
+    const existingDealer = await query("SELECT id FROM dealers WHERE dealer_no = ? LIMIT 1", [cleanString(body.dealerNo)]);
+    if (existingDealer.rowCount) {
+      const err = new Error("This dealer number already exists.");
+      err.statusCode = 409;
+      throw err;
+    }
+  }
+
+  return {
+    role: cleanRole,
+    createdByRole: cleanCreatedByRole,
+    dealerId: creatorDealerId,
+    name: cleanName,
+    mobile: mobileCheck.national,
+    email: cleanEmail,
+    status: cleanString(body.status) || "Active",
+    city: cleanString(body.city) || null,
+    state: cleanString(body.state) || null,
+    address: cleanString(body.address) || null,
+    pincode: cleanString(body.pincode) || null,
+    serviceAreas: cleanString(body.serviceAreas) || null,
+    dealerNo: cleanString(body.dealerNo) || null,
+    contactPerson: cleanString(body.contactPerson) || null,
+  };
+}
+
+async function createOtpAccount(payload) {
+  return withTransaction(async (run) => {
+    const existingMobile = await run("SELECT id FROM users WHERE mobile = ? LIMIT 1", [payload.mobile]);
+    if (existingMobile.rowCount) {
+      const err = new Error("This mobile number already has a login account.");
+      err.statusCode = 409;
+      throw err;
+    }
+
+    const userId = crypto.randomUUID();
+    await run(
+      "INSERT INTO users (id, role, name, mobile, email, password_hash, status) VALUES (?, ?, ?, ?, ?, NULL, ?)",
+      [userId, payload.role, payload.name, payload.mobile, payload.email, payload.status || "Active"]
+    );
+
+    let customer = null;
+    let technician = null;
+    let dealer = null;
+
+    if (payload.role === "Customer") {
+      const customerId = crypto.randomUUID();
+      await run(
+        "INSERT INTO customers (id, user_id, name, mobile, address, city, state, pincode, created_by_dealer_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [customerId, userId, payload.name, payload.mobile, payload.address, payload.city, payload.state, payload.pincode, payload.dealerId]
+      );
+      const result = await run("SELECT * FROM customers WHERE id = ? LIMIT 1", [customerId]);
+      customer = result.rows[0] || null;
+    }
+
+    if (payload.role === "Technician") {
+      const technicianId = crypto.randomUUID();
+      await run(
+        "INSERT INTO technicians (id, user_id, name, mobile, city, pincode, service_areas, approval_status, created_by_dealer_id) VALUES (?, ?, ?, ?, ?, ?, ?, 'Approved', ?)",
+        [technicianId, userId, payload.name, payload.mobile, payload.city, payload.pincode, payload.serviceAreas, payload.dealerId]
+      );
+      const result = await run("SELECT * FROM technicians WHERE id = ? LIMIT 1", [technicianId]);
+      technician = result.rows[0] || null;
+    }
+
+    if (payload.role === "Dealer") {
+      await ensureDealersUserIdSchema();
+      const finalDealerNo = payload.dealerNo || await getNextDealerNo();
+      await run(
+        "INSERT INTO dealers (user_id, dealer_no, name, contact_person, mobile, address, city, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [userId, finalDealerNo, payload.name, payload.contactPerson, payload.mobile, payload.address, payload.city, payload.state]
+      );
+      const result = await run("SELECT * FROM dealers WHERE dealer_no = ? LIMIT 1", [finalDealerNo]);
+      dealer = result.rows[0] || null;
+    }
+
+    const userResult = await run("SELECT * FROM users WHERE id = ? LIMIT 1", [userId]);
+    return { user: publicUser(userResult.rows[0]), customer, technician, dealer };
+  });
+}
+
+app.post("/accounts/request-otp", asyncRoute(async (req, res) => {
+  const payload = await prepareOtpAccountPayload(req.body);
+  const otp = String(crypto.randomInt(100000, 1000000));
+  const token = crypto.randomUUID();
+  purgeExpiredOtpChallenges(accountOtpChallenges);
+  accountOtpChallenges.set(token, {
+    payload,
+    otp,
+    attempts: 0,
+    expiresAt: Date.now() + LOGIN_OTP_TTL_MS,
+  });
+
+  let smsResult;
+  try {
+    smsResult = await sendLoginOtpSms(payload.mobile, otp);
+  } catch (err) {
+    accountOtpChallenges.delete(token);
+    throw err;
+  }
+
+  res.json({
+    token,
+    expiresInSeconds: Math.floor(LOGIN_OTP_TTL_MS / 1000),
+    message: smsResult.sent
+      ? `OTP sent to ${payload.role} mobile number.`
+      : "SMS gateway is not configured. Use development OTP for testing.",
+    smsSent: Boolean(smsResult.sent),
+    devOtp: smsResult.sent ? undefined : otp,
+  });
+}));
+
+app.post("/accounts/verify-otp", asyncRoute(async (req, res) => {
+  const token = cleanString(req.body.token);
+  const otp = normalizeMobileValue(req.body.otp);
+  const challenge = accountOtpChallenges.get(token);
+  if (!token || !challenge) {
+    return res.status(400).json({ error: "OTP session expired. Send OTP again." });
+  }
+  if (Date.now() > challenge.expiresAt) {
+    accountOtpChallenges.delete(token);
+    return res.status(400).json({ error: "OTP expired. Send OTP again." });
+  }
+  if (challenge.attempts >= 5) {
+    accountOtpChallenges.delete(token);
+    return res.status(429).json({ error: "Too many wrong OTP attempts. Send OTP again." });
+  }
+  if (otp !== challenge.otp) {
+    challenge.attempts += 1;
+    return res.status(401).json({ error: "Invalid OTP." });
+  }
+
+  const created = await createOtpAccount(challenge.payload);
+  accountOtpChallenges.delete(token);
+  res.status(201).json({
+    ...created,
+    message: `${created.user?.role || "Login"} mobile verified and login account created.`,
   });
 }));
 
