@@ -1705,6 +1705,22 @@ async function ensureDealerRewardsSchema() {
        CONSTRAINT fk_dealer_rewards_warranty FOREIGN KEY (warranty_id) REFERENCES warranties(id) ON DELETE CASCADE
      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
   );
+  await query(
+    `INSERT IGNORE INTO dealer_reward_transactions
+     (dealer_id, serial_id, warranty_id, points, description)
+     SELECT
+       COALESCE(w.dealer_id, s.dealer_id),
+       s.id,
+       w.id,
+       p.reward_points,
+       CONCAT('Warranty activated for ', s.serial_no)
+     FROM warranties w
+     INNER JOIN serial_numbers s ON s.id = w.serial_id
+     INNER JOIN products p ON p.id = s.product_id
+     WHERE w.customer_id IS NOT NULL
+       AND COALESCE(w.dealer_id, s.dealer_id) IS NOT NULL
+       AND p.reward_points > 0`
+  );
 }
 
 async function productHasActiveWarranty(productId) {
