@@ -396,7 +396,7 @@ const COMPLAINT_OPEN_WHERE = `
   )`;
 
 async function getDealerDashboardStats(dealerId) {
-  const [serials, warranties, totalComplaints, openComplaints, solvedComplaints, pendingScan, pendingInstallation] =
+  const [serials, warranties, totalComplaints, openComplaints, solvedComplaints, pendingScan, pendingInstallation, rewards] =
     await Promise.all([
     query("SELECT COUNT(*) AS total FROM serial_numbers WHERE dealer_id = ?", [dealerId]),
     query("SELECT COUNT(*) AS total FROM warranties WHERE dealer_id = ? AND customer_id IS NOT NULL", [dealerId]),
@@ -434,6 +434,10 @@ async function getDealerDashboardStats(dealerId) {
          AND LOWER(TRIM(COALESCE(w.installation_status, ''))) = 'required'`,
       [dealerId]
     ),
+    query(
+      "SELECT COALESCE(SUM(points), 0) AS total FROM dealer_reward_transactions WHERE dealer_id = ?",
+      [dealerId]
+    ),
   ]);
   const count = (result) => Number(result.rows[0]?.total || 0);
   const productsSold = count(warranties);
@@ -451,6 +455,7 @@ async function getDealerDashboardStats(dealerId) {
     pendingScan: count(pendingScan),
     assignedProducts: count(pendingScan),
     pendingInstallation: count(pendingInstallation),
+    rewardPoints: count(rewards),
     productsSold,
   };
 }
@@ -1661,6 +1666,7 @@ function installationStatusFromRequired(required) {
 
 async function ensureProductsQrSchema() {
   const columns = [
+    ["reward_points", "ALTER TABLE products ADD COLUMN reward_points INT UNSIGNED NOT NULL DEFAULT 0 AFTER warranty_months"],
     ["qr_status", "ALTER TABLE products ADD COLUMN qr_status VARCHAR(40) NOT NULL DEFAULT 'Not Printed' AFTER warranty_months"],
     ["qr_payload", "ALTER TABLE products ADD COLUMN qr_payload VARCHAR(255) NULL AFTER qr_status"],
     ["qr_printed_at", "ALTER TABLE products ADD COLUMN qr_printed_at TIMESTAMP NULL AFTER qr_payload"],
@@ -1680,6 +1686,25 @@ async function ensureProductsQrSchema() {
       await query(ddl);
     }
   }
+}
+
+async function ensureDealerRewardsSchema() {
+  await query(
+    `CREATE TABLE IF NOT EXISTS dealer_reward_transactions (
+       id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
+       dealer_id CHAR(36) NOT NULL,
+       serial_id CHAR(36) NOT NULL,
+       warranty_id CHAR(36) NOT NULL,
+       points INT UNSIGNED NOT NULL,
+       description VARCHAR(255),
+       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       UNIQUE KEY uq_dealer_reward_serial (serial_id),
+       INDEX idx_dealer_rewards_dealer (dealer_id),
+       CONSTRAINT fk_dealer_rewards_dealer FOREIGN KEY (dealer_id) REFERENCES dealers(id) ON DELETE CASCADE,
+       CONSTRAINT fk_dealer_rewards_serial FOREIGN KEY (serial_id) REFERENCES serial_numbers(id) ON DELETE CASCADE,
+       CONSTRAINT fk_dealer_rewards_warranty FOREIGN KEY (warranty_id) REFERENCES warranties(id) ON DELETE CASCADE
+     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
+  );
 }
 
 async function productHasActiveWarranty(productId) {
@@ -6055,12 +6080,16 @@ app.post("/products/bulk", asyncRoute(async (req, res) => {
   const quantity = Number(req.body.quantity || 1);
   const warrantyMonths = resolveProductWarrantyMonths(req.body);
   const installationRequired = parseInstallationRequired(req.body.installationRequired ?? req.body.installation_required);
+  const rewardPoints = Number(req.body.rewardPoints ?? req.body.reward_points ?? 0);
 
   if (!name || !categoryId) {
     return res.status(400).json({ error: "Product name and category are required." });
   }
   if (!Number.isInteger(quantity) || quantity < 1 || quantity > 500) {
     return res.status(400).json({ error: "Quantity must be a whole number between 1 and 500." });
+  }
+  if (!Number.isInteger(rewardPoints) || rewardPoints < 0 || rewardPoints > 1000000) {
+    return res.status(400).json({ error: "Reward points must be a whole number between 0 and 1,000,000." });
   }
 
   const created = await withTransaction(async (run) => {
@@ -6091,9 +6120,9 @@ app.post("/products/bulk", asyncRoute(async (req, res) => {
       const serialId = crypto.randomUUID();
 
       await run(
-        `INSERT INTO products (id, name, model_no, category, category_id, warranty_months, installation_required)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [productId, name, modelNo, category.name, categoryId, warrantyMonths, installationRequired ? 1 : 0]
+        `INSERT INTO products (id, name, model_no, category, category_id, warranty_months, reward_points, installation_required)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [productId, name, modelNo, category.name, categoryId, warrantyMonths, rewardPoints, installationRequired ? 1 : 0]
       );
       await run(
         `INSERT INTO serial_numbers (id, product_id, serial_no, qr_status, dispatch_status)
@@ -6525,6 +6554,7 @@ async function activateWarrantyFromSerial({ customerId, serialNo, purchaseDate, 
        p.name AS product_name,
        p.model_no,
        p.warranty_months,
+       p.reward_points,
        p.installation_required AS product_installation_required
      FROM serial_numbers s
      LEFT JOIN products p ON p.id = s.product_id
@@ -6679,7 +6709,17 @@ async function activateWarrantyFromSerial({ customerId, serialNo, purchaseDate, 
      LIMIT 1`,
     [warrantyNo]
   );
-  return warranty.rows[0];
+  const savedWarranty = warranty.rows[0];
+  const rewardPoints = Number(row.reward_points || 0);
+  if (actingDealerId && savedWarranty?.id && rewardPoints > 0) {
+    await query(
+      `INSERT IGNORE INTO dealer_reward_transactions
+       (dealer_id, serial_id, warranty_id, points, description)
+       VALUES (?, ?, ?, ?, ?)`,
+      [actingDealerId, row.id, savedWarranty.id, rewardPoints, `Warranty activated for ${row.serial_no}`]
+    );
+  }
+  return { ...savedWarranty, reward_points_awarded: actingDealerId ? rewardPoints : 0 };
 }
 
 app.post("/warranties/activate-from-qr", asyncRoute(async (req, res) => {
@@ -10119,6 +10159,7 @@ try {
   await ensureCustomersVillageSchema();
   await ensureProductCategoriesSchema();
   await ensureProductsQrSchema();
+  await ensureDealerRewardsSchema();
   await ensureComplaintsSchema();
   await ensureFeedbackSchema();
   await ensureTasksSchema();

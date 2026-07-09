@@ -75,6 +75,7 @@ CREATE TABLE IF NOT EXISTS products (
   category VARCHAR(120),
   category_id CHAR(36) NULL,
   warranty_months INT NOT NULL DEFAULT 12,
+  reward_points INT UNSIGNED NOT NULL DEFAULT 0,
   installation_required TINYINT(1) NOT NULL DEFAULT 0,
   qr_status VARCHAR(40) NOT NULL DEFAULT 'Not Printed',
   qr_payload VARCHAR(255),
@@ -155,6 +156,21 @@ CREATE TABLE IF NOT EXISTS warranties (
   CONSTRAINT fk_warranties_customer FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE,
   CONSTRAINT fk_warranties_dealer FOREIGN KEY (dealer_id) REFERENCES dealers(id) ON DELETE SET NULL,
   CONSTRAINT fk_warranties_serial FOREIGN KEY (serial_id) REFERENCES serial_numbers(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS dealer_reward_transactions (
+  id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
+  dealer_id CHAR(36) NOT NULL,
+  serial_id CHAR(36) NOT NULL,
+  warranty_id CHAR(36) NOT NULL,
+  points INT UNSIGNED NOT NULL,
+  description VARCHAR(255),
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_dealer_reward_serial (serial_id),
+  INDEX idx_dealer_rewards_dealer (dealer_id),
+  CONSTRAINT fk_dealer_rewards_dealer FOREIGN KEY (dealer_id) REFERENCES dealers(id) ON DELETE CASCADE,
+  CONSTRAINT fk_dealer_rewards_serial FOREIGN KEY (serial_id) REFERENCES serial_numbers(id) ON DELETE CASCADE,
+  CONSTRAINT fk_dealer_rewards_warranty FOREIGN KEY (warranty_id) REFERENCES warranties(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS complaints (
