@@ -6431,7 +6431,7 @@ app.get("/warranties/customer/:customerId", asyncRoute(async (req, res) => {
   res.json({ warranties: result.rows });
 }));
 
-async function findOrCreateCustomer({ name, mobile, email, address, city, state, pincode, password, createdByDealerId }) {
+async function findOrCreateCustomer({ name, mobile, email, address, city, village, state, pincode, password, createdByDealerId }) {
   const cleanName = cleanString(name);
   const cleanMobile = normalizeMobileValue(mobile);
   const emailNorm = normalizeEmail(email);
@@ -6489,11 +6489,12 @@ async function findOrCreateCustomer({ name, mobile, email, address, city, state,
            name = ?,
            address = COALESCE(?, address),
            city = COALESCE(?, city),
+           village = COALESCE(?, village),
            state = COALESCE(?, state),
            pincode = COALESCE(?, pincode),
            created_by_dealer_id = COALESCE(created_by_dealer_id, ?)
        WHERE id = ?`,
-      [userId, cleanName, address || null, city || null, state || null, pincode || null, createdByDealerId || null, row.id]
+      [userId, cleanName, address || null, city || null, village || null, state || null, pincode || null, createdByDealerId || null, row.id]
     );
     const updated = await query("SELECT * FROM customers WHERE id = ? LIMIT 1", [row.id]);
     return updated.rows[0];
@@ -6535,8 +6536,8 @@ async function findOrCreateCustomer({ name, mobile, email, address, city, state,
   }
 
   await query(
-    "INSERT INTO customers (user_id, name, mobile, address, city, state, pincode, created_by_dealer_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-    [userId, cleanName, cleanMobile, address || null, city || null, state || null, pincode || null, createdByDealerId || null]
+    "INSERT INTO customers (user_id, name, mobile, address, city, village, state, pincode, created_by_dealer_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    [userId, cleanName, cleanMobile, address || null, city || null, village || null, state || null, pincode || null, createdByDealerId || null]
   );
   const created = await query("SELECT * FROM customers WHERE user_id = ? LIMIT 1", [userId]);
   return created.rows[0];
@@ -6780,7 +6781,7 @@ app.post("/warranties/dealer/activate-from-qr", asyncRoute(async (req, res) => {
   const productId = cleanString(req.body.productId || req.body.product_id || scannedProduct.productId);
   const purchaseDate = cleanDate(req.body.purchaseDate || req.body.purchase_date) || new Date().toISOString().slice(0, 10);
   const invoiceNo = cleanString(req.body.invoiceNo || req.body.invoice_no);
-  const { name, mobile, email, address, city, state, pincode } = req.body;
+  const { name, mobile, email, address, city, village, state, pincode } = req.body;
   const cleanMobile = normalizeMobileValue(mobile);
   const cleanEmail = normalizeEmail(email);
 
@@ -6827,6 +6828,7 @@ app.post("/warranties/dealer/activate-from-qr", asyncRoute(async (req, res) => {
     email: cleanEmail || null,
     address,
     city,
+    village,
     state,
     pincode,
     password: "",
