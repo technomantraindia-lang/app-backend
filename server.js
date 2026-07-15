@@ -6226,7 +6226,7 @@ app.get("/products/:productId/scan", asyncRoute(async (req, res) => {
   const product = result.rows[0];
   if (product.qr_status !== "Printed") {
     const unitQrWhere = dealerId
-      ? "product_id = ? AND dealer_id = ? AND qr_status = 'Printed'"
+      ? "product_id = ? AND (dealer_id = ? OR dealer_id IS NULL) AND qr_status = 'Printed'"
       : "product_id = ? AND qr_status = 'Printed'";
     const unitQrParams = dealerId ? [product.id, dealerId] : [product.id];
     const unitQr = await query(
@@ -9291,15 +9291,14 @@ app.post("/dispatch/to-dealer", asyncRoute(async (req, res) => {
   const dispatchDate = cleanDate(req.body.dispatchDate || req.body.dispatch_date);
   const batchNo = cleanString(req.body.batchNo || req.body.batch_no) || `DSP-${Date.now()}`;
 
-  if (!dealerId && !dealerNo) {
-    return res.status(400).json({ error: "Select a dealer to dispatch products." });
-  }
-
-  const dealer = dealerId
-    ? await resolveDealerRecord(dealerId)
-    : (await query("SELECT * FROM dealers WHERE LOWER(TRIM(dealer_no)) = LOWER(?) AND status = 'Active' LIMIT 1", [dealerNo])).rows[0] || null;
-  if (!dealer) {
-    return res.status(400).json({ error: "Active dealer not found." });
+  let dealer = null;
+  if (dealerId || dealerNo) {
+    dealer = dealerId
+      ? await resolveDealerRecord(dealerId)
+      : (await query("SELECT * FROM dealers WHERE LOWER(TRIM(dealer_no)) = LOWER(?) AND status = 'Active' LIMIT 1", [dealerNo])).rows[0] || null;
+    if (!dealer) {
+      return res.status(400).json({ error: "Active dealer not found." });
+    }
   }
 
   let dispatchItems = Array.isArray(req.body.items)
@@ -9371,9 +9370,9 @@ app.post("/dispatch/to-dealer", asyncRoute(async (req, res) => {
           productName: unit.product_name,
           modelNo: unit.model_no,
           serialNo: unit.serial_no,
-          dealerId: dealer.id,
-          dealerNo: dealer.dealer_no,
-          dealerName: dealer.name,
+          dealerId: dealer?.id || "",
+          dealerNo: dealer?.dealer_no || "",
+          dealerName: dealer?.name || "",
         });
         await tx(
           `UPDATE serial_numbers
@@ -9388,9 +9387,9 @@ app.post("/dispatch/to-dealer", asyncRoute(async (req, res) => {
                dispatch_status = 'Dispatched',
                dispatched_at = NOW(),
                installation_required = ?
-           WHERE id = ?`,
+          WHERE id = ?`,
           [
-            dealer.id,
+            dealer?.id || null,
             invoiceNo,
             challanNo,
             batchNo,
@@ -9419,14 +9418,17 @@ app.post("/dispatch/to-dealer", asyncRoute(async (req, res) => {
   const productSummary = [...new Set(detail.rows.map((row) => row.product_name))].join(", ");
   res.status(201).json({
     batchNo,
+    dispatchType: dealer ? "dealer" : "openDealer",
     category: categoryResult.rows[0],
-    dealer: { id: dealer.id, dealer_no: dealer.dealer_no, name: dealer.name },
+    dealer: dealer ? { id: dealer.id, dealer_no: dealer.dealer_no, name: dealer.name } : null,
     count: dispatchedSerialNos.length,
     items: dispatchItems,
     serials: detail.rows,
     serialNumbers: detail.rows.map((row) => row.serial_no),
     printSheetUrl: `/dispatch/qr-print-sheet?batchNo=${encodeURIComponent(batchNo)}`,
-    message: `${dispatchedSerialNos.length} QR code(s) generated for ${dealer.name}. Open Dispatch QR Print to print stickers.`,
+    message: dealer
+      ? `${dispatchedSerialNos.length} QR code(s) generated for ${dealer.name}. Open Dispatch QR Print to print stickers.`
+      : `${dispatchedSerialNos.length} open dealer QR code(s) generated. Any dealer can scan and activate warranty from their login.`,
     productSummary,
   });
 }));
@@ -9620,9 +9622,7 @@ app.get("/dispatch/dashboard", asyncRoute(async (_req, res) => {
       "SELECT COUNT(*) AS total FROM serial_numbers WHERE dealer_id IS NULL AND dispatch_status = 'Pending'"
     ),
     query("SELECT COUNT(*) AS total FROM serial_numbers WHERE qr_status = 'Printed'"),
-    query(
-      "SELECT COUNT(*) AS total FROM serial_numbers WHERE dispatch_status = 'Dispatched' AND dealer_id IS NOT NULL"
-    ),
+    query("SELECT COUNT(*) AS total FROM serial_numbers WHERE dispatch_status = 'Dispatched'"),
     query(
       `SELECT COUNT(DISTINCT batch_no) AS total
        FROM serial_numbers
@@ -9723,7 +9723,6 @@ app.get("/dispatch/batches", asyncRoute(async (_req, res) => {
      WHERE s.dispatch_status = 'Dispatched'
        AND s.batch_no IS NOT NULL
        AND TRIM(s.batch_no) <> ''
-       AND (s.dealer_id IS NOT NULL OR s.dispatched_customer_id IS NOT NULL)
      GROUP BY s.batch_no, s.dealer_id, d.dealer_no, d.name, s.dispatched_customer_id, c.name, c.mobile
      ORDER BY MAX(s.dispatched_at) DESC, s.batch_no DESC
      LIMIT 200`
@@ -9759,7 +9758,7 @@ app.get("/dispatch/batches", asyncRoute(async (_req, res) => {
   res.json({
     batches: result.rows.map((row) => ({
       batchNo: row.batch_no,
-      dispatchType: row.dispatched_customer_id ? "selfSale" : "dealer",
+      dispatchType: row.dispatched_customer_id ? "selfSale" : (row.dealer_id ? "dealer" : "openDealer"),
       dealerId: row.dealer_id,
       dealerNo: row.dealer_no,
       dealerName: row.dealer_name,
