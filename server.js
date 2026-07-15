@@ -53,9 +53,10 @@ function publicUser(row) {
 }
 
 const accountRoles = ["Front Desk", "Dispatch", "Dealer", "Technician", "Customer"];
-const accountCreatorRoles = ["Admin", "Dealer"];
-const customerOnlyAccountCreators = ["Front Desk"];
-const dealerCreatableRoles = ["Customer", "Technician"];
+const accountCreatorRoles = ["Admin", "Dealer", "Front Desk"];
+const customerOnlyAccountCreators = [];
+const dealerCreatableRoles = ["Customer"];
+const frontDeskCreatableRoles = ["Customer", "Technician"];
 const loginOtpChallenges = new Map();
 const selfSaleOtpChallenges = new Map();
 const customerAccountOtpChallenges = new Map();
@@ -853,6 +854,7 @@ async function getComplaintNotifyContext(complaintId, runQuery = query) {
        c.id,
        c.complaint_no,
        c.customer_id,
+       c.created_by_role,
        c.status AS complaint_status,
        COALESCE(c.product_name, p.name) AS product_name,
        COALESCE(c.dealer_id, w.dealer_id, s.dealer_id) AS dealer_id,
@@ -865,7 +867,7 @@ async function getComplaintNotifyContext(complaintId, runQuery = query) {
      LEFT JOIN warranties w ON w.id = c.warranty_id
      LEFT JOIN serial_numbers s ON s.id = w.serial_id
      LEFT JOIN products p ON p.id = s.product_id
-     LEFT JOIN dealers d ON d.id = COALESCE(w.dealer_id, s.dealer_id)
+     LEFT JOIN dealers d ON d.id = COALESCE(c.dealer_id, w.dealer_id, s.dealer_id)
      LEFT JOIN users du ON du.role = 'Dealer' AND ${sqlNormalizeMobileColumn("du.mobile")} = ${sqlNormalizeMobileColumn("d.mobile")}
      LEFT JOIN tasks t ON t.complaint_id = c.id
      LEFT JOIN technicians tech ON tech.id = t.technician_id
@@ -2253,7 +2255,8 @@ async function ensureComplaintsSchema() {
     ["model_no", "ALTER TABLE complaints ADD COLUMN model_no VARCHAR(120) NULL AFTER product_name"],
     ["warranty_start_date", "ALTER TABLE complaints ADD COLUMN warranty_start_date DATE NULL AFTER model_no"],
     ["warranty_end_date", "ALTER TABLE complaints ADD COLUMN warranty_end_date DATE NULL AFTER warranty_start_date"],
-    ["warranty_status", "ALTER TABLE complaints ADD COLUMN warranty_status VARCHAR(60) NULL AFTER warranty_end_date"]
+    ["warranty_status", "ALTER TABLE complaints ADD COLUMN warranty_status VARCHAR(60) NULL AFTER warranty_end_date"],
+    ["created_by_role", "ALTER TABLE complaints ADD COLUMN created_by_role VARCHAR(40) NOT NULL DEFAULT 'Customer' AFTER status"]
   ];
 
   for (const [columnName, ddl] of columns) {
@@ -2995,7 +2998,12 @@ async function prepareOtpAccountPayload(body) {
     throw err;
   }
   if (cleanCreatedByRole === "Dealer" && !dealerCreatableRoles.includes(cleanRole)) {
-    const err = new Error("Dealers can create customer or technician login accounts only.");
+    const err = new Error("Dealers can create customer login accounts only.");
+    err.statusCode = 403;
+    throw err;
+  }
+  if (cleanCreatedByRole === "Front Desk" && !frontDeskCreatableRoles.includes(cleanRole)) {
+    const err = new Error("Front Desk can create customer or technician login accounts only.");
     err.statusCode = 403;
     throw err;
   }
@@ -3006,7 +3014,7 @@ async function prepareOtpAccountPayload(body) {
   }
 
   let creatorDealerId = null;
-  const linkToDealerRole = cleanRole === "Customer" || cleanRole === "Technician";
+  const linkToDealerRole = cleanRole === "Customer";
   if (cleanCreatedByRole === "Dealer" && linkToDealerRole) {
     const dealerProfile = await resolveDealerRecord(cleanString(body.dealerId));
     if (!dealerProfile) {
@@ -3018,11 +3026,17 @@ async function prepareOtpAccountPayload(body) {
   } else if (cleanCreatedByRole === "Admin" && linkToDealerRole) {
     const dealerProfile = await resolveDealerRecord(cleanString(body.dealerId));
     if (!dealerProfile) {
-      const err = new Error("Select a dealer. This account will show in that dealer's customer or technician list.");
+      const err = new Error("Select a dealer. This customer account will show in that dealer's customer list.");
       err.statusCode = 400;
       throw err;
     }
     creatorDealerId = dealerProfile.id;
+  }
+
+  if (cleanRole === "Technician" && !cleanString(body.pincode)) {
+    const err = new Error("Technician account ke liye pin code required hai.");
+    err.statusCode = 400;
+    throw err;
   }
 
   const existingMobile = await query("SELECT id FROM users WHERE mobile = ? LIMIT 1", [mobileCheck.national]);
@@ -3101,7 +3115,7 @@ async function createOtpAccount(payload) {
       const technicianId = crypto.randomUUID();
       await run(
         "INSERT INTO technicians (id, user_id, name, mobile, city, pincode, service_areas, approval_status, created_by_dealer_id) VALUES (?, ?, ?, ?, ?, ?, ?, 'Approved', ?)",
-        [technicianId, userId, payload.name, payload.mobile, payload.city, payload.pincode, payload.serviceAreas, payload.dealerId]
+        [technicianId, userId, payload.name, payload.mobile, payload.city, payload.pincode, payload.serviceAreas, null]
       );
       const result = await run("SELECT * FROM technicians WHERE id = ? LIMIT 1", [technicianId]);
       technician = result.rows[0] || null;
@@ -3563,11 +3577,14 @@ app.post("/accounts", asyncRoute(async (req, res) => {
     return res.status(403).json({ error: "Only customer login accounts can be created for this role." });
   }
   if (cleanCreatedByRole === "Dealer" && !dealerCreatableRoles.includes(cleanRole)) {
-    return res.status(403).json({ error: "Dealers can create customer or technician login accounts only." });
+    return res.status(403).json({ error: "Dealers can create customer login accounts only." });
+  }
+  if (cleanCreatedByRole === "Front Desk" && !frontDeskCreatableRoles.includes(cleanRole)) {
+    return res.status(403).json({ error: "Front Desk can create customer or technician login accounts only." });
   }
 
   let creatorDealerId = null;
-  const linkToDealerRole = cleanRole === "Customer" || cleanRole === "Technician";
+  const linkToDealerRole = cleanRole === "Customer";
   if (cleanCreatedByRole === "Dealer" && linkToDealerRole) {
     const dealerProfile = await resolveDealerRecord(cleanString(dealerId));
     if (!dealerProfile) {
@@ -3580,7 +3597,7 @@ app.post("/accounts", asyncRoute(async (req, res) => {
     const dealerProfile = await resolveDealerRecord(cleanString(dealerId));
     if (!dealerProfile) {
       return res.status(400).json({
-        error: "Select a dealer. This account will show in that dealer's customer or technician list.",
+        error: "Select a dealer. This customer account will show in that dealer's customer list.",
       });
     }
     creatorDealerId = dealerProfile.id;
@@ -3602,6 +3619,9 @@ app.post("/accounts", asyncRoute(async (req, res) => {
   }
   if (cleanPassword.length < 8) {
     return res.status(400).json({ error: "Password must be at least 8 characters." });
+  }
+  if (cleanRole === "Technician" && !cleanString(pincode)) {
+    return res.status(400).json({ error: "Technician account ke liye pin code required hai." });
   }
 
   const existingMobile = await query("SELECT id FROM users WHERE mobile = ? LIMIT 1", [cleanMobile]);
@@ -3642,7 +3662,7 @@ app.post("/accounts", asyncRoute(async (req, res) => {
       cleanCreatedByRole === "Dealer" || cleanCreatedByRole === "Admin" ? "Approved" : "Pending";
     await query(
       "INSERT INTO technicians (user_id, name, mobile, city, pincode, service_areas, approval_status, created_by_dealer_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      [userId, cleanName, cleanMobile, city || null, cleanPincode, serviceAreas || null, technicianApproval, creatorDealerId]
+      [userId, cleanName, cleanMobile, city || null, cleanPincode, serviceAreas || null, technicianApproval, null]
     );
     const result = await query("SELECT * FROM technicians WHERE user_id = ? LIMIT 1", [userId]);
     technician = result.rows[0] || null;
@@ -3980,7 +4000,6 @@ app.patch("/technicians/:id/approval", asyncRoute(async (req, res) => {
     return res.status(400).json({ error: "Status must be Approved or Rejected." });
   }
 
-  const dealerId = cleanString(req.body.dealerId || req.body.dealer_id);
   const existing = await query(
     "SELECT id, user_id, created_by_dealer_id FROM technicians WHERE id = ? LIMIT 1",
     [technicianId]
@@ -3989,31 +4008,8 @@ app.patch("/technicians/:id/approval", asyncRoute(async (req, res) => {
     return res.status(404).json({ error: "Technician not found." });
   }
 
-  let finalDealerId = existing.rows[0].created_by_dealer_id || null;
-  if (status === "Approved") {
-    if (dealerId) {
-      const dealer = await resolveDealerRecord(dealerId);
-      if (!dealer) {
-        return res.status(400).json({ error: "Dealer not found." });
-      }
-      finalDealerId = dealer.id;
-    }
-    if (!finalDealerId) {
-      return res.status(400).json({
-        error: "Select a dealer before approving. Technician must belong to a dealership.",
-      });
-    }
-  }
-
   await withTransaction(async (tx) => {
-    if (status === "Approved") {
-      await tx(
-        "UPDATE technicians SET approval_status = ?, created_by_dealer_id = ? WHERE id = ?",
-        [status, finalDealerId, technicianId]
-      );
-    } else {
-      await tx("UPDATE technicians SET approval_status = ? WHERE id = ?", [status, technicianId]);
-    }
+    await tx("UPDATE technicians SET approval_status = ? WHERE id = ?", [status, technicianId]);
     if (existing.rows[0].user_id) {
       await tx("UPDATE users SET status = ? WHERE id = ?", [status === "Approved" ? "Active" : "Rejected", existing.rows[0].user_id]);
     }
@@ -4032,39 +4028,9 @@ app.patch("/technicians/:id/approval", asyncRoute(async (req, res) => {
 }));
 
 app.patch("/technicians/:id/dealer", asyncRoute(async (req, res) => {
-  const requesterRole = cleanString(req.body.requesterRole);
-  const dealerId = cleanString(req.body.dealerId || req.body.dealer_id);
-  const technicianId = cleanString(req.params.id);
-
-  if (requesterRole !== "Admin") {
-    return res.status(403).json({ error: "Only Admin can assign technicians to a dealer." });
-  }
-  if (!dealerId) {
-    return res.status(400).json({ error: "dealerId is required." });
-  }
-
-  const dealer = await resolveDealerRecord(dealerId);
-  if (!dealer) {
-    return res.status(400).json({ error: "Dealer not found." });
-  }
-
-  const existing = await query("SELECT id FROM technicians WHERE id = ? LIMIT 1", [technicianId]);
-  if (!existing.rowCount) {
-    return res.status(404).json({ error: "Technician not found." });
-  }
-
-  await query("UPDATE technicians SET created_by_dealer_id = ? WHERE id = ?", [dealer.id, technicianId]);
-
-  const result = await query(
-    `SELECT t.*, u.email, u.status AS user_status, d.name AS dealer_name, d.dealer_no AS dealer_no
-     FROM technicians t
-     LEFT JOIN users u ON u.id = t.user_id
-     LEFT JOIN dealers d ON d.id = t.created_by_dealer_id
-     WHERE t.id = ?
-     LIMIT 1`,
-    [technicianId]
-  );
-  res.json({ technician: result.rows[0], dealer: { id: dealer.id, name: dealer.name, dealer_no: dealer.dealer_no } });
+  res.status(410).json({
+    error: "Technicians are not assigned to dealers anymore. Create/approve them by pin code and service area.",
+  });
 }));
 
 async function ensurePaymentsSchema() {
@@ -7810,6 +7776,7 @@ app.post("/replacement-delivery/confirm", asyncRoute(async (req, res) => {
 
 /** List complaints (staff panels). Customers should use `/complaints/customer/:customerId`. */
 app.get("/complaints", asyncRoute(async (_req, res) => {
+  await ensureComplaintsSchema();
   await ensureFeedbackSchema();
   const result = await query(
     `SELECT
@@ -7833,7 +7800,7 @@ app.get("/complaints", asyncRoute(async (_req, res) => {
      LEFT JOIN customers cust ON cust.id = c.customer_id
      LEFT JOIN serial_numbers s ON s.id = w.serial_id
      LEFT JOIN products p ON p.id = s.product_id
-     LEFT JOIN dealers d ON d.id = COALESCE(w.dealer_id, s.dealer_id)
+    LEFT JOIN dealers d ON d.id = COALESCE(c.dealer_id, w.dealer_id, s.dealer_id)
      ${COMPLAINT_LATEST_TASK_JOIN}
      ${COMPLAINT_FEEDBACK_JOIN}
      ${COMPLAINT_LATEST_QUOTATION_JOIN}
@@ -8415,7 +8382,7 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
           status === "Accepted"
             ? `${ctx.technician_name || "Technician"} accepted and will schedule a visit.`
             : status === "Rejected"
-              ? "Dealer will assign another technician."
+              ? "Front Desk will assign another technician."
               : status === "Completed" || status === "Closed"
                 ? `Complaint ${ctx.complaint_no || ""} is marked ${status}.`
                 : `Complaint ${ctx.complaint_no || ""} is on hold. ${resolutionNotes || ""}`.trim(),
@@ -8423,7 +8390,7 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
         entityId: row.complaint_id,
       });
     }
-    if (ctx?.dealer_id) {
+    if (ctx?.created_by_role === "Dealer" && ctx?.dealer_id) {
       await createNotification({
         userId: ctx.dealer_user_id || null,
         recipientRole: "Dealer",
@@ -8532,7 +8499,7 @@ app.post("/tasks/:id/mark-unrepairable", asyncRoute(async (req, res) => {
   if (complaintId) {
     await ensureNotificationsSchema();
     const ctx = await getComplaintNotifyContext(complaintId);
-    if (ctx?.dealer_id) {
+    if (ctx?.created_by_role === "Dealer" && ctx?.dealer_id) {
       await createNotification({
         userId: ctx.dealer_user_id || null,
         recipientRole: "Dealer",
@@ -9646,6 +9613,7 @@ app.get("/complaints/dealer/:dealerId", asyncRoute(async (req, res) => {
      ${COMPLAINT_FEEDBACK_JOIN}
      ${COMPLAINT_LATEST_QUOTATION_JOIN}
      WHERE COALESCE(c.dealer_id, w.dealer_id, s.dealer_id) = ?
+       AND c.created_by_role = 'Dealer'
      ORDER BY c.created_at DESC`,
     [dealerId]
   );
@@ -9768,7 +9736,7 @@ app.post("/complaints/:id/assign-technician", asyncRoute(async (req, res) => {
   const workType = cleanString(req.body.workType || req.body.work_type) || "Warranty Repair";
   const dueAt = cleanString(req.body.dueAt || req.body.due_at) || null;
   const payableAmount = Number(req.body.payableAmount || req.body.payable_amount || 0);
-  const assignedByRole = cleanString(req.body.assignedByRole || req.body.assigned_by_role || req.body.requesterRole) || "Dealer";
+  const assignedByRole = cleanString(req.body.assignedByRole || req.body.assigned_by_role || req.body.requesterRole) || "Front Desk";
   const assignedById = cleanString(req.body.assignedById || req.body.assigned_by_id || req.body.userId || req.body.user_id) || null;
 
   const complaintId = await resolveComplaintId(complaintKey);
@@ -9784,14 +9752,13 @@ app.post("/complaints/:id/assign-technician", asyncRoute(async (req, res) => {
     return res.status(404).json({ error: "Approved technician not found." });
   }
   const assignmentCtx = await getComplaintNotifyContext(complaintId);
-  if (!assignmentCtx?.dealer_id) {
-    return res.status(400).json({ error: "Complaint is not mapped to a dealer. Customer must register warranty from dealer purchase." });
+  const isDealerAssignment = assignedByRole === "Dealer";
+  const isDeskAssignment = assignedByRole === "Front Desk" || assignedByRole === "Admin";
+  if (isDealerAssignment) {
+    return res.status(403).json({ error: "Technician assignment is handled by Front Desk or Admin." });
   }
-  if (!technician.rows[0]?.created_by_dealer_id) {
-    return res.status(400).json({ error: "Technician must belong to a dealer before assignment." });
-  }
-  if (String(technician.rows[0].created_by_dealer_id) !== String(assignmentCtx.dealer_id)) {
-    return res.status(403).json({ error: "Dealer can assign only technicians linked to this dealership." });
+  if (!isDealerAssignment && !isDeskAssignment) {
+    return res.status(403).json({ error: "Only Front Desk or Admin can assign technicians." });
   }
 
   const existingTask = await query("SELECT id FROM tasks WHERE complaint_id = ? ORDER BY created_at DESC LIMIT 1", [complaintId]);
@@ -9866,7 +9833,7 @@ app.post("/complaints/:id/assign-technician", asyncRoute(async (req, res) => {
       entityId: complaintId,
     });
   }
-  if (ctx?.dealer_id) {
+  if (assignedByRole === "Dealer" && ctx?.dealer_id) {
     await createNotification({
       userId: ctx.dealer_user_id || null,
       recipientRole: "Dealer",
@@ -10086,16 +10053,17 @@ app.post("/complaints", asyncRoute(async (req, res) => {
   }
 
   const initialStatus = "Created";
+  const complaintSourceRole = creatorRole || "Customer";
   await ensureWorkflowAuditSchema();
   await query(
     `INSERT INTO complaints
-     (complaint_no, warranty_id, customer_id, dealer_id, problem_type, description, priority, product_name, model_no, warranty_start_date, warranty_end_date, warranty_status, status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     (complaint_no, warranty_id, customer_id, dealer_id, problem_type, description, priority, product_name, model_no, warranty_start_date, warranty_end_date, warranty_status, status, created_by_role)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       cleanComplaintNo,
       resolvedWarrantyId,
       resolvedCustomerId,
-      resolvedDealerId,
+      complaintSourceRole === "Customer" ? null : resolvedDealerId,
       cleanProblemType,
       typeof description === "string" && description.trim() ? description.trim() : null,
       typeof priority === "string" && priority.trim() ? priority.trim() : "Normal",
@@ -10104,7 +10072,8 @@ app.post("/complaints", asyncRoute(async (req, res) => {
       cleanWarrantyStartDate,
       cleanWarrantyEndDate,
       cleanWarrantyStatus,
-      initialStatus
+      initialStatus,
+      complaintSourceRole
     ]
   );
   const result = await query("SELECT * FROM complaints WHERE complaint_no = ? LIMIT 1", [cleanComplaintNo]);
@@ -10126,12 +10095,12 @@ app.post("/complaints", asyncRoute(async (req, res) => {
       customerId: resolvedCustomerId,
       type: "complaint_created",
       title: "Complaint registered",
-      message: `Your complaint ${cleanComplaintNo} was saved. Dealer will assign a technician.`,
+      message: `Your complaint ${cleanComplaintNo} was saved. Front Desk will assign a technician.`,
       entityType: "complaint",
       entityId: saved?.id || null,
     });
   }
-  if (ctx?.dealer_id) {
+  if (complaintSourceRole === "Dealer" && ctx?.dealer_id) {
     await createNotification({
       userId: ctx.dealer_user_id || null,
       recipientRole: "Dealer",
@@ -10144,6 +10113,14 @@ app.post("/complaints", asyncRoute(async (req, res) => {
   }
   await createNotification({
     recipientRole: "Front Desk",
+    type: "new_complaint",
+    title: "New complaint logged",
+    message: `Complaint ${cleanComplaintNo} created for ${ctx?.product_name || "product"}.`,
+    entityType: "complaint",
+    entityId: saved?.id || null,
+  });
+  await createNotification({
+    recipientRole: "Admin",
     type: "new_complaint",
     title: "New complaint logged",
     message: `Complaint ${cleanComplaintNo} created for ${ctx?.product_name || "product"}.`,
@@ -10172,22 +10149,24 @@ app.use((error, _req, res, _next) => {
   res.status(500).json({ error: error?.message || "Internal server error" });
 });
 
-try {
-  await ensureSerialNumbersSchema();
-  await ensureCustomersVillageSchema();
-  await ensureProductCategoriesSchema();
-  await ensureProductsQrSchema();
-  await ensureDealerRewardsSchema();
-  await ensureComplaintsSchema();
-  await ensureFeedbackSchema();
-  await ensureTasksSchema();
-  await ensureWorkTypeCostsSchema();
-  await ensurePaymentsSchema();
-  await ensureQuotationsSchema();
-  await ensureNotificationsSchema();
-  await ensureWorkflowAuditSchema();
-} catch (error) {
-  console.warn("Runtime schema check skipped:", error?.message || error);
+async function runRuntimeSchemaChecks() {
+  try {
+    await ensureSerialNumbersSchema();
+    await ensureCustomersVillageSchema();
+    await ensureProductCategoriesSchema();
+    await ensureProductsQrSchema();
+    await ensureDealerRewardsSchema();
+    await ensureComplaintsSchema();
+    await ensureFeedbackSchema();
+    await ensureTasksSchema();
+    await ensureWorkTypeCostsSchema();
+    await ensurePaymentsSchema();
+    await ensureQuotationsSchema();
+    await ensureNotificationsSchema();
+    await ensureWorkflowAuditSchema();
+  } catch (error) {
+    console.warn("Runtime schema check skipped:", error?.message || error);
+  }
 }
 
 app.listen(port, "0.0.0.0", () => {
@@ -10195,4 +10174,6 @@ app.listen(port, "0.0.0.0", () => {
   console.log(`Admin website: http://localhost:${port}/admin/`);
   console.log(`Health check: http://localhost:${port}/health`);
   console.log("Stop with Ctrl+C. Changes need server restart.");
+
+  runRuntimeSchemaChecks();
 });

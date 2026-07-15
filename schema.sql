@@ -188,6 +188,7 @@ CREATE TABLE IF NOT EXISTS complaints (
   warranty_end_date DATE,
   warranty_status VARCHAR(60),
   status VARCHAR(40) NOT NULL DEFAULT 'Open',
+  created_by_role VARCHAR(40) NOT NULL DEFAULT 'Customer',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   INDEX idx_complaints_customer_id (customer_id),
   INDEX idx_complaints_dealer_id (dealer_id),
