@@ -810,7 +810,8 @@ const COMPLAINT_LATEST_TASK_JOIN = `
   LEFT JOIN tasks t ON t.id = (
     SELECT t2.id FROM tasks t2 WHERE t2.complaint_id = c.id ORDER BY t2.created_at DESC LIMIT 1
   )
-  LEFT JOIN technicians tech ON tech.id = t.technician_id`;
+  LEFT JOIN technicians tech ON tech.id = t.technician_id
+  LEFT JOIN users assigned_user ON assigned_user.id = t.assigned_by_id`;
 
 const COMPLAINT_LATEST_TASK_FIELDS = `
        t.technician_id,
@@ -823,6 +824,9 @@ const COMPLAINT_LATEST_TASK_FIELDS = `
        t.completed_at AS task_completed_at,
        t.resolution_notes AS task_resolution_notes,
        t.created_at AS task_created_at,
+       t.assigned_by_role AS task_assigned_by_role,
+       t.assigned_by_id AS task_assigned_by_id,
+       assigned_user.name AS task_assigned_by_name,
        fb.complaint_id AS feedback_id,
        fb.rating AS feedback_rating,
        fb.remarks AS feedback_remarks,
@@ -2270,7 +2274,9 @@ async function ensureCustomersVillageSchema() {
 async function ensureTasksSchema() {
   const columns = [
     ["completed_at", "ALTER TABLE tasks ADD COLUMN completed_at TIMESTAMP NULL AFTER status"],
-    ["resolution_notes", "ALTER TABLE tasks ADD COLUMN resolution_notes TEXT NULL AFTER completed_at"]
+    ["resolution_notes", "ALTER TABLE tasks ADD COLUMN resolution_notes TEXT NULL AFTER completed_at"],
+    ["assigned_by_role", "ALTER TABLE tasks ADD COLUMN assigned_by_role VARCHAR(80) NULL AFTER payable_amount"],
+    ["assigned_by_id", "ALTER TABLE tasks ADD COLUMN assigned_by_id CHAR(36) NULL AFTER assigned_by_role"]
   ];
   for (const [columnName, ddl] of columns) {
     const found = await query(
@@ -2291,6 +2297,11 @@ async function ensureTasksSchema() {
      SET completed_at = COALESCE(completed_at, created_at)
      WHERE LOWER(TRIM(COALESCE(status, ''))) = 'completed' AND completed_at IS NULL`
   );
+}
+
+function isTaskStatusReassignable(status) {
+  const normalized = String(status || "").trim().toLowerCase();
+  return ["rejected", "cancelled", "canceled"].includes(normalized);
 }
 
 async function ensureTechniciansSchema() {
@@ -5467,6 +5478,7 @@ app.patch("/quotations/:id/admin-decision", asyncRoute(async (req, res) => {
 
 app.get("/dealers/:id/dashboard", asyncRoute(async (req, res) => {
   await ensureFeedbackSchema();
+  await ensureTasksSchema();
   const dealerKey = cleanString(req.params.id);
   if (!dealerKey) {
     return res.status(400).json({ error: "Dealer id is required." });
@@ -6956,6 +6968,7 @@ app.post("/warranties/dealer/activate-from-qr", asyncRoute(async (req, res) => {
 app.post("/warranties/:id/assign-installation", asyncRoute(async (req, res) => {
   await ensureWorkflowAuditSchema();
   await ensureComplaintsSchema();
+  await ensureTasksSchema();
   const warrantyId = await resolveWarrantyId(req.params.id);
   const dealerId = cleanString(req.body.dealerId || req.body.dealer_id);
   const technicianId = cleanString(req.body.technicianId || req.body.technician_id);
@@ -7108,9 +7121,10 @@ app.post("/warranties/:id/assign-installation", asyncRoute(async (req, res) => {
       [complaintId, technicianId, assignedById]
     );
     await tx(
-      `INSERT INTO tasks (task_no, complaint_id, technician_id, work_type, due_at, status, payable_amount)
-       VALUES (?, ?, ?, 'Installation', ?, 'Assigned', ?)`,
-      [taskNo, complaintId, technicianId, dueAt, payableAmount]
+      `INSERT INTO tasks
+       (task_no, complaint_id, technician_id, work_type, due_at, status, payable_amount, assigned_by_role, assigned_by_id)
+       VALUES (?, ?, ?, 'Installation', ?, 'Assigned', ?, 'Dealer', ?)`,
+      [taskNo, complaintId, technicianId, dueAt, payableAmount, assignedById]
     );
     await tx("UPDATE warranties SET installation_status = 'Assigned' WHERE id = ?", [warrantyId]);
     await createWorkflowMessage({
@@ -7920,6 +7934,7 @@ app.post("/replacement-delivery/confirm", asyncRoute(async (req, res) => {
 /** List complaints (staff panels). Customers should use `/complaints/customer/:customerId`. */
 app.get("/complaints", asyncRoute(async (_req, res) => {
   await ensureComplaintsSchema();
+  await ensureTasksSchema();
   await ensureFeedbackSchema();
   const result = await query(
     `SELECT
@@ -8299,6 +8314,9 @@ const TASK_DETAIL_SELECT = `
        t.completed_at,
        t.resolution_notes,
        t.payable_amount,
+       t.assigned_by_role,
+       t.assigned_by_id,
+       assigned_user.name AS assigned_by_name,
        t.created_at,
        c.id AS complaint_db_id,
        c.complaint_no,
@@ -8332,6 +8350,7 @@ const TASK_DETAIL_JOINS = `
      FROM tasks t
      LEFT JOIN complaints c ON c.id = t.complaint_id
      LEFT JOIN technicians tech ON tech.id = t.technician_id
+     LEFT JOIN users assigned_user ON assigned_user.id = t.assigned_by_id
      LEFT JOIN warranties w ON w.id = c.warranty_id
      LEFT JOIN customers cust ON cust.id = COALESCE(c.customer_id, w.customer_id)
      LEFT JOIN serial_numbers s ON s.id = w.serial_id
@@ -8344,6 +8363,7 @@ const TASK_DETAIL_JOINS = `
      ) pay ON pay.task_id = t.id`;
 
 app.get("/tasks", asyncRoute(async (req, res) => {
+  await ensureTasksSchema();
   const status = cleanString(req.query.status);
   const technicianId = cleanString(req.query.technicianId || req.query.technician_id);
   const where = [];
@@ -8370,6 +8390,7 @@ app.get("/tasks", asyncRoute(async (req, res) => {
 }));
 
 app.get("/tasks/:id", asyncRoute(async (req, res) => {
+  await ensureTasksSchema();
   const taskId = await resolveTaskId(req.params.id);
   if (!taskId) {
     return res.status(404).json({ error: "Task not found." });
@@ -9645,6 +9666,7 @@ app.post("/dispatch-mapping", asyncRoute(async (req, res) => {
 
 app.get("/complaints/customer/:customerId", asyncRoute(async (req, res) => {
   await ensureComplaintsSchema();
+  await ensureTasksSchema();
   await ensureFeedbackSchema();
   await ensureQuotationsSchema();
   await ensureReplaceReturnSchema();
@@ -9722,6 +9744,7 @@ app.get("/complaints/customer/:customerId/replacement-cases", asyncRoute(async (
 
 app.get("/complaints/dealer/:dealerId", asyncRoute(async (req, res) => {
   await ensureComplaintsSchema();
+  await ensureTasksSchema();
   await ensureFeedbackSchema();
   const dealerKey = cleanString(req.params.dealerId);
   const dealer = await resolveDealerRecord(dealerKey);
@@ -9874,6 +9897,7 @@ app.post("/complaints/:id/delete", asyncRoute(handleComplaintDelete));
 
 app.post("/complaints/:id/assign-technician", asyncRoute(async (req, res) => {
   await ensureWorkflowAuditSchema();
+  await ensureTasksSchema();
   const complaintKey = cleanString(req.params.id);
   const technicianId = cleanString(req.body.technicianId || req.body.technician_id);
   const workType = cleanString(req.body.workType || req.body.work_type) || "Warranty Repair";
@@ -9894,7 +9918,6 @@ app.post("/complaints/:id/assign-technician", asyncRoute(async (req, res) => {
   if (!technician.rowCount) {
     return res.status(404).json({ error: "Approved technician not found." });
   }
-  const assignmentCtx = await getComplaintNotifyContext(complaintId);
   const isDealerAssignment = assignedByRole === "Dealer";
   const isDeskAssignment = assignedByRole === "Front Desk" || assignedByRole === "Admin";
   if (isDealerAssignment) {
@@ -9904,7 +9927,37 @@ app.post("/complaints/:id/assign-technician", asyncRoute(async (req, res) => {
     return res.status(403).json({ error: "Only Front Desk or Admin can assign technicians." });
   }
 
-  const existingTask = await query("SELECT id FROM tasks WHERE complaint_id = ? ORDER BY created_at DESC LIMIT 1", [complaintId]);
+  const existingTask = await query(
+    `SELECT
+       t.id,
+       t.technician_id,
+       t.status,
+       tech.name AS technician_name,
+       assigned_user.name AS assigned_by_name,
+       t.assigned_by_role
+     FROM tasks t
+     LEFT JOIN technicians tech ON tech.id = t.technician_id
+     LEFT JOIN users assigned_user ON assigned_user.id = t.assigned_by_id
+     WHERE t.complaint_id = ?
+     ORDER BY t.created_at DESC
+     LIMIT 1`,
+    [complaintId]
+  );
+  if (
+    existingTask.rowCount &&
+    existingTask.rows[0]?.technician_id &&
+    !isTaskStatusReassignable(existingTask.rows[0]?.status)
+  ) {
+    const row = existingTask.rows[0];
+    const by = row.assigned_by_name || row.assigned_by_role || "Front Desk/Admin";
+    return res.status(409).json({
+      error: `Complaint already assigned to ${row.technician_name || "technician"} by ${by}. Reassign tabhi hoga jab technician reject kare.`,
+      assignedTechnicianName: row.technician_name || null,
+      assignedByName: row.assigned_by_name || null,
+      assignedByRole: row.assigned_by_role || null,
+      taskStatus: row.status || null,
+    });
+  }
   const oldComplaintStatus = complaint.rows[0]?.status || null;
   await withTransaction(async (tx) => {
     await tx("UPDATE complaints SET status = 'Assigned to Technician' WHERE id = ?", [complaintId]);
@@ -9924,13 +9977,40 @@ app.post("/complaints/:id/assign-technician", asyncRoute(async (req, res) => {
     );
     if (existingTask.rowCount) {
       await tx(
-        "UPDATE tasks SET technician_id = ?, work_type = ?, due_at = ?, status = 'Assigned', payable_amount = ? WHERE id = ?",
-        [technicianId, workType, dueAt, Number.isFinite(payableAmount) ? payableAmount : 0, existingTask.rows[0].id]
+        `UPDATE tasks
+         SET technician_id = ?,
+             work_type = ?,
+             due_at = ?,
+             status = 'Assigned',
+             payable_amount = ?,
+             assigned_by_role = ?,
+             assigned_by_id = ?
+         WHERE id = ?`,
+        [
+          technicianId,
+          workType,
+          dueAt,
+          Number.isFinite(payableAmount) ? payableAmount : 0,
+          assignedByRole,
+          assignedById,
+          existingTask.rows[0].id
+        ]
       );
     } else {
       await tx(
-        "INSERT INTO tasks (task_no, complaint_id, technician_id, work_type, due_at, status, payable_amount) VALUES (?, ?, ?, ?, ?, 'Assigned', ?)",
-        [`TASK-${Date.now()}`, complaintId, technicianId, workType, dueAt, Number.isFinite(payableAmount) ? payableAmount : 0]
+        `INSERT INTO tasks
+         (task_no, complaint_id, technician_id, work_type, due_at, status, payable_amount, assigned_by_role, assigned_by_id)
+         VALUES (?, ?, ?, ?, ?, 'Assigned', ?, ?, ?)`,
+        [
+          `TASK-${Date.now()}`,
+          complaintId,
+          technicianId,
+          workType,
+          dueAt,
+          Number.isFinite(payableAmount) ? payableAmount : 0,
+          assignedByRole,
+          assignedById
+        ]
       );
     }
     await createWorkflowMessage({
