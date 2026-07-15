@@ -62,6 +62,7 @@ const selfSaleOtpChallenges = new Map();
 const customerAccountOtpChallenges = new Map();
 const accountOtpChallenges = new Map();
 const LOGIN_OTP_TTL_MS = 5 * 60 * 1000;
+const pincodeLookupCache = new Map();
 
 function normalizeEmail(email) {
   return typeof email === "string" ? email.trim().toLowerCase() : "";
@@ -491,6 +492,121 @@ async function findTechnicianForUser(userRow) {
 
 function cleanString(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizePincode(value) {
+  return String(value ?? "").replace(/\D/g, "").slice(0, 6);
+}
+
+function bestCityFromPostalOffice(postOffice) {
+  return cleanString(
+    postOffice?.Block ||
+      postOffice?.Taluk ||
+      postOffice?.District ||
+      postOffice?.Name ||
+      postOffice?.Division
+  );
+}
+
+async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 6000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+      headers: {
+        Accept: "application/json",
+        ...(options.headers || {}),
+      },
+    });
+    if (!response.ok) {
+      return null;
+    }
+    return response.json();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function lookupPincodeLocation(pincode) {
+  const pin = normalizePincode(pincode);
+  if (pin.length !== 6) {
+    const err = new Error("Enter a valid 6 digit pin code.");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const cached = pincodeLookupCache.get(pin);
+  if (cached && Date.now() - cached.at < 24 * 60 * 60 * 1000) {
+    return cached.data;
+  }
+
+  let local = null;
+  try {
+    const areaResult = await query(
+      `SELECT state, city, area, pincode
+       FROM service_areas
+       WHERE pincode = ?
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [pin]
+    );
+    local = areaResult.rows?.[0] || null;
+  } catch {
+    local = null;
+  }
+  if (local?.city || local?.state) {
+    const data = {
+      pincode: pin,
+      city: cleanString(local.city),
+      state: cleanString(local.state),
+      area: cleanString(local.area),
+      source: "service_areas",
+    };
+    pincodeLookupCache.set(pin, { data, at: Date.now() });
+    return data;
+  }
+
+  const postalData = await fetchJsonWithTimeout(`https://api.postalpincode.in/pincode/${encodeURIComponent(pin)}`);
+  const postalOffice = Array.isArray(postalData?.[0]?.PostOffice) ? postalData[0].PostOffice[0] : null;
+  if (postalOffice) {
+    const data = {
+      pincode: pin,
+      city: bestCityFromPostalOffice(postalOffice),
+      state: cleanString(postalOffice.State),
+      area: cleanString(postalOffice.Name),
+      district: cleanString(postalOffice.District),
+      source: "postalpincode",
+    };
+    pincodeLookupCache.set(pin, { data, at: Date.now() });
+    return data;
+  }
+
+  const osmUrl =
+    `https://nominatim.openstreetmap.org/search?format=json&addressdetails=1&limit=1&country=India&postalcode=${encodeURIComponent(pin)}`;
+  const osmData = await fetchJsonWithTimeout(osmUrl, {
+    headers: { "User-Agent": "HitaishiCRM/1.0 pincode lookup" },
+  });
+  const first = Array.isArray(osmData) ? osmData[0] : null;
+  if (first?.address) {
+    const address = first.address;
+    const data = {
+      pincode: pin,
+      city: cleanString(address.city || address.town || address.village || address.county || address.state_district),
+      state: cleanString(address.state),
+      area: cleanString(address.suburb || address.neighbourhood || address.state_district),
+      source: "openstreetmap",
+    };
+    pincodeLookupCache.set(pin, { data, at: Date.now() });
+    return data;
+  }
+
+  const err = new Error("Pin code location not found.");
+  err.statusCode = 404;
+  throw err;
 }
 
 function purgeExpiredOtpChallenges(store) {
@@ -6184,6 +6300,11 @@ app.delete("/products/:id", asyncRoute(async (req, res) => {
 app.get("/service-areas", asyncRoute(async (_req, res) => {
   const result = await query("SELECT * FROM service_areas ORDER BY created_at DESC LIMIT 800");
   res.json({ areas: result.rows });
+}));
+
+app.get("/locations/pincode/:pincode", asyncRoute(async (req, res) => {
+  const location = await lookupPincodeLocation(req.params.pincode);
+  res.json({ location });
 }));
 
 app.post("/service-areas", asyncRoute(async (req, res) => {
