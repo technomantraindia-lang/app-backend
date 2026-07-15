@@ -62,6 +62,7 @@ const selfSaleOtpChallenges = new Map();
 const customerAccountOtpChallenges = new Map();
 const accountOtpChallenges = new Map();
 const LOGIN_OTP_TTL_MS = 5 * 60 * 1000;
+const NOTIFICATION_TTL_HOURS = 48;
 const pincodeLookupCache = new Map();
 
 function normalizeEmail(email) {
@@ -824,7 +825,6 @@ const COMPLAINT_LATEST_TASK_FIELDS = `
        t.status AS task_status,
        t.completed_at AS task_completed_at,
        t.resolution_notes AS task_resolution_notes,
-       t.completion_voice_note AS task_completion_voice_note,
        t.completion_code_sent_at AS task_completion_code_sent_at,
        t.completion_verified_at AS task_completion_verified_at,
        t.created_at AS task_created_at,
@@ -987,6 +987,90 @@ async function ensureNotificationsSchema() {
   );
 }
 
+async function purgeExpiredNotifications(runQuery = query) {
+  await runQuery(
+    `DELETE FROM notifications
+     WHERE created_at < DATE_SUB(NOW(), INTERVAL ${NOTIFICATION_TTL_HOURS} HOUR)`
+  );
+}
+
+async function ensurePushTokensSchema() {
+  await query(
+    `CREATE TABLE IF NOT EXISTS push_tokens (
+      id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
+      token VARCHAR(255) NOT NULL UNIQUE,
+      user_id CHAR(36),
+      customer_id CHAR(36),
+      role VARCHAR(80),
+      platform VARCHAR(40),
+      last_seen_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_push_tokens_user (user_id),
+      INDEX idx_push_tokens_customer (customer_id),
+      INDEX idx_push_tokens_role (role)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
+  );
+}
+
+async function sendExpoPushMessages(messages) {
+  const payload = messages
+    .filter((msg) => msg?.to && String(msg.to).startsWith("ExponentPushToken["))
+    .slice(0, 100);
+  if (!payload.length) {
+    return;
+  }
+  try {
+    const response = await fetch("https://exp.host/--/api/v2/push/send", {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Accept-Encoding": "gzip, deflate",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+      console.warn("Expo push failed:", response.status, await response.text().catch(() => ""));
+    }
+  } catch (err) {
+    console.warn("Expo push skipped:", err?.message || err);
+  }
+}
+
+async function sendPushForNotification({ recipientRole = null, customerId = null, userId = null, title, message, entityType = null, entityId = null, type = null }) {
+  try {
+    await ensurePushTokensSchema();
+    const where = [];
+    const params = [];
+    if (customerId) {
+      where.push("customer_id = ?");
+      params.push(customerId);
+    }
+    if (userId) {
+      where.push("user_id = ?");
+      params.push(userId);
+    }
+    if (!where.length) {
+      return;
+    }
+    const result = await query(
+      `SELECT DISTINCT token FROM push_tokens WHERE (${where.join(" OR ")}) ORDER BY last_seen_at DESC LIMIT 100`,
+      params
+    );
+    await sendExpoPushMessages(
+      result.rows.map((row) => ({
+        to: row.token,
+        sound: "default",
+        title: title || "Hitaishi CRM",
+        body: message || "",
+        data: { type, entityType, entityId },
+      }))
+    );
+  } catch (err) {
+    console.warn("Push notification skipped:", err?.message || err);
+  }
+}
+
 async function createNotification({
   recipientRole = null,
   customerId = null,
@@ -1003,6 +1087,7 @@ async function createNotification({
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     [recipientRole, customerId, userId, type, title, message, entityType, entityId]
   );
+  sendPushForNotification({ recipientRole, customerId, userId, type, title, message, entityType, entityId });
 }
 
 async function getComplaintNotifyContext(complaintId, runQuery = query) {
@@ -2283,8 +2368,7 @@ async function ensureTasksSchema() {
     ["assigned_by_id", "ALTER TABLE tasks ADD COLUMN assigned_by_id CHAR(36) NULL AFTER assigned_by_role"],
     ["completion_happy_code", "ALTER TABLE tasks ADD COLUMN completion_happy_code VARCHAR(12) NULL AFTER resolution_notes"],
     ["completion_code_sent_at", "ALTER TABLE tasks ADD COLUMN completion_code_sent_at TIMESTAMP NULL AFTER completion_happy_code"],
-    ["completion_verified_at", "ALTER TABLE tasks ADD COLUMN completion_verified_at TIMESTAMP NULL AFTER completion_code_sent_at"],
-    ["completion_voice_note", "ALTER TABLE tasks ADD COLUMN completion_voice_note LONGTEXT NULL AFTER completion_verified_at"]
+    ["completion_verified_at", "ALTER TABLE tasks ADD COLUMN completion_verified_at TIMESTAMP NULL AFTER completion_code_sent_at"]
   ];
   for (const [columnName, ddl] of columns) {
     const found = await query(
@@ -4805,37 +4889,62 @@ app.get("/quotations", asyncRoute(async (req, res) => {
 
 app.get("/notifications", asyncRoute(async (req, res) => {
   await ensureNotificationsSchema();
+  await purgeExpiredNotifications();
   const customerId = cleanString(req.query.customerId || req.query.customer_id);
   const userId = cleanString(req.query.userId || req.query.user_id);
-  const role = cleanString(req.query.role || req.query.recipientRole || req.query.recipient_role);
-  const where = [];
+  const identityWhere = [];
   const params = [];
   if (customerId) {
-    where.push("customer_id = ?");
+    identityWhere.push("customer_id = ?");
     params.push(customerId);
-  } else if (role && ["Front Desk", "Admin"].includes(role)) {
-    where.push("recipient_role = ?");
-    params.push(role);
-  } else if (userId && role) {
-    where.push("(user_id = ? OR (user_id IS NULL AND recipient_role = ?))");
-    params.push(userId, role);
-  } else if (userId) {
-    where.push("user_id = ?");
-    params.push(userId);
-  } else if (role) {
-    where.push("recipient_role = ?");
-    params.push(role);
   }
-  const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  if (userId) {
+    identityWhere.push("user_id = ?");
+    params.push(userId);
+  }
+  if (!identityWhere.length) {
+    return res.json({ notifications: [] });
+  }
+  const where = [
+    `(${identityWhere.join(" OR ")})`,
+    `created_at >= DATE_SUB(NOW(), INTERVAL ${NOTIFICATION_TTL_HOURS} HOUR)`,
+  ];
   const result = await query(
     `SELECT *
      FROM notifications
-     ${whereSql}
+     WHERE ${where.join(" AND ")}
      ORDER BY created_at DESC
      LIMIT 100`,
     params
   );
   res.json({ notifications: result.rows });
+}));
+
+app.post("/push-tokens", asyncRoute(async (req, res) => {
+  await ensurePushTokensSchema();
+  const token = cleanString(req.body.token);
+  const userId = cleanString(req.body.userId || req.body.user_id) || null;
+  const customerId = cleanString(req.body.customerId || req.body.customer_id) || null;
+  const role = cleanString(req.body.role) || null;
+  const platform = cleanString(req.body.platform) || null;
+  if (!token || !token.startsWith("ExponentPushToken[")) {
+    return res.status(400).json({ error: "Valid Expo push token is required." });
+  }
+  if (!userId && !customerId && !role) {
+    return res.status(400).json({ error: "userId, customerId or role is required." });
+  }
+  await query(
+    `INSERT INTO push_tokens (token, user_id, customer_id, role, platform)
+     VALUES (?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+       user_id = VALUES(user_id),
+       customer_id = VALUES(customer_id),
+       role = VALUES(role),
+       platform = VALUES(platform),
+       last_seen_at = CURRENT_TIMESTAMP`,
+    [token, userId, customerId, role, platform]
+  );
+  res.json({ ok: true });
 }));
 
 app.get("/quotations/complaint/:complaintId", asyncRoute(async (req, res) => {
@@ -8323,7 +8432,6 @@ const TASK_DETAIL_SELECT = `
        t.resolution_notes,
        t.completion_code_sent_at,
        t.completion_verified_at,
-       t.completion_voice_note,
        t.payable_amount,
        t.assigned_by_role,
        t.assigned_by_id,
@@ -8426,7 +8534,6 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
   const dueAt = cleanString(req.body?.dueAt || req.body?.due_at) || null;
   const technicianId = cleanString(req.body?.technicianId || req.body?.technician_id);
   const resolutionNotes = cleanString(req.body?.resolutionNotes || req.body?.resolution_notes) || null;
-  const completionVoiceNote = cleanString(req.body?.completionVoiceNote || req.body?.completion_voice_note || req.body?.voiceNote || req.body?.voice_note) || null;
   if (!taskId || !rawStatus) {
     return res.status(400).json({ error: "Task id and status are required." });
   }
@@ -8474,8 +8581,8 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
   if (status === "Rejected" && current !== "Assigned") {
     return res.status(400).json({ error: "Only new assignments can be rejected." });
   }
-  if ((status === "Completed" || status === "Closed") && technicianId && !resolutionNotes && !completionVoiceNote) {
-    return res.status(400).json({ error: "Completion notes ya voice note required hai." });
+  if ((status === "Completed" || status === "Closed") && technicianId && !resolutionNotes) {
+    return res.status(400).json({ error: "Completion remark required hai." });
   }
 
   const complaintId = row.complaint_id;
@@ -8501,11 +8608,10 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
         `UPDATE tasks
          SET status = 'Pending Happy Code',
              resolution_notes = COALESCE(?, resolution_notes),
-             completion_voice_note = COALESCE(?, completion_voice_note),
              completion_happy_code = ?,
              completion_code_sent_at = CURRENT_TIMESTAMP
          WHERE id = ?`,
-        [resolutionNotes, completionVoiceNote, happyCode, id]
+        [resolutionNotes, happyCode, id]
       );
     } else if (status === "Completed" || status === "Closed") {
       await tx(
@@ -8513,10 +8619,9 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
          SET status = ?,
              completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
              completion_verified_at = COALESCE(completion_verified_at, CURRENT_TIMESTAMP),
-             resolution_notes = COALESCE(?, resolution_notes),
-             completion_voice_note = COALESCE(?, completion_voice_note)
+             resolution_notes = COALESCE(?, resolution_notes)
          WHERE id = ?`,
-        [status, resolutionNotes, completionVoiceNote, id]
+        [status, resolutionNotes, id]
       );
       await ensurePaymentForCompletedTask(id, tx);
       if (isInstallationTask && row.warranty_id) {
@@ -10533,6 +10638,8 @@ async function runRuntimeSchemaChecks() {
     await ensurePaymentsSchema();
     await ensureQuotationsSchema();
     await ensureNotificationsSchema();
+    await purgeExpiredNotifications();
+    await ensurePushTokensSchema();
     await ensureWorkflowAuditSchema();
   } catch (error) {
     console.warn("Runtime schema check skipped:", error?.message || error);
@@ -10547,4 +10654,10 @@ app.listen(port, "0.0.0.0", () => {
 
   runRuntimeSchemaChecks();
 });
+
+setInterval(() => {
+  purgeExpiredNotifications().catch((error) => {
+    console.warn("Notification cleanup skipped:", error?.message || error);
+  });
+}, 60 * 60 * 1000);
 
