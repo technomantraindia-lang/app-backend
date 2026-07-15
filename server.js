@@ -102,6 +102,39 @@ function requireTenDigitMobile(mobile, countryDial) {
   return { ok: true, national };
 }
 
+async function ensureUniqueLoginIdentity({ mobile, email, excludeUserId = null }, runQuery = query) {
+  const cleanMobile = normalizeLoginMobile(mobile);
+  const cleanEmail = normalizeEmail(email);
+  if (cleanMobile) {
+    const params = [cleanMobile];
+    const exclude = excludeUserId ? " AND id <> ?" : "";
+    if (excludeUserId) params.push(excludeUserId);
+    const existingMobile = await runQuery(
+      `SELECT id FROM users WHERE RIGHT(${sqlNormalizeMobileColumn("mobile")}, 10) = ?${exclude} LIMIT 1`,
+      params
+    );
+    if (existingMobile.rowCount) {
+      const err = new Error("This mobile number already has a login account.");
+      err.statusCode = 409;
+      throw err;
+    }
+  }
+  if (cleanEmail) {
+    const params = [cleanEmail];
+    const exclude = excludeUserId ? " AND id <> ?" : "";
+    if (excludeUserId) params.push(excludeUserId);
+    const existingEmail = await runQuery(
+      `SELECT id FROM users WHERE LOWER(TRIM(COALESCE(email,''))) = ?${exclude} LIMIT 1`,
+      params
+    );
+    if (existingEmail.rowCount) {
+      const err = new Error("This email ID already has a login account.");
+      err.statusCode = 409;
+      throw err;
+    }
+  }
+}
+
 function renderSmsTemplate(template, values) {
   return String(template || "").replace(/\{\{(\w+)\}\}/g, (_match, key) => encodeURIComponent(values[key] ?? ""));
 }
@@ -2842,9 +2875,10 @@ app.post("/admin/self-sale/request-otp", asyncRoute(async (req, res) => {
   }
   const storedMobile = mobileCheck.national;
 
-  const existingUser = await query("SELECT id FROM users WHERE mobile = ? LIMIT 1", [storedMobile]);
-  if (existingUser.rowCount) {
-    return res.status(409).json({ error: "This mobile number already has a login account." });
+  try {
+    await ensureUniqueLoginIdentity({ mobile: storedMobile });
+  } catch (err) {
+    return res.status(err.statusCode || 409).json({ error: err.message || "This mobile number already has a login account." });
   }
   const existingCustomer = await query("SELECT id FROM customers WHERE mobile = ? LIMIT 1", [storedMobile]);
   if (existingCustomer.rowCount) {
@@ -2903,12 +2937,7 @@ app.post("/admin/self-sale/verify-otp", asyncRoute(async (req, res) => {
 
   const { name, mobile, city, village, pincode } = challenge.payload;
   const created = await withTransaction(async (run) => {
-    const existingUser = await run("SELECT id FROM users WHERE mobile = ? LIMIT 1", [mobile]);
-    if (existingUser.rowCount) {
-      const err = new Error("This mobile number already has a login account.");
-      err.statusCode = 409;
-      throw err;
-    }
+    await ensureUniqueLoginIdentity({ mobile }, run);
     const existingCustomer = await run("SELECT id FROM customers WHERE mobile = ? LIMIT 1", [mobile]);
     if (existingCustomer.rowCount) {
       const err = new Error("This mobile number already has a customer profile.");
@@ -2983,9 +3012,10 @@ app.post("/accounts/customer/request-otp", asyncRoute(async (req, res) => {
     creatorDealerId = dealerProfile.id;
   }
 
-  const existingUser = await query("SELECT id FROM users WHERE mobile = ? LIMIT 1", [storedMobile]);
-  if (existingUser.rowCount) {
-    return res.status(409).json({ error: "This mobile number already has a login account." });
+  try {
+    await ensureUniqueLoginIdentity({ mobile: storedMobile });
+  } catch (err) {
+    return res.status(err.statusCode || 409).json({ error: err.message || "This mobile number already has a login account." });
   }
   const existingCustomer = await query("SELECT id FROM customers WHERE mobile = ? LIMIT 1", [storedMobile]);
   if (existingCustomer.rowCount) {
@@ -3054,12 +3084,7 @@ app.post("/accounts/customer/verify-otp", asyncRoute(async (req, res) => {
 
   const { dealerId, name, mobile, city, state, pincode, address, village } = challenge.payload;
   const created = await withTransaction(async (run) => {
-    const existingUser = await run("SELECT id FROM users WHERE mobile = ? LIMIT 1", [mobile]);
-    if (existingUser.rowCount) {
-      const err = new Error("This mobile number already has a login account.");
-      err.statusCode = 409;
-      throw err;
-    }
+    await ensureUniqueLoginIdentity({ mobile }, run);
     const existingCustomer = await run("SELECT id FROM customers WHERE mobile = ? LIMIT 1", [mobile]);
     if (existingCustomer.rowCount) {
       const err = new Error("This mobile number already has a customer profile.");
@@ -3155,12 +3180,7 @@ async function prepareOtpAccountPayload(body) {
     throw err;
   }
 
-  const existingMobile = await query("SELECT id FROM users WHERE mobile = ? LIMIT 1", [mobileCheck.national]);
-  if (existingMobile.rowCount) {
-    const err = new Error("This mobile number already has a login account.");
-    err.statusCode = 409;
-    throw err;
-  }
+  await ensureUniqueLoginIdentity({ mobile: mobileCheck.national, email: cleanEmail });
 
   if (cleanRole === "Customer") {
     const existingCustomer = await query("SELECT id FROM customers WHERE mobile = ? LIMIT 1", [mobileCheck.national]);
@@ -3200,12 +3220,7 @@ async function prepareOtpAccountPayload(body) {
 
 async function createOtpAccount(payload) {
   return withTransaction(async (run) => {
-    const existingMobile = await run("SELECT id FROM users WHERE mobile = ? LIMIT 1", [payload.mobile]);
-    if (existingMobile.rowCount) {
-      const err = new Error("This mobile number already has a login account.");
-      err.statusCode = 409;
-      throw err;
-    }
+    await ensureUniqueLoginIdentity({ mobile: payload.mobile, email: payload.email }, run);
 
     const userId = crypto.randomUUID();
     await run(
@@ -3392,20 +3407,10 @@ app.patch("/auth/profile", asyncRoute(async (req, res) => {
     return res.status(404).json({ error: "Profile not found." });
   }
 
-  const mobileConflict = await query(
-    "SELECT id FROM users WHERE mobile = ? AND id <> ? LIMIT 1",
-    [mobileCheck.national, userId]
-  );
-  if (mobileConflict.rowCount) {
-    return res.status(409).json({ error: "This mobile number is already used by another account." });
-  }
-
-  const emailConflict = await query(
-    "SELECT id FROM users WHERE LOWER(TRIM(COALESCE(email,''))) = ? AND role = ? AND id <> ? LIMIT 1",
-    [email, role, userId]
-  );
-  if (emailConflict.rowCount) {
-    return res.status(409).json({ error: "This email is already used for this role." });
+  try {
+    await ensureUniqueLoginIdentity({ mobile: mobileCheck.national, email, excludeUserId: userId });
+  } catch (err) {
+    return res.status(err.statusCode || 409).json({ error: err.message || "This login identity is already used." });
   }
 
   await query(
@@ -3740,16 +3745,10 @@ app.post("/accounts", asyncRoute(async (req, res) => {
     return res.status(400).json({ error: "Technician account ke liye pin code required hai." });
   }
 
-  const existingMobile = await query("SELECT id FROM users WHERE mobile = ? LIMIT 1", [cleanMobile]);
-  if (existingMobile.rowCount) {
-    return res.status(409).json({ error: "This mobile number already has a login account." });
-  }
-  const existingEmail = await query(
-    "SELECT id FROM users WHERE LOWER(TRIM(COALESCE(email,''))) = ? AND role = ? LIMIT 1",
-    [cleanEmail, cleanRole]
-  );
-  if (existingEmail.rowCount) {
-    return res.status(409).json({ error: "This login ID already exists for the selected role." });
+  try {
+    await ensureUniqueLoginIdentity({ mobile: cleanMobile, email: cleanEmail });
+  } catch (err) {
+    return res.status(err.statusCode || 409).json({ error: err.message || "This login identity is already used." });
   }
 
   await query(
@@ -5746,13 +5745,30 @@ app.patch("/dealers/:id", asyncRoute(async (req, res) => {
     return res.status(400).json({ error: mobileCheck.error });
   }
 
-  const existing = await query("SELECT dealer_no, user_id FROM dealers WHERE id = ? LIMIT 1", [id]);
+  const existing = await query("SELECT dealer_no, user_id, mobile FROM dealers WHERE id = ? LIMIT 1", [id]);
   if (!existing.rowCount) {
     return res.status(404).json({ error: "Dealer not found." });
   }
   const dealerNo = cleanString(existing.rows[0].dealer_no);
   if (!dealerNo) {
     return res.status(400).json({ error: "Dealer number is missing on this profile." });
+  }
+
+  let linkedUserId = cleanString(existing.rows[0].user_id);
+  if (!linkedUserId) {
+    const oldMobile = normalizeLoginMobile(existing.rows[0].mobile);
+    if (oldMobile) {
+      const userByOldMobile = await query(
+        `SELECT id FROM users WHERE role = 'Dealer' AND RIGHT(${sqlNormalizeMobileColumn("mobile")}, 10) = ? LIMIT 1`,
+        [oldMobile]
+      );
+      linkedUserId = cleanString(userByOldMobile.rows?.[0]?.id);
+    }
+  }
+  try {
+    await ensureUniqueLoginIdentity({ mobile: mobileCheck.national, excludeUserId: linkedUserId || null });
+  } catch (err) {
+    return res.status(err.statusCode || 409).json({ error: err.message || "This mobile number already has a login account." });
   }
 
   const result = await query(
@@ -5764,7 +5780,9 @@ app.patch("/dealers/:id", asyncRoute(async (req, res) => {
   if (!result.affectedRows) {
     return res.status(404).json({ error: "Dealer not found." });
   }
-  const linkedUserId = cleanString(existing.rows[0].user_id);
+  if (linkedUserId) {
+    await query("UPDATE dealers SET user_id = ? WHERE id = ?", [linkedUserId, id]);
+  }
   if (linkedUserId) {
     await query(
       "UPDATE users SET name = ?, mobile = ?, status = ? WHERE id = ? AND role = 'Dealer'",
@@ -6551,6 +6569,7 @@ async function findOrCreateCustomer({ name, mobile, email, address, city, villag
     }
     if (user.rowCount) {
       userId = user.rows[0].id;
+      await ensureUniqueLoginIdentity({ email: emailNorm, excludeUserId: userId });
       await query(
         `UPDATE users
          SET name = ?,
@@ -6563,6 +6582,7 @@ async function findOrCreateCustomer({ name, mobile, email, address, city, villag
         [cleanName, emailNorm || null, cleanPassword, cleanPassword ? hashPassword(cleanPassword) : null, userId]
       );
     } else {
+      await ensureUniqueLoginIdentity({ mobile: cleanMobile, email: emailNorm });
       await query(
         "INSERT INTO users (role, name, mobile, email, password_hash, status) VALUES ('Customer', ?, ?, ?, ?, 'Active')",
         [cleanName, cleanMobile, emailNorm || null, cleanPassword ? hashPassword(cleanPassword) : null]
@@ -6597,6 +6617,7 @@ async function findOrCreateCustomer({ name, mobile, email, address, city, villag
   let userId;
   if (userCheck.rowCount) {
     userId = userCheck.rows[0].id;
+    await ensureUniqueLoginIdentity({ email: emailNorm, excludeUserId: userId });
     await query(
       `UPDATE users
        SET name = ?,
@@ -6614,6 +6635,7 @@ async function findOrCreateCustomer({ name, mobile, email, address, city, villag
       return updated.rows[0];
     }
   } else {
+    await ensureUniqueLoginIdentity({ mobile: cleanMobile, email: emailNorm });
     await query(
       "INSERT INTO users (role, name, mobile, email, password_hash, status) VALUES ('Customer', ?, ?, ?, ?, 'Active')",
       [cleanName, cleanMobile, emailNorm || null, cleanPassword ? hashPassword(cleanPassword) : null]
