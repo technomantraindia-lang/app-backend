@@ -702,6 +702,7 @@ function complaintStatusForTaskStatus(taskStatus) {
   if (!s) return null;
   if (s === "Completed") return "Closed";
   if (s === "Closed") return "Closed";
+  if (s === "Pending Happy Code") return "Pending Customer Confirmation";
   if (s === "On Hold") return "On Hold";
   if (s === "Rejected") return "Technician Rejected";
   if (s === "Unrepairable") return "Awaiting Dealer Action";
@@ -823,6 +824,9 @@ const COMPLAINT_LATEST_TASK_FIELDS = `
        t.status AS task_status,
        t.completed_at AS task_completed_at,
        t.resolution_notes AS task_resolution_notes,
+       t.completion_voice_note AS task_completion_voice_note,
+       t.completion_code_sent_at AS task_completion_code_sent_at,
+       t.completion_verified_at AS task_completion_verified_at,
        t.created_at AS task_created_at,
        t.assigned_by_role AS task_assigned_by_role,
        t.assigned_by_id AS task_assigned_by_id,
@@ -2276,7 +2280,11 @@ async function ensureTasksSchema() {
     ["completed_at", "ALTER TABLE tasks ADD COLUMN completed_at TIMESTAMP NULL AFTER status"],
     ["resolution_notes", "ALTER TABLE tasks ADD COLUMN resolution_notes TEXT NULL AFTER completed_at"],
     ["assigned_by_role", "ALTER TABLE tasks ADD COLUMN assigned_by_role VARCHAR(80) NULL AFTER payable_amount"],
-    ["assigned_by_id", "ALTER TABLE tasks ADD COLUMN assigned_by_id CHAR(36) NULL AFTER assigned_by_role"]
+    ["assigned_by_id", "ALTER TABLE tasks ADD COLUMN assigned_by_id CHAR(36) NULL AFTER assigned_by_role"],
+    ["completion_happy_code", "ALTER TABLE tasks ADD COLUMN completion_happy_code VARCHAR(12) NULL AFTER resolution_notes"],
+    ["completion_code_sent_at", "ALTER TABLE tasks ADD COLUMN completion_code_sent_at TIMESTAMP NULL AFTER completion_happy_code"],
+    ["completion_verified_at", "ALTER TABLE tasks ADD COLUMN completion_verified_at TIMESTAMP NULL AFTER completion_code_sent_at"],
+    ["completion_voice_note", "ALTER TABLE tasks ADD COLUMN completion_voice_note LONGTEXT NULL AFTER completion_verified_at"]
   ];
   for (const [columnName, ddl] of columns) {
     const found = await query(
@@ -8313,6 +8321,9 @@ const TASK_DETAIL_SELECT = `
        t.status,
        t.completed_at,
        t.resolution_notes,
+       t.completion_code_sent_at,
+       t.completion_verified_at,
+       t.completion_voice_note,
        t.payable_amount,
        t.assigned_by_role,
        t.assigned_by_id,
@@ -8415,6 +8426,7 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
   const dueAt = cleanString(req.body?.dueAt || req.body?.due_at) || null;
   const technicianId = cleanString(req.body?.technicianId || req.body?.technician_id);
   const resolutionNotes = cleanString(req.body?.resolutionNotes || req.body?.resolution_notes) || null;
+  const completionVoiceNote = cleanString(req.body?.completionVoiceNote || req.body?.completion_voice_note || req.body?.voiceNote || req.body?.voice_note) || null;
   if (!taskId || !rawStatus) {
     return res.status(400).json({ error: "Task id and status are required." });
   }
@@ -8429,6 +8441,7 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
     "Inspection Started",
     "On Hold",
     "Unrepairable",
+    "Pending Happy Code",
     "Completed",
     "Closed"
   ];
@@ -8461,12 +8474,16 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
   if (status === "Rejected" && current !== "Assigned") {
     return res.status(400).json({ error: "Only new assignments can be rejected." });
   }
+  if ((status === "Completed" || status === "Closed") && technicianId && !resolutionNotes && !completionVoiceNote) {
+    return res.status(400).json({ error: "Completion notes ya voice note required hai." });
+  }
 
   const complaintId = row.complaint_id;
   const complaintBefore = complaintId
     ? await query("SELECT status FROM complaints WHERE id = ? LIMIT 1", [complaintId])
     : { rowCount: 0, rows: [] };
   const oldComplaintStatus = complaintBefore.rows[0]?.status || null;
+  let pendingHappyCode = null;
 
   await ensureWorkflowAuditSchema();
   await withTransaction(async (tx) => {
@@ -8477,10 +8494,29 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
         "UPDATE tasks SET status = ?, resolution_notes = COALESCE(?, resolution_notes) WHERE id = ?",
         [status, resolutionNotes, id]
       );
+    } else if ((status === "Completed" || status === "Closed") && technicianId) {
+      const happyCode = String(crypto.randomInt(100000, 1000000));
+      pendingHappyCode = happyCode;
+      await tx(
+        `UPDATE tasks
+         SET status = 'Pending Happy Code',
+             resolution_notes = COALESCE(?, resolution_notes),
+             completion_voice_note = COALESCE(?, completion_voice_note),
+             completion_happy_code = ?,
+             completion_code_sent_at = CURRENT_TIMESTAMP
+         WHERE id = ?`,
+        [resolutionNotes, completionVoiceNote, happyCode, id]
+      );
     } else if (status === "Completed" || status === "Closed") {
       await tx(
-        "UPDATE tasks SET status = ?, completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP), resolution_notes = COALESCE(?, resolution_notes) WHERE id = ?",
-        [status, resolutionNotes, id]
+        `UPDATE tasks
+         SET status = ?,
+             completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+             completion_verified_at = COALESCE(completion_verified_at, CURRENT_TIMESTAMP),
+             resolution_notes = COALESCE(?, resolution_notes),
+             completion_voice_note = COALESCE(?, completion_voice_note)
+         WHERE id = ?`,
+        [status, resolutionNotes, completionVoiceNote, id]
       );
       await ensurePaymentForCompletedTask(id, tx);
       if (isInstallationTask && row.warranty_id) {
@@ -8498,7 +8534,7 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
       await tx("UPDATE warranties SET installation_status = 'In Progress' WHERE id = ?", [row.warranty_id]);
     }
     if (!complaintId) return;
-    const nextComplaintStatus = complaintStatusForTaskStatus(status);
+    const nextComplaintStatus = complaintStatusForTaskStatus((status === "Completed" || status === "Closed") && technicianId ? "Pending Happy Code" : status);
     if (nextComplaintStatus) {
       await tx("UPDATE complaints SET status = ? WHERE id = ?", [nextComplaintStatus, complaintId]);
       await recordStatusHistory({
@@ -8507,7 +8543,7 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
         newStatus: nextComplaintStatus,
         changedByRole: "Technician",
         changedById: technicianId || row.technician_id || null,
-        remarks: resolutionNotes || `Task marked ${status}`,
+        remarks: resolutionNotes || `Task marked ${nextComplaintStatus === "Pending Customer Confirmation" ? "Pending Happy Code" : status}`,
       }, tx);
     }
     await createWorkflowMessage({
@@ -8515,7 +8551,7 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
       senderRole: "Technician",
       senderId: technicianId || row.technician_id || null,
       receiverRole: "Front Desk",
-      message: resolutionNotes || `Task status changed to ${status}.`,
+      message: resolutionNotes || `Task status changed to ${nextComplaintStatus === "Pending Customer Confirmation" ? "Pending Happy Code" : status}.`,
     }, tx);
   });
 
@@ -8540,7 +8576,7 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
             : status === "Rejected"
               ? "Technician declined assignment"
               : status === "Completed" || status === "Closed"
-                ? "Service completed"
+                ? (pendingHappyCode ? "Happy Code for service confirmation" : "Service completed")
                 : "Service put on hold",
         message:
           status === "Accepted"
@@ -8548,7 +8584,9 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
             : status === "Rejected"
               ? "Front Desk will assign another technician."
               : status === "Completed" || status === "Closed"
-                ? `Complaint ${ctx.complaint_no || ""} is marked ${status}.`
+                ? (pendingHappyCode
+                  ? `Technician marked the job done. Happy Code: ${pendingHappyCode}. Share this code with technician only after checking the problem is solved.`
+                  : `Complaint ${ctx.complaint_no || ""} is marked ${status}.`)
                 : `Complaint ${ctx.complaint_no || ""} is on hold. ${resolutionNotes || ""}`.trim(),
         entityType: "complaint",
         entityId: row.complaint_id,
@@ -8586,6 +8624,115 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
   }
 
   res.json({ task: taskResult.rowCount ? taskResult.rows[0] : null });
+}));
+
+app.post("/tasks/:id/verify-happy-code", asyncRoute(async (req, res) => {
+  await ensureTasksSchema();
+  await ensureWorkflowAuditSchema();
+  await ensureNotificationsSchema();
+  const taskId = await resolveTaskId(req.params.id);
+  const technicianId = cleanString(req.body?.technicianId || req.body?.technician_id);
+  const happyCode = normalizeMobileValue(req.body?.happyCode || req.body?.happy_code || req.body?.code);
+  if (!taskId || !happyCode) {
+    return res.status(400).json({ error: "Task and Happy Code are required." });
+  }
+
+  const existing = await query(
+    `SELECT t.id, t.complaint_id, t.technician_id, t.status, t.work_type, t.completion_happy_code, c.status AS complaint_status, c.warranty_id
+     FROM tasks t
+     LEFT JOIN complaints c ON c.id = t.complaint_id
+     WHERE t.id = ?
+     LIMIT 1`,
+    [taskId]
+  );
+  if (!existing.rowCount) {
+    return res.status(404).json({ error: "Task not found." });
+  }
+  const row = existing.rows[0];
+  if (technicianId && String(row.technician_id) !== technicianId) {
+    return res.status(403).json({ error: "This task is not assigned to you." });
+  }
+  if (String(row.status || "") !== "Pending Happy Code") {
+    return res.status(400).json({ error: "This task is not waiting for Happy Code verification." });
+  }
+  if (String(row.completion_happy_code || "") !== happyCode) {
+    return res.status(401).json({ error: "Happy Code galat hai. Customer notification se sahi code daalein." });
+  }
+
+  const isInstallationTask = String(row.work_type || "").trim().toLowerCase() === "installation";
+  await withTransaction(async (tx) => {
+    await tx(
+      `UPDATE tasks
+       SET status = 'Completed',
+           completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+           completion_verified_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [taskId]
+    );
+    await ensurePaymentForCompletedTask(taskId, tx);
+    if (isInstallationTask && row.warranty_id) {
+      await tx("UPDATE warranties SET installation_status = 'Completed' WHERE id = ?", [row.warranty_id]);
+    }
+    if (row.complaint_id) {
+      await tx("UPDATE complaints SET status = 'Closed' WHERE id = ?", [row.complaint_id]);
+      await recordStatusHistory({
+        complaintId: row.complaint_id,
+        oldStatus: row.complaint_status || null,
+        newStatus: "Closed",
+        changedByRole: "Technician",
+        changedById: technicianId || row.technician_id || null,
+        remarks: "Happy Code verified; problem successfully completed.",
+      }, tx);
+      await createWorkflowMessage({
+        complaintId: row.complaint_id,
+        senderRole: "Technician",
+        senderId: technicianId || row.technician_id || null,
+        receiverRole: "Front Desk",
+        message: "Happy Code verified. Problem successfully completed.",
+      }, tx);
+    }
+  });
+
+  const taskResult = await query(
+    `SELECT ${TASK_DETAIL_SELECT}
+     ${TASK_DETAIL_JOINS}
+     WHERE t.id = ?
+     LIMIT 1`,
+    [taskId]
+  );
+  const ctx = row.complaint_id ? await getComplaintNotifyContext(row.complaint_id) : null;
+  if (ctx?.customer_id) {
+    await createNotification({
+      customerId: ctx.customer_id,
+      type: "happy_code_verified",
+      title: "Problem successfully completed",
+      message: `Complaint ${ctx.complaint_no || ""} completed after Happy Code verification.`,
+      entityType: "complaint",
+      entityId: row.complaint_id,
+    });
+  }
+  await createNotification({
+    recipientRole: "Front Desk",
+    type: "complaint_completed",
+    title: "Complaint completed",
+    message: `${ctx?.complaint_no || "Complaint"} completed after Happy Code verification.`,
+    entityType: "complaint",
+    entityId: row.complaint_id,
+  });
+  await createNotification({
+    recipientRole: "Admin",
+    type: "complaint_completed",
+    title: "Complaint completed",
+    message: `${ctx?.complaint_no || "Complaint"} completed after Happy Code verification.`,
+    entityType: "complaint",
+    entityId: row.complaint_id,
+  });
+
+  res.json({
+    ok: true,
+    message: "Happy Code verified. Problem successfully completed.",
+    task: taskResult.rowCount ? taskResult.rows[0] : null,
+  });
 }));
 
 app.post("/tasks/:id/mark-unrepairable", asyncRoute(async (req, res) => {
