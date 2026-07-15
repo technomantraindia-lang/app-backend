@@ -1,4 +1,4 @@
-import express from "express";
+﻿import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import crypto from "crypto";
@@ -151,7 +151,7 @@ function sqlNormalizeMobileColumn(column) {
   return `REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(${column}, ' ', ''), '-', ''), '+', ''), '(', ''), ')', ''), '.', '')`;
 }
 
-/** Resolve dealer profile for login — by user_id, then last 10 digits of mobile (auto-links user_id when missing). */
+/** Resolve dealer profile for login - by user_id, then last 10 digits of mobile (auto-links user_id when missing). */
 async function findDealerForUser(userRow) {
   if (!userRow?.id) {
     return null;
@@ -462,7 +462,7 @@ async function getDealerDashboardStats(dealerId) {
   };
 }
 
-/** Resolve technician profile for login — by user_id, then mobile (auto-links user_id when missing). */
+/** Resolve technician profile for login - by user_id, then mobile (auto-links user_id when missing). */
 async function findTechnicianForUser(userRow) {
   if (!userRow?.id) {
     return null;
@@ -1649,14 +1649,14 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
     <div class="toolbar-row">
       <label for="labelRotation">Label rotation</label>
       <select id="labelRotation" aria-label="Label rotation">
-        <option value="0" selected>0° — Normal (60×40 horizontal)</option>
-        <option value="90">90° — Clockwise (40×60 vertical)</option>
-        <option value="180">180° — Upside down</option>
-        <option value="270">270° — Counter-clockwise</option>
+        <option value="0" selected>0 deg - Normal (60x40 horizontal)</option>
+        <option value="90">90 deg - Clockwise (40x60 vertical)</option>
+        <option value="180">180 deg - Upside down</option>
+        <option value="270">270 deg - Counter-clockwise</option>
       </select>
       <button id="printBtn" type="button">Print / Save as PDF</button>
     </div>
-    <div class="hint" id="rotationHint">0° Normal — page 60×40mm. Label as designed (wide). Print Scale 100%, margins none.</div>
+    <div class="hint" id="rotationHint">0 deg Normal - page 60x40mm. Label as designed (wide). Print Scale 100%, margins none.</div>
   </div>
   <main>${pageHtml || '<p class="empty-state">No QR codes found for this dispatch.</p>'}</main>
   <script>
@@ -1665,10 +1665,10 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
       var hint = document.getElementById("rotationHint");
       var pageStyle = document.getElementById("pageSizeStyle");
       var hints = {
-        "0": "0° Normal — page 60×40mm. Label as designed (wide). Print Scale 100%, margins none.",
-        "90": "90° Clockwise — page 40×60mm. Label rotated right.",
-        "180": "180° Upside down — page 60×40mm. Label flipped.",
-        "270": "270° Counter-clockwise — page 40×60mm. Label rotated left."
+        "0": "0 deg Normal - page 60x40mm. Label as designed (wide). Print Scale 100%, margins none.",
+        "90": "90 deg Clockwise - page 40x60mm. Label rotated right.",
+        "180": "180 deg Upside down - page 60x40mm. Label flipped.",
+        "270": "270 deg Counter-clockwise - page 40x60mm. Label rotated left."
       };
       function normalizeRotation(value) {
         var num = Number.parseInt(String(value || "0"), 10);
@@ -3348,7 +3348,7 @@ app.post("/auth/change-password", asyncRoute(async (req, res) => {
   res.json({ ok: true });
 }));
 
-/** Logged-in user profile — read fresh details from database. */
+/** Logged-in user profile - read fresh details from database. */
 app.get("/auth/profile", asyncRoute(async (req, res) => {
   const userId = cleanString(req.query.userId);
   const role = cleanString(req.query.role);
@@ -3365,7 +3365,7 @@ app.get("/auth/profile", asyncRoute(async (req, res) => {
   res.json({ user: publicUser(result.rows[0]) });
 }));
 
-/** Logged-in user profile — update name, mobile and email in users table. */
+/** Logged-in user profile - update name, mobile and email in users table. */
 app.patch("/auth/profile", asyncRoute(async (req, res) => {
   const userId = cleanString(req.body.userId);
   const role = cleanString(req.body.role);
@@ -4600,7 +4600,7 @@ app.get("/dealers/by-user/:userId", asyncRoute(async (req, res) => {
   if (!dealer) {
     return res.status(404).json({
       error:
-        "Dealer profile not linked. In Admin → Dealer Management, use the same mobile number as this login account.",
+        "Dealer profile not linked. In Admin -> Dealer Management, use the same mobile number as this login account.",
     });
   }
   res.json({ dealer });
@@ -5193,7 +5193,7 @@ app.post("/quotations/:id/customer-payment", asyncRoute(async (req, res) => {
       senderRole: "Customer",
       senderId: customerId,
       receiverRole: "Front Desk",
-      message: `Customer paid ${row.quotation_no || "quotation"} — Rs ${amount.toFixed(2)} via ${paymentMode}.`,
+      message: `Customer paid ${row.quotation_no || "quotation"} - Rs ${amount.toFixed(2)} via ${paymentMode}.`,
     }, tx);
   });
 
@@ -5201,7 +5201,7 @@ app.post("/quotations/:id/customer-payment", asyncRoute(async (req, res) => {
     recipientRole: "Front Desk",
     type: "quotation_paid",
     title: "Customer paid repair quotation",
-    message: `${row.quotation_no || "Quotation"} — Rs ${amount.toFixed(2)} received from customer.`,
+    message: `${row.quotation_no || "Quotation"} - Rs ${amount.toFixed(2)} received from customer.`,
     entityType: "quotation",
     entityId: quotationId,
   });
@@ -5284,7 +5284,7 @@ app.patch("/quotations/:id/frontdesk-instruction", asyncRoute(async (req, res) =
   if (ctx) {
     await notifyTechnicianForComplaint(ctx, {
       type: instruction === "Proceed" ? "frontdesk_proceed" : "frontdesk_hold",
-      title: instruction === "Proceed" ? "Proceed with work" : "On hold — do not proceed",
+      title: instruction === "Proceed" ? "Proceed with work" : "On hold - do not proceed",
       message:
         instruction === "Proceed"
           ? remarks || "Front Desk approved. Continue and complete the repair."
@@ -5476,7 +5476,7 @@ app.get("/dealers/:id/dashboard", asyncRoute(async (req, res) => {
   if (!dealer) {
     return res.status(404).json({
       error:
-        "Dealer profile not found. Link the dealer login mobile to a dealer record in Admin → Dealer Management.",
+        "Dealer profile not found. Link the dealer login mobile to a dealer record in Admin -> Dealer Management.",
     });
   }
   const dealerId = dealer.id;
@@ -7049,7 +7049,7 @@ app.post("/warranties/:id/assign-installation", asyncRoute(async (req, res) => {
           warrantyId,
           warranty.customer_id,
           dealerId,
-          "Install product at customer location. No quotation required — technician payout is fixed by Admin.",
+          "Install product at customer location. No quotation required - technician payout is fixed by Admin.",
           warranty.product_name,
           warranty.model_no,
           warranty.start_date,
@@ -7097,7 +7097,7 @@ app.post("/warranties/:id/assign-installation", asyncRoute(async (req, res) => {
       senderId: assignedById,
       receiverRole: "Technician",
       receiverId: technicianId,
-      message: "Installation job assigned. Visit customer and complete installation — no quotation needed.",
+      message: "Installation job assigned. Visit customer and complete installation - no quotation needed.",
     }, tx);
   });
 
@@ -7361,7 +7361,7 @@ app.post("/replace-return", asyncRoute(async (req, res) => {
       recipientRole: "Admin",
       type: "replace_return",
       title: `New ${actionType} case`,
-      message: `${caseNo}: ${complaint.product_name || "Product"} — scan QR in Replace/Return panel.`,
+      message: `${caseNo}: ${complaint.product_name || "Product"} - scan QR in Replace/Return panel.`,
       entityType: "replace_return",
       entityId: caseId,
     });
@@ -7378,7 +7378,7 @@ app.post("/replace-return", asyncRoute(async (req, res) => {
   res.status(201).json({
     case: detail.rows[0],
     qrPayload,
-    message: `${actionType} case created. QR is ready — Admin will scan to receive product.`,
+    message: `${actionType} case created. QR is ready - Admin will scan to receive product.`,
   });
 }));
 
@@ -7610,7 +7610,7 @@ app.post("/replace-return/:id/dispatch-replacement", asyncRoute(async (req, res)
     return res.status(404).json({ error: "Dealer not found for this case." });
   }
 
-  const replacementLabel = `Replacement for ${row.customer_name || "Customer"} · ${row.complaint_no || row.case_no}`;
+  const replacementLabel = `Replacement for ${row.customer_name || "Customer"} - ${row.complaint_no || row.case_no}`;
   const batchNo = `RPL-${Date.now()}`;
   const qrPayload = replacementDeliveryQrPayload({
     caseId,
@@ -7653,7 +7653,7 @@ app.post("/replace-return/:id/dispatch-replacement", asyncRoute(async (req, res)
       newStatus: "Replacement Dispatched to Dealer",
       changedByRole: "Admin",
       changedById: adminUserId,
-      remarks: `${replacementLabel} — new serial ${serial.serial_no} sent to ${dealer.dealer_no}`,
+      remarks: `${replacementLabel} - new serial ${serial.serial_no} sent to ${dealer.dealer_no}`,
     }, tx);
   });
 
@@ -7663,7 +7663,7 @@ app.post("/replace-return/:id/dispatch-replacement", asyncRoute(async (req, res)
       recipientRole: "Dealer",
       type: "replacement_dispatched",
       title: "Customer replacement product dispatched",
-      message: `${serial.serial_no} — ${replacementLabel}. Give this unit to the customer.`,
+      message: `${serial.serial_no} - ${replacementLabel}. Give this unit to the customer.`,
       entityType: "replace_return",
       entityId: caseId,
     });
@@ -7689,7 +7689,7 @@ app.post("/replace-return/:id/dispatch-replacement", asyncRoute(async (req, res)
     },
     qrPayload,
     qrUrl: `/replace-return/${caseId}/replacement-qr.svg`,
-    message: `Replacement ${serial.serial_no} dispatched to ${dealer.name}. Print QR sticker — dealer will scan to deliver to customer.`,
+    message: `Replacement ${serial.serial_no} dispatched to ${dealer.name}. Print QR sticker - dealer will scan to deliver to customer.`,
   });
 }));
 
@@ -8522,7 +8522,7 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
             : status === "Rejected"
               ? "Technician rejected job"
               : `Technician marked ${status}`,
-        message: `${ctx.complaint_no || "Complaint"} — ${ctx.technician_name || "Technician"} ${status.toLowerCase()}.`,
+        message: `${ctx.complaint_no || "Complaint"} - ${ctx.technician_name || "Technician"} ${status.toLowerCase()}.`,
         entityType: "complaint",
         entityId: row.complaint_id,
       });
@@ -8626,7 +8626,7 @@ app.post("/tasks/:id/mark-unrepairable", asyncRoute(async (req, res) => {
         recipientRole: "Dealer",
         type: "task_unrepairable",
         title: "Product cannot be repaired",
-        message: `${ctx.complaint_no || "Complaint"} — technician could not repair. Open Replace/Return.`,
+        message: `${ctx.complaint_no || "Complaint"} - technician could not repair. Open Replace/Return.`,
         entityType: "complaint",
         entityId: complaintId,
       });
@@ -9395,7 +9395,7 @@ app.get("/dispatch/stock", asyncRoute(async (_req, res) => {
       id: row.id,
       productName: row.product_name,
       modelNo: row.model_no,
-      categoryName: row.category_name || "—",
+      categoryName: row.category_name || "-",
       inStock: Number(row.in_stock || 0),
       dispatched: Number(row.dispatched || 0),
       qrPrinted: Number(row.qr_printed || 0),
@@ -9515,7 +9515,7 @@ app.get("/dispatch/qr-print-data", asyncRoute(async (req, res) => {
      LIMIT 500`,
     params
   );
-  const title = batchNo ? `Dispatch QR Sheet Â· ${batchNo}` : "Dispatch QR Sheet";
+  const title = batchNo ? `Dispatch QR Sheet - ${batchNo}` : "Dispatch QR Sheet";
   const rows = expandQrPrintRows(result.rows, copies, copiesByProduct).map((serial) => ({
     serialNo: serial.serial_no,
     productId: serial.product_id,
@@ -9581,7 +9581,7 @@ app.get("/dispatch/qr-print-sheet", asyncRoute(async (req, res) => {
      LIMIT 500`,
     params
   );
-  const title = batchNo ? `Dispatch QR Sheet · ${batchNo}` : "Dispatch QR Sheet";
+  const title = batchNo ? `Dispatch QR Sheet - ${batchNo}` : "Dispatch QR Sheet";
   res.type("html").send(buildDispatchQrPrintHtml(result.rows, title, copies, copiesByProduct));
 }));
 
@@ -10227,7 +10227,7 @@ app.post("/complaints", asyncRoute(async (req, res) => {
       recipientRole: "Dealer",
       type: "new_complaint",
       title: "New customer complaint",
-      message: `Complaint ${cleanComplaintNo} — ${cleanProblemType}. Assign a technician in Complaints.`,
+      message: `Complaint ${cleanComplaintNo} - ${cleanProblemType}. Assign a technician in Complaints.`,
       entityType: "complaint",
       entityId: saved?.id || null,
     });
@@ -10298,3 +10298,4 @@ app.listen(port, "0.0.0.0", () => {
 
   runRuntimeSchemaChecks();
 });
+
