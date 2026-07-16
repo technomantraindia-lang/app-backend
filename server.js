@@ -7735,6 +7735,9 @@ app.post("/replace-return/from-warranty-scan", asyncRoute(async (req, res) => {
     : "";
   const description = `${actionType} requested by dealer from active warranty QR scan. ${problemDetails}${exchangeDetail}`.trim();
   const savedProblemDetails = `${problemDetails}${exchangeDetail}`.trim();
+  const completesImmediately = actionType === "Product Exchange" && requestedExchangeSerial;
+  const complaintStatus = completesImmediately ? "Product Exchange Completed" : "Awaiting Dealer Action";
+  const caseStatus = completesImmediately ? "Delivered to Customer" : "Pending Admin Scan";
   const qrPayload = replaceReturnQrPayload({
     caseId,
     caseNo,
@@ -7747,7 +7750,7 @@ app.post("/replace-return/from-warranty-scan", asyncRoute(async (req, res) => {
       `INSERT INTO complaints
          (id, complaint_no, warranty_id, customer_id, dealer_id, problem_type, description, priority,
           product_name, model_no, warranty_start_date, warranty_end_date, warranty_status, status, created_by_role)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'Normal', ?, ?, ?, ?, ?, 'Awaiting Dealer Action', 'Dealer')`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'Normal', ?, ?, ?, ?, ?, ?, 'Dealer')`,
       [
         complaintId,
         complaintNo,
@@ -7761,13 +7764,16 @@ app.post("/replace-return/from-warranty-scan", asyncRoute(async (req, res) => {
         warranty.start_date,
         warranty.expiry_date,
         warranty.status,
+        complaintStatus,
       ]
     );
     await tx(
       `INSERT INTO replace_return_cases
          (id, case_no, complaint_id, task_id, warranty_id, customer_id, dealer_id, serial_id,
-          action_type, problem_details, technician_remarks, requested_exchange_serial_id, status, qr_status, qr_payload, qr_printed_at)
-       VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, ?, 'Pending Admin Scan', 'Printed', ?, CURRENT_TIMESTAMP)`,
+          action_type, problem_details, technician_remarks, requested_exchange_serial_id,
+          replacement_serial_id, replacement_dispatched_at, delivered_to_customer_at,
+          status, qr_status, qr_payload, qr_printed_at)
+       VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, 'Printed', ?, CURRENT_TIMESTAMP)`,
       [
         caseId,
         caseNo,
@@ -7779,30 +7785,54 @@ app.post("/replace-return/from-warranty-scan", asyncRoute(async (req, res) => {
         actionType,
         savedProblemDetails,
         requestedExchangeSerial?.id || null,
+        completesImmediately ? requestedExchangeSerial.id : null,
+        completesImmediately ? new Date() : null,
+        completesImmediately ? new Date() : null,
+        caseStatus,
         qrPayload,
       ]
     );
+    if (completesImmediately) {
+      await tx("UPDATE warranties SET serial_id = ? WHERE id = ?", [requestedExchangeSerial.id, warranty.id]);
+      await tx(
+        `UPDATE serial_numbers
+         SET replacement_case_id = ?,
+             replacement_for_customer_id = ?,
+             replacement_label = ?
+         WHERE id = ?`,
+        [
+          caseId,
+          warranty.customer_id,
+          `Exchange for ${warranty.customer_name || "Customer"} - ${complaintNo}`,
+          requestedExchangeSerial.id,
+        ]
+      );
+    }
     await recordStatusHistory({
       complaintId,
       oldStatus: null,
-      newStatus: "Awaiting Dealer Action",
+      newStatus: complaintStatus,
       changedByRole: "Dealer",
       changedById: createdById,
-      remarks: `${actionType} case ${caseNo} created from warranty QR scan`,
+      remarks: completesImmediately
+        ? `Product exchanged directly by dealer. New serial ${requestedExchangeSerial.serial_no}`
+        : `${actionType} case ${caseNo} created from warranty QR scan`,
     }, tx);
   });
 
-  const adminUsers = await query("SELECT id FROM users WHERE role = 'Admin' LIMIT 5");
-  for (const admin of adminUsers.rows) {
-    await createNotification({
-      userId: admin.id,
-      recipientRole: "Admin",
-      type: "replace_return",
-      title: `New ${actionType} case from QR`,
-      message: `${caseNo}: ${warranty.product_name || "Product"} - ${warranty.serial_no || ""}.`,
-      entityType: "replace_return",
-      entityId: caseId,
-    });
+  if (!completesImmediately) {
+    const adminUsers = await query("SELECT id FROM users WHERE role = 'Admin' LIMIT 5");
+    for (const admin of adminUsers.rows) {
+      await createNotification({
+        userId: admin.id,
+        recipientRole: "Admin",
+        type: "replace_return",
+        title: `New ${actionType} case from QR`,
+        message: `${caseNo}: ${warranty.product_name || "Product"} - ${warranty.serial_no || ""}.`,
+        entityType: "replace_return",
+        entityId: caseId,
+      });
+    }
   }
 
   const detail = await query(
@@ -7817,7 +7847,9 @@ app.post("/replace-return/from-warranty-scan", asyncRoute(async (req, res) => {
     case: detail.rows[0],
     complaintNo,
     qrPayload,
-    message: `${actionType} case created. Admin will scan/receive this product. Warranty remaining period will continue.`,
+    message: completesImmediately
+      ? `Product exchanged successfully with ${requestedExchangeSerial.serial_no}. Warranty remaining period will continue.`
+      : `${actionType} case created. Admin will scan/receive this product. Warranty remaining period will continue.`,
   });
 }));
 
