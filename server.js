@@ -10161,6 +10161,77 @@ app.post("/dispatch-mapping", asyncRoute(async (req, res) => {
   res.json({ ok: true, mapped: result.affectedRows });
 }));
 
+app.post("/dealer-stock/claim-scan", asyncRoute(async (req, res) => {
+  const dealerId = cleanString(req.body.dealerId || req.body.dealer_id);
+  const serialNo = cleanSerialNo(req.body.serialNo || req.body.serial_no);
+  if (!dealerId || !serialNo) {
+    return res.status(400).json({ error: "Dealer and serial number are required." });
+  }
+  const dealer = await resolveDealerRecord(dealerId);
+  if (!dealer) {
+    return res.status(404).json({ error: "Dealer not found." });
+  }
+  const serialResult = await query(
+    `SELECT
+       s.*,
+       p.name AS product_name,
+       p.model_no,
+       p.category,
+       w.id AS warranty_id,
+       w.customer_id AS warranty_customer_id,
+       w.status AS warranty_status
+     FROM serial_numbers s
+     LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN warranties w ON w.serial_id = s.id
+     WHERE LOWER(TRIM(s.serial_no)) = LOWER(TRIM(?))
+     ORDER BY w.created_at DESC
+     LIMIT 1`,
+    [serialNo]
+  );
+  if (!serialResult.rowCount) {
+    return res.status(404).json({ error: "Serial number not found." });
+  }
+  const serial = serialResult.rows[0];
+  if (serial.warranty_customer_id || String(serial.warranty_status || "").toLowerCase() === "active") {
+    return res.status(409).json({ error: "Warranty is already active for this serial. Scan again to open warranty actions." });
+  }
+  if (serial.dealer_id && String(serial.dealer_id) !== String(dealer.id)) {
+    return res.status(403).json({ error: "This product is already assigned to another dealer." });
+  }
+  const alreadyAssigned = serial.dealer_id && String(serial.dealer_id) === String(dealer.id);
+  if (!alreadyAssigned) {
+    await query(
+      `UPDATE serial_numbers
+       SET dealer_id = ?,
+           dispatch_status = 'Dispatched',
+           dispatched_at = COALESCE(dispatched_at, NOW()),
+           dispatch_date = COALESCE(dispatch_date, CURDATE())
+       WHERE id = ?`,
+      [dealer.id, serial.id]
+    );
+  }
+  const updated = await query(
+    `SELECT
+       s.*,
+       p.name AS product_name,
+       p.model_no,
+       p.category
+     FROM serial_numbers s
+     LEFT JOIN products p ON p.id = s.product_id
+     WHERE s.id = ?
+     LIMIT 1`,
+    [serial.id]
+  );
+  res.json({
+    ok: true,
+    claimed: !alreadyAssigned,
+    serial: updated.rows[0] || serial,
+    message: alreadyAssigned
+      ? "Product is already saved in your stock. Scan again to activate warranty."
+      : "Product saved in your dealer stock. Scan this QR again to activate warranty.",
+  });
+}));
+
 app.get("/complaints/customer/:customerId", asyncRoute(async (req, res) => {
   await ensureComplaintsSchema();
   await ensureTasksSchema();
