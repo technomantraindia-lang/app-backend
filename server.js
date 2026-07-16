@@ -1403,7 +1403,7 @@ function buildWarrantyQrLabel({ payload, title = "PLEASE REGISTER", qrUrl = "", 
             </div>
             <div class="scan-copy">
               <div class="scan-title">CUSTOMER SCAN</div>
-              <div class="scan-text">If dealer does not scan</div>
+              <div class="scan-text">If dealer not scan</div>
             </div>
           </div>
         </div>
