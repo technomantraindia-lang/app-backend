@@ -7389,6 +7389,8 @@ const REPLACE_RETURN_DETAIL_JOINS = `
   LEFT JOIN serial_numbers rs ON rs.id = rr.replacement_serial_id
   LEFT JOIN products rp ON rp.id = rs.product_id`;
 
+const QR_WARRANTY_ACTIONS = new Set(["Replace", "Return", "Product Exchange"]);
+
 async function resolveReplaceReturnCase(identifier) {
   const key = cleanString(identifier);
   if (!key) return null;
@@ -7592,6 +7594,181 @@ app.post("/replace-return", asyncRoute(async (req, res) => {
   });
 }));
 
+app.post("/replace-return/from-warranty-scan", asyncRoute(async (req, res) => {
+  await ensureReplaceReturnSchema();
+  await ensureComplaintsSchema();
+  await ensureNotificationsSchema();
+  const dealerId = cleanString(req.body.dealerId || req.body.dealer_id);
+  const serialNo = cleanSerialNo(req.body.serialNo || req.body.serial_no);
+  const warrantyKey = cleanString(req.body.warrantyId || req.body.warranty_id || req.body.warrantyNo || req.body.warranty_no);
+  const actionType = cleanString(req.body.actionType || req.body.action_type);
+  const problemDetails = cleanString(req.body.problemDetails || req.body.problem_details);
+  const createdById = cleanString(req.body.createdById || req.body.userId || req.body.user_id) || null;
+
+  if (!dealerId || (!serialNo && !warrantyKey) || !actionType || !problemDetails) {
+    return res.status(400).json({ error: "Dealer, active warranty/product, action type, and details are required." });
+  }
+  if (!QR_WARRANTY_ACTIONS.has(actionType)) {
+    return res.status(400).json({ error: "Action type must be Replace, Return, or Product Exchange." });
+  }
+
+  const dealer = await resolveDealerRecord(dealerId);
+  if (!dealer) {
+    return res.status(404).json({ error: "Dealer not found." });
+  }
+
+  const lookupWhere = warrantyKey
+    ? "(w.id = ? OR w.warranty_no = ?)"
+    : "LOWER(TRIM(s.serial_no)) = LOWER(TRIM(?))";
+  const lookupParams = warrantyKey ? [warrantyKey, warrantyKey] : [serialNo];
+  const warrantyResult = await query(
+    `SELECT
+       w.*,
+       s.id AS serial_id,
+       s.serial_no,
+       s.dealer_id AS serial_dealer_id,
+       p.name AS product_name,
+       p.model_no,
+       p.category AS product_category,
+       cust.name AS customer_name,
+       cust.mobile AS customer_mobile,
+       d.id AS owning_dealer_id,
+       d.name AS dealer_name,
+       d.dealer_no
+     FROM warranties w
+     LEFT JOIN serial_numbers s ON s.id = w.serial_id
+     LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN customers cust ON cust.id = w.customer_id
+     LEFT JOIN dealers d ON d.id = COALESCE(w.dealer_id, s.dealer_id)
+     WHERE ${lookupWhere}
+     ORDER BY w.created_at DESC
+     LIMIT 1`,
+    lookupParams
+  );
+  if (!warrantyResult.rowCount) {
+    return res.status(404).json({ error: "Active warranty not found for this QR." });
+  }
+  const warranty = warrantyResult.rows[0];
+  if (!warranty.customer_id) {
+    return res.status(400).json({ error: "Warranty is not active for a customer yet." });
+  }
+  if (isWarrantyExpiredStatus(warranty.status, warranty.expiry_date)) {
+    return res.status(400).json({ error: "Warranty has expired. Replace/Return/Exchange is not available." });
+  }
+  const owningDealerId = String(warranty.dealer_id || warranty.serial_dealer_id || warranty.owning_dealer_id || "");
+  if (owningDealerId && owningDealerId !== String(dealer.id)) {
+    return res.status(403).json({ error: "This warranty belongs to another dealer." });
+  }
+
+  const openExisting = await query(
+    `SELECT rr.id, rr.case_no, rr.status
+     FROM replace_return_cases rr
+     WHERE rr.warranty_id = ?
+       AND rr.status NOT IN ('Delivered to Customer', 'Closed', 'Cancelled', 'Return Completed')
+     ORDER BY rr.created_at DESC
+     LIMIT 1`,
+    [warranty.id]
+  );
+  if (openExisting.rowCount) {
+    return res.status(409).json({
+      error: `Case ${openExisting.rows[0].case_no} is already open for this warranty.`,
+      caseId: openExisting.rows[0].id,
+      caseNo: openExisting.rows[0].case_no,
+      status: openExisting.rows[0].status,
+    });
+  }
+
+  const complaintId = crypto.randomUUID();
+  const complaintNo = `CMP-${Date.now()}`;
+  const caseId = crypto.randomUUID();
+  const caseNo = `RR-${Date.now()}`;
+  const problemType = actionType === "Return" ? "Product Return" : actionType === "Product Exchange" ? "Product Exchange" : "Product Replacement";
+  const description = `${actionType} requested by dealer from active warranty QR scan. ${problemDetails}`.trim();
+  const qrPayload = replaceReturnQrPayload({
+    caseId,
+    caseNo,
+    serialNo: warranty.serial_no,
+    actionType,
+  });
+
+  await withTransaction(async (tx) => {
+    await tx(
+      `INSERT INTO complaints
+         (id, complaint_no, warranty_id, customer_id, dealer_id, problem_type, description, priority,
+          product_name, model_no, warranty_start_date, warranty_end_date, warranty_status, status, created_by_role)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'Normal', ?, ?, ?, ?, ?, 'Awaiting Dealer Action', 'Dealer')`,
+      [
+        complaintId,
+        complaintNo,
+        warranty.id,
+        warranty.customer_id,
+        dealer.id,
+        problemType,
+        description,
+        warranty.product_name,
+        warranty.model_no,
+        warranty.start_date,
+        warranty.expiry_date,
+        warranty.status,
+      ]
+    );
+    await tx(
+      `INSERT INTO replace_return_cases
+         (id, case_no, complaint_id, task_id, warranty_id, customer_id, dealer_id, serial_id,
+          action_type, problem_details, technician_remarks, status, qr_status, qr_payload, qr_printed_at)
+       VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, 'Pending Admin Scan', 'Printed', ?, CURRENT_TIMESTAMP)`,
+      [
+        caseId,
+        caseNo,
+        complaintId,
+        warranty.id,
+        warranty.customer_id,
+        dealer.id,
+        warranty.serial_id || null,
+        actionType,
+        problemDetails,
+        qrPayload,
+      ]
+    );
+    await recordStatusHistory({
+      complaintId,
+      oldStatus: null,
+      newStatus: "Awaiting Dealer Action",
+      changedByRole: "Dealer",
+      changedById: createdById,
+      remarks: `${actionType} case ${caseNo} created from warranty QR scan`,
+    }, tx);
+  });
+
+  const adminUsers = await query("SELECT id FROM users WHERE role = 'Admin' LIMIT 5");
+  for (const admin of adminUsers.rows) {
+    await createNotification({
+      userId: admin.id,
+      recipientRole: "Admin",
+      type: "replace_return",
+      title: `New ${actionType} case from QR`,
+      message: `${caseNo}: ${warranty.product_name || "Product"} - ${warranty.serial_no || ""}.`,
+      entityType: "replace_return",
+      entityId: caseId,
+    });
+  }
+
+  const detail = await query(
+    `SELECT ${REPLACE_RETURN_DETAIL_SELECT}
+     ${REPLACE_RETURN_DETAIL_JOINS}
+     WHERE rr.id = ?
+     LIMIT 1`,
+    [caseId]
+  );
+
+  res.status(201).json({
+    case: detail.rows[0],
+    complaintNo,
+    qrPayload,
+    message: `${actionType} case created. Admin will scan/receive this product. Warranty remaining period will continue.`,
+  });
+}));
+
 app.get("/replace-return/:id/scan", asyncRoute(async (req, res) => {
   const caseId = await resolveReplaceReturnCase(req.params.id);
   if (!caseId) {
@@ -7705,6 +7882,9 @@ app.get("/replace-return/:id/available-replacement-serials", asyncRoute(async (r
   if (String(row.status || "") !== "Admin Received") {
     return res.status(400).json({ error: "Admin must receive the product before dispatching replacement." });
   }
+  if (String(row.action_type || "") === "Return") {
+    return res.status(400).json({ error: "Return cases do not need replacement dispatch. Process refund/payment offline after admin receive." });
+  }
   if (row.replacement_serial_id) {
     return res.status(409).json({ error: "Replacement already dispatched for this case." });
   }
@@ -7713,10 +7893,10 @@ app.get("/replace-return/:id/available-replacement-serials", asyncRoute(async (r
   const categoryId = cleanString(row.category_id);
   const clauses = ["s.dealer_id IS NULL", "s.dispatch_status = 'Pending'", "s.replacement_case_id IS NULL"];
   const params = [];
-  if (productName) {
+  if (String(row.action_type || "") !== "Product Exchange" && productName) {
     clauses.push("p.name = ?");
     params.push(productName);
-  } else if (categoryId) {
+  } else if (String(row.action_type || "") !== "Product Exchange" && categoryId) {
     clauses.push("p.category_id = ?");
     params.push(categoryId);
   }
@@ -7779,6 +7959,9 @@ app.post("/replace-return/:id/dispatch-replacement", asyncRoute(async (req, res)
   const row = caseRow.rows[0];
   if (String(row.status || "") !== "Admin Received") {
     return res.status(400).json({ error: "Admin must receive the product before dispatching replacement." });
+  }
+  if (String(row.action_type || "") === "Return") {
+    return res.status(400).json({ error: "Return cases do not need replacement dispatch. Process refund/payment offline after admin receive." });
   }
   if (row.replacement_serial_id) {
     return res.status(409).json({ error: "Replacement already dispatched for this case." });
@@ -9113,7 +9296,12 @@ app.get("/serial-numbers/:serialNo", asyncRoute(async (req, res) => {
        d.mobile AS dealer_mobile,
        cust.name AS dispatched_customer_name,
        cust.mobile AS dispatched_customer_mobile,
+       wcust.name AS warranty_customer_name,
+       wcust.mobile AS warranty_customer_mobile,
+       wcust.name AS customer_name,
+       wcust.mobile AS customer_mobile,
        w.warranty_no,
+       w.id AS warranty_id,
        w.status AS warranty_status,
        w.customer_id AS warranty_customer_id,
        w.installation_status,
@@ -9124,6 +9312,7 @@ app.get("/serial-numbers/:serialNo", asyncRoute(async (req, res) => {
      LEFT JOIN dealers d ON d.id = s.dealer_id
      LEFT JOIN customers cust ON cust.id = s.dispatched_customer_id
      LEFT JOIN warranties w ON w.serial_id = s.id
+     LEFT JOIN customers wcust ON wcust.id = w.customer_id
      WHERE LOWER(TRIM(s.serial_no)) = LOWER(TRIM(?))
      ORDER BY w.created_at DESC
      LIMIT 1`,
