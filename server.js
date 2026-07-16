@@ -2607,6 +2607,7 @@ async function ensureReplaceReturnSchema() {
       replacement_serial_id CHAR(36),
       replacement_dispatched_at TIMESTAMP NULL,
       replacement_dispatched_by CHAR(36),
+      requested_exchange_serial_id CHAR(36),
       delivered_to_customer_at TIMESTAMP NULL,
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       INDEX idx_rr_dealer (dealer_id),
@@ -2618,6 +2619,7 @@ async function ensureReplaceReturnSchema() {
     ["replacement_serial_id", "ALTER TABLE replace_return_cases ADD COLUMN replacement_serial_id CHAR(36) NULL AFTER admin_scanned_by"],
     ["replacement_dispatched_at", "ALTER TABLE replace_return_cases ADD COLUMN replacement_dispatched_at TIMESTAMP NULL AFTER replacement_serial_id"],
     ["replacement_dispatched_by", "ALTER TABLE replace_return_cases ADD COLUMN replacement_dispatched_by CHAR(36) NULL AFTER replacement_dispatched_at"],
+    ["requested_exchange_serial_id", "ALTER TABLE replace_return_cases ADD COLUMN requested_exchange_serial_id CHAR(36) NULL AFTER replacement_dispatched_by"],
     ["delivered_to_customer_at", "ALTER TABLE replace_return_cases ADD COLUMN delivered_to_customer_at TIMESTAMP NULL AFTER replacement_dispatched_by"],
   ];
   for (const [columnName, ddl] of columns) {
@@ -7372,6 +7374,9 @@ const REPLACE_RETURN_DETAIL_SELECT = `
   p.category AS product_category,
   t.resolution_notes AS technician_remarks,
   tech.name AS technician_name,
+  reqs.serial_no AS requested_exchange_serial_no,
+  reqp.name AS requested_exchange_product_name,
+  reqp.model_no AS requested_exchange_model_no,
   rs.serial_no AS replacement_serial_no,
   rp.name AS replacement_product_name,
   rp.model_no AS replacement_model_no`;
@@ -7386,6 +7391,8 @@ const REPLACE_RETURN_DETAIL_JOINS = `
   LEFT JOIN products p ON p.id = s.product_id
   LEFT JOIN tasks t ON t.id = rr.task_id
   LEFT JOIN technicians tech ON tech.id = t.technician_id
+  LEFT JOIN serial_numbers reqs ON reqs.id = rr.requested_exchange_serial_id
+  LEFT JOIN products reqp ON reqp.id = reqs.product_id
   LEFT JOIN serial_numbers rs ON rs.id = rr.replacement_serial_id
   LEFT JOIN products rp ON rp.id = rs.product_id`;
 
@@ -7603,6 +7610,8 @@ app.post("/replace-return/from-warranty-scan", asyncRoute(async (req, res) => {
   const warrantyKey = cleanString(req.body.warrantyId || req.body.warranty_id || req.body.warrantyNo || req.body.warranty_no);
   const actionType = cleanString(req.body.actionType || req.body.action_type);
   const problemDetails = cleanString(req.body.problemDetails || req.body.problem_details);
+  const exchangeSerialId = cleanString(req.body.exchangeSerialId || req.body.exchange_serial_id);
+  const exchangeSerialNo = cleanSerialNo(req.body.exchangeSerialNo || req.body.exchange_serial_no);
   const createdById = cleanString(req.body.createdById || req.body.userId || req.body.user_id) || null;
 
   if (!dealerId || (!serialNo && !warrantyKey) || !actionType || !problemDetails) {
@@ -7660,6 +7669,44 @@ app.post("/replace-return/from-warranty-scan", asyncRoute(async (req, res) => {
     return res.status(403).json({ error: "This warranty belongs to another dealer." });
   }
 
+  let requestedExchangeSerial = null;
+  if (actionType === "Product Exchange") {
+    if (!exchangeSerialId && !exchangeSerialNo) {
+      return res.status(400).json({ error: "Select new product from dealer stock for Product Exchange." });
+    }
+    const exchangeResult = exchangeSerialId
+      ? await query(
+          `SELECT s.*, p.name AS product_name, p.model_no
+           FROM serial_numbers s
+           LEFT JOIN products p ON p.id = s.product_id
+           WHERE s.id = ?
+           LIMIT 1`,
+          [exchangeSerialId]
+        )
+      : await query(
+          `SELECT s.*, p.name AS product_name, p.model_no
+           FROM serial_numbers s
+           LEFT JOIN products p ON p.id = s.product_id
+           WHERE LOWER(TRIM(s.serial_no)) = LOWER(TRIM(?))
+           LIMIT 1`,
+          [exchangeSerialNo]
+        );
+    if (!exchangeResult.rowCount) {
+      return res.status(404).json({ error: "Selected exchange product serial not found." });
+    }
+    requestedExchangeSerial = exchangeResult.rows[0];
+    if (String(requestedExchangeSerial.dealer_id || "") !== String(dealer.id)) {
+      return res.status(403).json({ error: "Selected exchange product is not in this dealer stock." });
+    }
+    const exchangeWarranty = await query(
+      "SELECT id FROM warranties WHERE serial_id = ? AND customer_id IS NOT NULL LIMIT 1",
+      [requestedExchangeSerial.id]
+    );
+    if (exchangeWarranty.rowCount) {
+      return res.status(409).json({ error: "Selected exchange product is already sold/activated." });
+    }
+  }
+
   const openExisting = await query(
     `SELECT rr.id, rr.case_no, rr.status
      FROM replace_return_cases rr
@@ -7683,7 +7730,11 @@ app.post("/replace-return/from-warranty-scan", asyncRoute(async (req, res) => {
   const caseId = crypto.randomUUID();
   const caseNo = `RR-${Date.now()}`;
   const problemType = actionType === "Return" ? "Product Return" : actionType === "Product Exchange" ? "Product Exchange" : "Product Replacement";
-  const description = `${actionType} requested by dealer from active warranty QR scan. ${problemDetails}`.trim();
+  const exchangeDetail = requestedExchangeSerial
+    ? ` Exchange with: ${requestedExchangeSerial.product_name || "Product"} - ${requestedExchangeSerial.model_no || "-"} - ${requestedExchangeSerial.serial_no}.`
+    : "";
+  const description = `${actionType} requested by dealer from active warranty QR scan. ${problemDetails}${exchangeDetail}`.trim();
+  const savedProblemDetails = `${problemDetails}${exchangeDetail}`.trim();
   const qrPayload = replaceReturnQrPayload({
     caseId,
     caseNo,
@@ -7715,8 +7766,8 @@ app.post("/replace-return/from-warranty-scan", asyncRoute(async (req, res) => {
     await tx(
       `INSERT INTO replace_return_cases
          (id, case_no, complaint_id, task_id, warranty_id, customer_id, dealer_id, serial_id,
-          action_type, problem_details, technician_remarks, status, qr_status, qr_payload, qr_printed_at)
-       VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, 'Pending Admin Scan', 'Printed', ?, CURRENT_TIMESTAMP)`,
+          action_type, problem_details, technician_remarks, requested_exchange_serial_id, status, qr_status, qr_payload, qr_printed_at)
+       VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, ?, 'Pending Admin Scan', 'Printed', ?, CURRENT_TIMESTAMP)`,
       [
         caseId,
         caseNo,
@@ -7726,7 +7777,8 @@ app.post("/replace-return/from-warranty-scan", asyncRoute(async (req, res) => {
         dealer.id,
         warranty.serial_id || null,
         actionType,
-        problemDetails,
+        savedProblemDetails,
+        requestedExchangeSerial?.id || null,
         qrPayload,
       ]
     );
@@ -10192,9 +10244,6 @@ app.post("/dealer-stock/claim-scan", asyncRoute(async (req, res) => {
     return res.status(404).json({ error: "Serial number not found." });
   }
   const serial = serialResult.rows[0];
-  if (serial.warranty_customer_id || String(serial.warranty_status || "").toLowerCase() === "active") {
-    return res.status(409).json({ error: "Warranty is already active for this serial. Scan again to open warranty actions." });
-  }
   if (serial.dealer_id && String(serial.dealer_id) !== String(dealer.id)) {
     return res.status(403).json({ error: "This product is already assigned to another dealer." });
   }
