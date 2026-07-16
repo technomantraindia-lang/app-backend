@@ -20,6 +20,7 @@ const QRErrorCorrectLevel = require("qrcode-terminal/vendor/QRCode/QRErrorCorrec
 
 const app = express();
 const port = process.env.PORT || 4000;
+const APP_QR_URL = process.env.HITAISHI_APP_QR_URL || "https://play.google.com/store/apps/details?id=com.instagram.android";
 
 app.use(cors());
 app.use(express.json());
@@ -1375,6 +1376,7 @@ function expandQrPrintRows(rows, copies = 1, copiesByProduct = new Map()) {
 }
 
 function buildWarrantyQrLabel({ payload, title = "PLEASE REGISTER", qrUrl = "", serial = "", model = "", product = "" }) {
+  const serviceCategory = [model, serial].filter(Boolean).join(" | ");
   return `
     <div class="label-print-slot">
     <section class="warranty-label">
@@ -1401,14 +1403,20 @@ function buildWarrantyQrLabel({ payload, title = "PLEASE REGISTER", qrUrl = "", 
             </div>
             <div class="scan-copy">
               <div class="scan-title">CUSTOMER SCAN</div>
-              <div class="scan-text">If dealer does not scan, customer can scan to activate warranty</div>
+              <div class="scan-text">If dealer does not scan</div>
             </div>
           </div>
         </div>
+        <div class="app-install-block">
+          <div class="app-install-qr">${qrSvg(APP_QR_URL, 84, 1)}</div>
+          <div class="app-install-text">Scan to install app</div>
+        </div>
         <div class="qr-panel">
           <div class="qr-wrap">
-            ${qrSvg(payload, 260, 2)}
+            ${qrSvg(payload, 300, 2)}
           </div>
+          <div class="service-category">${escapeHtml(serviceCategory)}</div>
+          <div class="service-product">${escapeHtml(product)}</div>
           <a class="download" href="${escapeHtml(qrUrl)}">Download QR</a>
         </div>
       </div>
@@ -1419,7 +1427,7 @@ function buildWarrantyQrLabel({ payload, title = "PLEASE REGISTER", qrUrl = "", 
         <div class="footer-brand">HITAISHI TECHNOLOGIES PVT. LTD.</div>
       </footer>
       <div class="print-meta">
-        ${escapeHtml([product, model, serial].filter(Boolean).join(" | "))}
+        ${escapeHtml(serviceCategory || product)}
       </div>
     </section>
     </div>`;
@@ -1522,7 +1530,7 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
       flex: 1 1 auto;
       min-height: 0;
       display: grid;
-      grid-template-columns: minmax(0, 1fr) 21.8mm;
+      grid-template-columns: minmax(0, 1fr) 24.2mm;
       grid-template-rows: auto 1fr;
       grid-template-areas:
         "header ."
@@ -1530,6 +1538,7 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
       column-gap: 1.15mm;
       padding: 2.35mm 2.1mm 1.5mm 2.8mm;
       align-items: start;
+      position: relative;
     }
     .label-header {
       grid-area: header;
@@ -1657,18 +1666,46 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
       line-height: 1.13;
       font-weight: 700;
     }
+    .app-install-block {
+      position: absolute;
+      left: 2.8mm;
+      bottom: 1.15mm;
+      display: flex;
+      align-items: center;
+      gap: 1.1mm;
+      max-width: 30mm;
+      min-width: 0;
+    }
+    .app-install-qr {
+      width: 5.9mm;
+      height: 5.9mm;
+      flex: 0 0 5.9mm;
+      overflow: hidden;
+      background: #fff;
+    }
+    .app-install-qr svg {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+    .app-install-text {
+      font-size: 1.55mm;
+      line-height: 1;
+      font-weight: 800;
+      white-space: nowrap;
+    }
     .qr-panel {
       grid-area: qr;
-      width: 21.8mm;
-      height: 21.8mm;
+      width: 24.2mm;
+      min-height: 27mm;
       align-self: center;
       justify-self: end;
       position: relative;
-      margin-top: 0.4mm;
+      margin-top: -0.4mm;
     }
     .qr-wrap {
-      width: 100%;
-      height: 100%;
+      width: 24.2mm;
+      height: 24.2mm;
       border: 0.38mm solid #111;
       border-radius: 1.55mm;
       padding: 0.4mm;
@@ -1676,12 +1713,32 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
       overflow: hidden;
     }
     .qr-wrap svg { width: 100%; height: 100%; display: block; }
+    .service-category {
+      margin-top: 0.75mm;
+      width: 24.2mm;
+      font-size: 1.5mm;
+      line-height: 1;
+      font-weight: 800;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: clip;
+    }
+    .service-product {
+      margin-top: 0.55mm;
+      width: 24.2mm;
+      font-size: 1.35mm;
+      line-height: 1;
+      font-weight: 800;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: clip;
+    }
     .label-footer {
       flex: 0 0 7.85mm;
       display: flex;
       align-items: center;
       gap: 0.8mm;
-      padding: 0 2.1mm;
+      padding: 0 2.8mm;
       background: #050505;
       color: #fff;
       font-weight: 900;
