@@ -21,6 +21,7 @@ const QRErrorCorrectLevel = require("qrcode-terminal/vendor/QRCode/QRErrorCorrec
 const app = express();
 const port = process.env.PORT || 4000;
 const APP_QR_URL = process.env.HITAISHI_APP_QR_URL || "https://play.google.com/store/apps/details?id=com.instagram.android";
+const SHOW_APP_INSTALL_QR = String(process.env.SHOW_APP_INSTALL_QR || "").toLowerCase() === "true";
 
 app.use(cors());
 app.use(express.json());
@@ -65,6 +66,33 @@ const accountOtpChallenges = new Map();
 const LOGIN_OTP_TTL_MS = 5 * 60 * 1000;
 const NOTIFICATION_TTL_HOURS = 48;
 const pincodeLookupCache = new Map();
+const DEALER_COMMON_PASSWORD_KEY = "dealer_common_password_hash";
+
+async function ensureAppSettingsSchema() {
+  await query(
+    `CREATE TABLE IF NOT EXISTS app_settings (
+      setting_key VARCHAR(120) PRIMARY KEY,
+      setting_value TEXT NULL,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )`
+  );
+}
+
+async function getAppSetting(key) {
+  await ensureAppSettingsSchema();
+  const result = await query("SELECT setting_value FROM app_settings WHERE setting_key = ? LIMIT 1", [key]);
+  return result.rows[0]?.setting_value || "";
+}
+
+async function setAppSetting(key, value) {
+  await ensureAppSettingsSchema();
+  await query(
+    `INSERT INTO app_settings (setting_key, setting_value)
+     VALUES (?, ?)
+     ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)`,
+    [key, value]
+  );
+}
 
 function normalizeEmail(email) {
   return typeof email === "string" ? email.trim().toLowerCase() : "";
@@ -1407,7 +1435,7 @@ function buildWarrantyQrLabel({ payload, title = "PLEASE REGISTER", qrUrl = "", 
             </div>
           </div>
         </div>
-        <div class="app-install-block">
+        <div class="app-install-block${SHOW_APP_INSTALL_QR ? "" : " is-hidden"}">
           <div class="app-install-qr">${qrSvg(APP_QR_URL, 84, 1)}</div>
           <div class="app-install-text">Scan to install app</div>
         </div>
@@ -1675,6 +1703,9 @@ function buildDispatchQrPrintHtml(rows, title = "Dispatch QR Sheet", copies = 1,
       gap: 1.1mm;
       max-width: 30mm;
       min-width: 0;
+    }
+    .app-install-block.is-hidden {
+      display: none;
     }
     .app-install-qr {
       width: 5.9mm;
@@ -2078,7 +2109,35 @@ function parseSequenceSeed(raw, label, options = {}) {
 }
 
 function formatSequenceNumber(prefix, width, number) {
+  if (Number(width) <= 0) {
+    return cleanString(prefix);
+  }
   return `${prefix}${String(number).padStart(width, "0")}`;
+}
+
+function parseFixedModelName(raw, label = "Model name") {
+  const value = cleanString(raw);
+  if (!value) {
+    const err = new Error(`${label} is required.`);
+    err.statusCode = 400;
+    throw err;
+  }
+  return {
+    prefix: value,
+    width: 0,
+    nextNumber: 0,
+    useCategoryPrefix: false,
+  };
+}
+
+function formatCategoryModelName(category) {
+  const prefix = cleanString(category?.model_prefix);
+  const width = Number(category?.model_number_width ?? 0);
+  const startNumber = Number(category?.model_start_number ?? category?.next_model_number ?? 0);
+  if (width <= 0 || (prefix && width === 1 && startNumber === 1)) {
+    return prefix;
+  }
+  return formatSequenceNumber(prefix, width, startNumber);
 }
 
 function categoryPrefixFromName(name) {
@@ -2945,6 +3004,41 @@ async function findUserForAuth({ loginId, mobile, email, role }) {
 
 app.post("/auth/login", asyncRoute(async (req, res) => {
   return res.status(410).json({ error: "Password login is disabled. Use mobile OTP login." });
+}));
+
+app.post("/auth/dealer-password-login", asyncRoute(async (req, res) => {
+  const password = typeof req.body.password === "string" ? req.body.password : "";
+  const { userRow } = await findUserForAuth({ ...req.body, role: "Dealer" });
+  if (String(userRow.status || "Active").toLowerCase() !== "active") {
+    return res.status(403).json({ error: "This dealer login account is not active." });
+  }
+  if (!password.trim()) {
+    return res.status(400).json({ error: "Dealer password is required." });
+  }
+
+  const savedHash = await getAppSetting(DEALER_COMMON_PASSWORD_KEY);
+  if (!savedHash) {
+    return res.status(400).json({ error: "Dealer password is not set. Ask admin to set dealer password." });
+  }
+  if (savedHash !== hashPassword(password)) {
+    return res.status(401).json({ error: "Invalid dealer password." });
+  }
+
+  res.json(await buildAuthLoginResponse(userRow, "Dealer"));
+}));
+
+app.get("/admin/dealer-password", asyncRoute(async (_req, res) => {
+  const savedHash = await getAppSetting(DEALER_COMMON_PASSWORD_KEY);
+  res.json({ enabled: Boolean(savedHash) });
+}));
+
+app.patch("/admin/dealer-password", asyncRoute(async (req, res) => {
+  const password = typeof req.body.password === "string" ? req.body.password.trim() : "";
+  if (password.length < 4) {
+    return res.status(400).json({ error: "Dealer password must be at least 4 characters." });
+  }
+  await setAppSetting(DEALER_COMMON_PASSWORD_KEY, hashPassword(password));
+  res.json({ ok: true, enabled: true, message: "Dealer password updated." });
 }));
 
 app.post("/auth/request-otp", asyncRoute(async (req, res) => {
@@ -5994,9 +6088,15 @@ app.get("/product-categories", asyncRoute(async (_req, res) => {
   const result = await query(
     `SELECT
        c.*,
-       CONCAT(c.model_prefix, LPAD(COALESCE(c.model_start_number, c.next_model_number), c.model_number_width, '0')) AS starting_model_no,
+       CASE
+         WHEN c.model_number_width <= 0 OR (TRIM(COALESCE(c.model_prefix, '')) <> '' AND c.model_number_width = 1 AND COALESCE(c.model_start_number, c.next_model_number) = 1) THEN c.model_prefix
+         ELSE CONCAT(c.model_prefix, LPAD(COALESCE(c.model_start_number, c.next_model_number), c.model_number_width, '0'))
+       END AS starting_model_no,
        CONCAT(c.serial_prefix, LPAD(COALESCE(c.serial_start_number, c.next_serial_number), c.serial_number_width, '0')) AS starting_serial_no,
-       CONCAT(c.model_prefix, LPAD(c.next_model_number, c.model_number_width, '0')) AS next_model_no,
+       CASE
+         WHEN c.model_number_width <= 0 OR (TRIM(COALESCE(c.model_prefix, '')) <> '' AND c.model_number_width = 1 AND COALESCE(c.model_start_number, c.next_model_number) = 1) THEN c.model_prefix
+         ELSE CONCAT(c.model_prefix, LPAD(c.next_model_number, c.model_number_width, '0'))
+       END AS next_model_no,
        CONCAT(c.serial_prefix, LPAD(c.next_serial_number, c.serial_number_width, '0')) AS next_serial_no,
        COUNT(p.id) AS product_count
      FROM product_categories c
@@ -6014,8 +6114,8 @@ app.post("/product-categories", asyncRoute(async (req, res) => {
   }
   const modelSeed = req.body.modelStart ?? req.body.model_start ?? req.body.modelNoStart ?? req.body.model_no_start;
   const serialSeed = req.body.serialStart ?? req.body.serial_start ?? req.body.serialNoStart ?? req.body.serial_no_start ?? req.body.serialNumber ?? req.body.serial_number;
-  const model = parseSequenceSeed(modelSeed, "Model starting number", { defaultValue: "1" });
-  const serial = parseSequenceSeed(serialSeed, "Serial starting number", { defaultValue: "1" });
+  const model = parseFixedModelName(modelSeed, "Model name");
+  const serial = parseSequenceSeed(serialSeed, "Serial number", { defaultValue: "1" });
   const sequences = applyCategorySequencePrefixes(name, model, serial);
   const id = crypto.randomUUID();
   await query(
@@ -6072,8 +6172,8 @@ app.patch("/product-categories/:id", asyncRoute(async (req, res) => {
   } else {
     const modelSeed = req.body.modelStart ?? req.body.model_start ?? req.body.modelNoStart ?? req.body.model_no_start;
     const serialSeed = req.body.serialStart ?? req.body.serial_start ?? req.body.serialNoStart ?? req.body.serial_no_start ?? req.body.serialNumber ?? req.body.serial_number;
-    const model = parseSequenceSeed(modelSeed, "Model starting code", { defaultValue: "1" });
-    const serial = parseSequenceSeed(serialSeed, "Serial starting code", { defaultValue: "1" });
+    const model = parseFixedModelName(modelSeed, "Model name");
+    const serial = parseSequenceSeed(serialSeed, "Serial number", { defaultValue: "1" });
     const sequences = applyCategorySequencePrefixes(name, model, serial);
     await query(
       `UPDATE product_categories
@@ -6098,9 +6198,15 @@ app.patch("/product-categories/:id", asyncRoute(async (req, res) => {
   const result = await query(
     `SELECT
        c.*,
-       CONCAT(c.model_prefix, LPAD(COALESCE(c.model_start_number, c.next_model_number), c.model_number_width, '0')) AS starting_model_no,
+       CASE
+         WHEN c.model_number_width <= 0 OR (TRIM(COALESCE(c.model_prefix, '')) <> '' AND c.model_number_width = 1 AND COALESCE(c.model_start_number, c.next_model_number) = 1) THEN c.model_prefix
+         ELSE CONCAT(c.model_prefix, LPAD(COALESCE(c.model_start_number, c.next_model_number), c.model_number_width, '0'))
+       END AS starting_model_no,
        CONCAT(c.serial_prefix, LPAD(COALESCE(c.serial_start_number, c.next_serial_number), c.serial_number_width, '0')) AS starting_serial_no,
-       CONCAT(c.model_prefix, LPAD(c.next_model_number, c.model_number_width, '0')) AS next_model_no,
+       CASE
+         WHEN c.model_number_width <= 0 OR (TRIM(COALESCE(c.model_prefix, '')) <> '' AND c.model_number_width = 1 AND COALESCE(c.model_start_number, c.next_model_number) = 1) THEN c.model_prefix
+         ELSE CONCAT(c.model_prefix, LPAD(c.next_model_number, c.model_number_width, '0'))
+       END AS next_model_no,
        CONCAT(c.serial_prefix, LPAD(c.next_serial_number, c.serial_number_width, '0')) AS next_serial_no,
        COUNT(p.id) AS product_count
      FROM product_categories c
@@ -6405,16 +6511,12 @@ app.post("/products/bulk", asyncRoute(async (req, res) => {
     }
     const category = categoryResult.rows[0];
     const sequence = await resolveCategorySequenceNext(category, run);
-    const modelBase = sequence.modelNext;
     const serialBase = sequence.serialNext;
+    const fixedModelNo = formatCategoryModelName(category);
     const products = [];
 
     for (let index = 0; index < quantity; index += 1) {
-      const modelNo = formatSequenceNumber(
-        category.model_prefix,
-        category.model_number_width,
-        modelBase + index
-      );
+      const modelNo = fixedModelNo;
       const serialNo = formatSequenceNumber(
         category.serial_prefix,
         category.serial_number_width,
@@ -6445,7 +6547,7 @@ app.post("/products/bulk", asyncRoute(async (req, res) => {
       `UPDATE product_categories
        SET next_model_number = ?, next_serial_number = ?
        WHERE id = ?`,
-      [modelBase + quantity, serialBase + quantity, categoryId]
+      [Number(category.next_model_number ?? category.model_start_number ?? 0), serialBase + quantity, categoryId]
     );
 
     return products;
