@@ -432,7 +432,14 @@ async function resolveDealerRecord(idOrUserId) {
 const DEALER_COMPLAINT_FROM = `
   FROM complaints c
   LEFT JOIN warranties w ON w.id = c.warranty_id
-  LEFT JOIN serial_numbers s ON s.id = w.serial_id`;
+  LEFT JOIN serial_numbers s ON s.id = w.serial_id
+  LEFT JOIN customers cust ON cust.id = COALESCE(c.customer_id, w.customer_id)`;
+
+const DEALER_COMPLAINT_SCOPE_WHERE = `
+  (
+    COALESCE(c.dealer_id, w.dealer_id, s.dealer_id) = ?
+    OR cust.created_by_dealer_id = ?
+  )`;
 
 /** Same rules as isComplaintSolvedInDb / app isComplaintSolved (case-insensitive task status). */
 const COMPLAINT_TASK_COMPLETED_SQL = `
@@ -467,18 +474,18 @@ async function getDealerDashboardStats(dealerId) {
     query("SELECT COUNT(*) AS total FROM serial_numbers WHERE dealer_id = ?", [dealerId]),
     query("SELECT COUNT(*) AS total FROM warranties WHERE dealer_id = ? AND customer_id IS NOT NULL", [dealerId]),
     query(
-      `SELECT COUNT(*) AS total ${DEALER_COMPLAINT_FROM} WHERE COALESCE(c.dealer_id, w.dealer_id, s.dealer_id) = ?`,
-      [dealerId]
+      `SELECT COUNT(*) AS total ${DEALER_COMPLAINT_FROM} WHERE ${DEALER_COMPLAINT_SCOPE_WHERE}`,
+      [dealerId, dealerId]
     ),
     query(
       `SELECT COUNT(*) AS total ${DEALER_COMPLAINT_FROM}
-       WHERE COALESCE(c.dealer_id, w.dealer_id, s.dealer_id) = ? AND ${COMPLAINT_OPEN_WHERE}`,
-      [dealerId]
+       WHERE ${DEALER_COMPLAINT_SCOPE_WHERE} AND ${COMPLAINT_OPEN_WHERE}`,
+      [dealerId, dealerId]
     ),
     query(
       `SELECT COUNT(*) AS total ${DEALER_COMPLAINT_FROM}
-       WHERE COALESCE(c.dealer_id, w.dealer_id, s.dealer_id) = ? AND ${COMPLAINT_SOLVED_WHERE}`,
-      [dealerId]
+       WHERE ${DEALER_COMPLAINT_SCOPE_WHERE} AND ${COMPLAINT_SOLVED_WHERE}`,
+      [dealerId, dealerId]
     ),
     query(
       `SELECT COUNT(*) AS total
@@ -5857,10 +5864,13 @@ app.get("/dealers/:id/dashboard", asyncRoute(async (req, res) => {
      LEFT JOIN products p ON p.id = s.product_id
      ${COMPLAINT_LATEST_TASK_JOIN}
      ${COMPLAINT_FEEDBACK_JOIN}
-     WHERE COALESCE(c.dealer_id, w.dealer_id, s.dealer_id) = ?
+     WHERE (
+       COALESCE(c.dealer_id, w.dealer_id, s.dealer_id) = ?
+       OR cust.created_by_dealer_id = ?
+     )
      ORDER BY c.created_at DESC
      LIMIT 3`,
-    [dealerId]
+    [dealerId, dealerId]
   );
   res.json({
     dealer,
@@ -10784,10 +10794,12 @@ app.get("/complaints/dealer/:dealerId", asyncRoute(async (req, res) => {
      ${COMPLAINT_LATEST_TASK_JOIN}
      ${COMPLAINT_FEEDBACK_JOIN}
      ${COMPLAINT_LATEST_QUOTATION_JOIN}
-     WHERE COALESCE(c.dealer_id, w.dealer_id, s.dealer_id) = ?
-       AND c.created_by_role = 'Dealer'
+     WHERE (
+       COALESCE(c.dealer_id, w.dealer_id, s.dealer_id) = ?
+       OR cust.created_by_dealer_id = ?
+     )
      ORDER BY c.created_at DESC`,
-    [dealerId]
+    [dealerId, dealerId]
   );
   res.json({ complaints: result.rows });
 }));
