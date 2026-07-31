@@ -6290,6 +6290,41 @@ app.patch("/dealers/:id", asyncRoute(async (req, res) => {
   res.json({ dealer: row.rows[0] });
 }));
 
+app.delete("/sub-dealers/:id", asyncRoute(async (req, res) => {
+  const requesterRole = cleanString(req.body?.requesterRole);
+  const id = cleanString(req.params.id);
+  if (requesterRole !== "Admin") {
+    return res.status(403).json({ error: "Only Admin can delete sub dealer accounts." });
+  }
+  if (!id) {
+    return res.status(400).json({ error: "Sub dealer id is required." });
+  }
+  await ensureDealersUserIdSchema();
+  const existing = await query("SELECT * FROM dealers WHERE id = ? LIMIT 1", [id]);
+  if (!existing.rowCount) {
+    return res.status(404).json({ error: "Sub dealer not found." });
+  }
+  const subDealer = existing.rows[0];
+  if (!subDealer.parent_dealer_id) {
+    return res.status(400).json({ error: "This is a main dealer. Delete it from Dealer Master only." });
+  }
+
+  const deleted = await withTransaction(async (tx) => {
+    const counts = { rewards: 0, dealers: 0, users: 0 };
+    const rewards = await tx("DELETE FROM dealer_reward_transactions WHERE dealer_id = ?", [id]);
+    counts.rewards = Number(rewards.affectedRows || 0);
+    const dealerDelete = await tx("DELETE FROM dealers WHERE id = ?", [id]);
+    counts.dealers = Number(dealerDelete.affectedRows || 0);
+    if (subDealer.user_id) {
+      const userDelete = await tx("DELETE FROM users WHERE id = ? AND role = 'Dealer'", [subDealer.user_id]);
+      counts.users = Number(userDelete.affectedRows || 0);
+    }
+    return counts;
+  });
+
+  res.json({ ok: true, deletedSubDealer: subDealer, deleted });
+}));
+
 app.delete("/dealers/:id", asyncRoute(async (req, res) => {
   const id = cleanString(req.params.id);
   const result = await query("DELETE FROM dealers WHERE id = ?", [id]);
