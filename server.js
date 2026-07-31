@@ -2052,7 +2052,7 @@ async function ensureDealerRewardsSchema() {
     `INSERT IGNORE INTO dealer_reward_transactions
      (dealer_id, serial_id, warranty_id, points, description)
      SELECT
-       COALESCE(w.dealer_id, s.dealer_id),
+       COALESCE(c.created_by_dealer_id, w.dealer_id, s.dealer_id),
        s.id,
        w.id,
        p.reward_points,
@@ -2060,8 +2060,9 @@ async function ensureDealerRewardsSchema() {
      FROM warranties w
      INNER JOIN serial_numbers s ON s.id = w.serial_id
      INNER JOIN products p ON p.id = s.product_id
+     LEFT JOIN customers c ON c.id = w.customer_id
      WHERE w.customer_id IS NOT NULL
-       AND COALESCE(w.dealer_id, s.dealer_id) IS NOT NULL
+       AND COALESCE(c.created_by_dealer_id, w.dealer_id, s.dealer_id) IS NOT NULL
        AND p.reward_points > 0`
   );
 }
@@ -7200,7 +7201,7 @@ async function activateWarrantyFromSerial({ customerId, serialNo, purchaseDate, 
     throw err;
   }
 
-  const customer = await query("SELECT id FROM customers WHERE id = ? LIMIT 1", [customerId]);
+  const customer = await query("SELECT id, created_by_dealer_id FROM customers WHERE id = ? LIMIT 1", [customerId]);
   if (!customer.rowCount) {
     const err = new Error("Customer account not found.");
     err.statusCode = 404;
@@ -7377,15 +7378,16 @@ async function activateWarrantyFromSerial({ customerId, serialNo, purchaseDate, 
   );
   const savedWarranty = warranty.rows[0];
   const rewardPoints = Number(row.reward_points || 0);
-  if (actingDealerId && savedWarranty?.id && rewardPoints > 0) {
+  const rewardDealerId = customer.rows[0]?.created_by_dealer_id || actingDealerId || null;
+  if (rewardDealerId && savedWarranty?.id && rewardPoints > 0) {
     await query(
       `INSERT IGNORE INTO dealer_reward_transactions
        (dealer_id, serial_id, warranty_id, points, description)
        VALUES (?, ?, ?, ?, ?)`,
-      [actingDealerId, row.id, savedWarranty.id, rewardPoints, `Warranty activated for ${row.serial_no}`]
+      [rewardDealerId, row.id, savedWarranty.id, rewardPoints, `Warranty activated for ${row.serial_no}`]
     );
   }
-  return { ...savedWarranty, reward_points_awarded: actingDealerId ? rewardPoints : 0 };
+  return { ...savedWarranty, reward_dealer_id: rewardDealerId, reward_points_awarded: rewardDealerId ? rewardPoints : 0 };
 }
 
 app.post("/warranties/activate-from-qr", asyncRoute(async (req, res) => {
