@@ -57,7 +57,7 @@ function publicUser(row) {
 const accountRoles = ["Front Desk", "Dispatch", "Dealer", "Technician", "Customer"];
 const accountCreatorRoles = ["Admin", "Dealer", "Front Desk"];
 const customerOnlyAccountCreators = [];
-const dealerCreatableRoles = ["Customer"];
+const dealerCreatableRoles = ["Customer", "Dealer"];
 const frontDeskCreatableRoles = ["Customer", "Technician"];
 const loginOtpChallenges = new Map();
 const selfSaleOtpChallenges = new Map();
@@ -461,7 +461,8 @@ const COMPLAINT_OPEN_WHERE = `
   )`;
 
 async function getDealerDashboardStats(dealerId) {
-  const [serials, warranties, totalComplaints, openComplaints, solvedComplaints, pendingScan, pendingInstallation, rewards] =
+  await ensureDealersUserIdSchema();
+  const [serials, warranties, totalComplaints, openComplaints, solvedComplaints, pendingScan, pendingInstallation, rewards, customers, subDealers] =
     await Promise.all([
     query("SELECT COUNT(*) AS total FROM serial_numbers WHERE dealer_id = ?", [dealerId]),
     query("SELECT COUNT(*) AS total FROM warranties WHERE dealer_id = ? AND customer_id IS NOT NULL", [dealerId]),
@@ -503,6 +504,14 @@ async function getDealerDashboardStats(dealerId) {
       "SELECT COALESCE(SUM(points), 0) AS total FROM dealer_reward_transactions WHERE dealer_id = ?",
       [dealerId]
     ),
+    query(
+      `SELECT COUNT(DISTINCT c.id) AS total
+       FROM customers c
+       LEFT JOIN warranties w ON w.customer_id = c.id
+       WHERE c.created_by_dealer_id = ? OR w.dealer_id = ?`,
+      [dealerId, dealerId]
+    ),
+    query("SELECT COUNT(*) AS total FROM dealers WHERE parent_dealer_id = ?", [dealerId]),
   ]);
   const count = (result) => Number(result.rows[0]?.total || 0);
   const productsSold = count(warranties);
@@ -521,6 +530,8 @@ async function getDealerDashboardStats(dealerId) {
     assignedProducts: count(pendingScan),
     pendingInstallation: count(pendingInstallation),
     rewardPoints: count(rewards),
+    customers: count(customers),
+    subDealers: count(subDealers),
     productsSold,
   };
 }
@@ -2450,6 +2461,7 @@ async function ensureSerialNumbersSchema() {
 
 async function ensureDealersUserIdSchema() {
   await ensureTableColumn("dealers", "user_id", "ALTER TABLE dealers ADD COLUMN user_id CHAR(36) NULL AFTER id");
+  await ensureTableColumn("dealers", "parent_dealer_id", "ALTER TABLE dealers ADD COLUMN parent_dealer_id CHAR(36) NULL AFTER user_id");
 }
 
 async function ensureDealerCreatedBySchema() {
@@ -3395,7 +3407,7 @@ async function prepareOtpAccountPayload(body) {
     throw err;
   }
   if (cleanCreatedByRole === "Dealer" && !dealerCreatableRoles.includes(cleanRole)) {
-    const err = new Error("Dealers can create customer login accounts only.");
+    const err = new Error("Dealers can create customer and sub dealer login accounts only.");
     err.statusCode = 403;
     throw err;
   }
@@ -3411,15 +3423,22 @@ async function prepareOtpAccountPayload(body) {
   }
 
   let creatorDealerId = null;
+  let parentDealerId = null;
   const linkToDealerRole = cleanRole === "Customer";
-  if (cleanCreatedByRole === "Dealer" && linkToDealerRole) {
+  const linkToParentDealerRole = cleanRole === "Dealer";
+  if (cleanCreatedByRole === "Dealer" && (linkToDealerRole || linkToParentDealerRole)) {
     const dealerProfile = await resolveDealerRecord(cleanString(body.dealerId));
     if (!dealerProfile) {
       const err = new Error("Dealer profile is required. Link your login mobile with Dealer Management in Admin.");
       err.statusCode = 400;
       throw err;
     }
-    creatorDealerId = dealerProfile.id;
+    if (linkToDealerRole) {
+      creatorDealerId = dealerProfile.id;
+    }
+    if (linkToParentDealerRole) {
+      parentDealerId = dealerProfile.id;
+    }
   } else if (cleanCreatedByRole === "Admin" && linkToDealerRole) {
     const dealerProfile = await resolveDealerRecord(cleanString(body.dealerId));
     if (!dealerProfile) {
@@ -3460,6 +3479,7 @@ async function prepareOtpAccountPayload(body) {
     role: cleanRole,
     createdByRole: cleanCreatedByRole,
     dealerId: creatorDealerId,
+    parentDealerId,
     name: cleanName,
     mobile: mobileCheck.national,
     email: cleanEmail,
@@ -3512,8 +3532,8 @@ async function createOtpAccount(payload) {
       await ensureDealersUserIdSchema();
       const finalDealerNo = payload.dealerNo || await getNextDealerNo();
       await run(
-        "INSERT INTO dealers (user_id, dealer_no, name, contact_person, mobile, address, city, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        [userId, finalDealerNo, payload.name, payload.contactPerson, payload.mobile, payload.address, payload.city, payload.state]
+        "INSERT INTO dealers (user_id, parent_dealer_id, dealer_no, name, contact_person, mobile, address, city, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [userId, payload.parentDealerId || null, finalDealerNo, payload.name, payload.contactPerson, payload.mobile, payload.address, payload.city, payload.state]
       );
       const result = await run("SELECT * FROM dealers WHERE dealer_no = ? LIMIT 1", [finalDealerNo]);
       dealer = result.rows[0] || null;
@@ -3954,22 +3974,29 @@ app.post("/accounts", asyncRoute(async (req, res) => {
     return res.status(403).json({ error: "Only customer login accounts can be created for this role." });
   }
   if (cleanCreatedByRole === "Dealer" && !dealerCreatableRoles.includes(cleanRole)) {
-    return res.status(403).json({ error: "Dealers can create customer login accounts only." });
+    return res.status(403).json({ error: "Dealers can create customer and sub dealer login accounts only." });
   }
   if (cleanCreatedByRole === "Front Desk" && !frontDeskCreatableRoles.includes(cleanRole)) {
     return res.status(403).json({ error: "Front Desk can create customer or technician login accounts only." });
   }
 
   let creatorDealerId = null;
+  let parentDealerId = null;
   const linkToDealerRole = cleanRole === "Customer";
-  if (cleanCreatedByRole === "Dealer" && linkToDealerRole) {
+  const linkToParentDealerRole = cleanRole === "Dealer";
+  if (cleanCreatedByRole === "Dealer" && (linkToDealerRole || linkToParentDealerRole)) {
     const dealerProfile = await resolveDealerRecord(cleanString(dealerId));
     if (!dealerProfile) {
       return res.status(400).json({
         error: "Dealer profile is required. Link your login mobile with Dealer Management in Admin.",
       });
     }
-    creatorDealerId = dealerProfile.id;
+    if (linkToDealerRole) {
+      creatorDealerId = dealerProfile.id;
+    }
+    if (linkToParentDealerRole) {
+      parentDealerId = dealerProfile.id;
+    }
   } else if (cleanCreatedByRole === "Admin" && linkToDealerRole) {
     const dealerProfile = await resolveDealerRecord(cleanString(dealerId));
     if (!dealerProfile) {
@@ -4044,8 +4071,8 @@ app.post("/accounts", asyncRoute(async (req, res) => {
     const finalDealerNo = cleanString(dealerNo) || await getNextDealerNo();
     const storedMobile = normalizeLoginMobile(cleanMobile) || cleanMobile;
     await query(
-      "INSERT INTO dealers (user_id, dealer_no, name, contact_person, mobile, address, city, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      [userId, finalDealerNo, cleanName, contactPerson || null, storedMobile, address || null, city || null, state || null]
+      "INSERT INTO dealers (user_id, parent_dealer_id, dealer_no, name, contact_person, mobile, address, city, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [userId, parentDealerId || null, finalDealerNo, cleanName, contactPerson || null, storedMobile, address || null, city || null, state || null]
     );
     const result = await query("SELECT * FROM dealers WHERE dealer_no = ? LIMIT 1", [finalDealerNo]);
     dealer = result.rows[0] || null;
@@ -4728,6 +4755,7 @@ app.get("/dealers", asyncRoute(async (req, res) => {
     const entry = {
       id: dealer.id,
       user_id: userRow.id,
+      parent_dealer_id: dealer.parent_dealer_id || null,
       dealer_no: dealer.dealer_no,
       name: dealer.name || userRow.name,
       contact_person: dealer.contact_person || userRow.name,
@@ -4772,6 +4800,7 @@ app.get("/dealers", asyncRoute(async (req, res) => {
     const entry = {
       id: dealer.id,
       user_id: dealer.user_id || null,
+      parent_dealer_id: dealer.parent_dealer_id || null,
       dealer_no: dealer.dealer_no,
       name: dealer.name,
       contact_person: dealer.contact_person,
@@ -5987,6 +6016,148 @@ app.get("/dealers/:id/created-technicians", asyncRoute(async (req, res) => {
     [dealer.id]
   );
   res.json({ dealer: { id: dealer.id, name: dealer.name, dealer_no: dealer.dealer_no }, technicians: result.rows });
+}));
+
+app.get("/dealers/:id/sub-dealers", asyncRoute(async (req, res) => {
+  await ensureDealersUserIdSchema();
+  const dealer = await resolveDealerRecord(req.params.id);
+  if (!dealer) {
+    return res.status(404).json({ error: "Dealer not found." });
+  }
+  const result = await query(
+    `SELECT
+       d.id,
+       d.user_id,
+       d.parent_dealer_id,
+       d.dealer_no,
+       d.name,
+       d.contact_person,
+       d.mobile,
+       d.address,
+       d.city,
+       d.state,
+       d.status,
+       d.created_at,
+       u.email,
+       COALESCE(u.status, d.status, 'Active') AS user_status,
+       COUNT(DISTINCT w.id) AS products_sold,
+       COUNT(DISTINCT s.id) AS products_dispatched,
+       COUNT(DISTINCT CASE WHEN w.id IS NULL THEN s.id END) AS products_in_stock,
+       COUNT(DISTINCT w.customer_id) AS customers,
+       (
+         SELECT COALESCE(SUM(points), 0)
+         FROM dealer_reward_transactions drt
+         WHERE drt.dealer_id = d.id
+       ) AS reward_points
+     FROM dealers d
+     LEFT JOIN users u ON u.id = d.user_id
+     LEFT JOIN serial_numbers s ON s.dealer_id = d.id
+     LEFT JOIN warranties w ON w.dealer_id = d.id AND w.customer_id IS NOT NULL AND w.serial_id = s.id
+     WHERE d.parent_dealer_id = ?
+     GROUP BY
+       d.id,
+       d.user_id,
+       d.parent_dealer_id,
+       d.dealer_no,
+       d.name,
+       d.contact_person,
+       d.mobile,
+       d.address,
+       d.city,
+       d.state,
+       d.status,
+       d.created_at,
+       u.email,
+       u.status
+     ORDER BY d.created_at DESC
+     LIMIT 500`,
+    [dealer.id]
+  );
+  const subDealers = result.rows.map((row) => ({
+    ...row,
+    stats: {
+      productsSold: Number(row.products_sold || 0),
+      productsDispatched: Number(row.products_dispatched || 0),
+      assignedProducts: Number(row.products_in_stock || 0),
+      rewardPoints: Number(row.reward_points || 0),
+      customers: Number(row.customers || 0),
+    },
+  }));
+  res.json({
+    dealer: { id: dealer.id, name: dealer.name, dealer_no: dealer.dealer_no },
+    subDealers,
+  });
+}));
+
+app.get("/admin/sub-dealers", asyncRoute(async (_req, res) => {
+  await ensureDealersUserIdSchema();
+  const result = await query(
+    `SELECT
+       d.id,
+       d.user_id,
+       d.parent_dealer_id,
+       d.dealer_no,
+       d.name,
+       d.contact_person,
+       d.mobile,
+       d.address,
+       d.city,
+       d.state,
+       d.status,
+       d.created_at,
+       parent.id AS parent_id,
+       parent.dealer_no AS parent_dealer_no,
+       parent.name AS parent_dealer_name,
+       parent.mobile AS parent_dealer_mobile,
+       u.email,
+       COALESCE(u.status, d.status, 'Active') AS user_status,
+       COUNT(DISTINCT w.id) AS products_sold,
+       COUNT(DISTINCT s.id) AS products_dispatched,
+       COUNT(DISTINCT CASE WHEN w.id IS NULL THEN s.id END) AS products_in_stock,
+       COUNT(DISTINCT w.customer_id) AS customers,
+       (
+         SELECT COALESCE(SUM(points), 0)
+         FROM dealer_reward_transactions drt
+         WHERE drt.dealer_id = d.id
+       ) AS reward_points
+     FROM dealers d
+     INNER JOIN dealers parent ON parent.id = d.parent_dealer_id
+     LEFT JOIN users u ON u.id = d.user_id
+     LEFT JOIN serial_numbers s ON s.dealer_id = d.id
+     LEFT JOIN warranties w ON w.dealer_id = d.id AND w.customer_id IS NOT NULL AND w.serial_id = s.id
+     GROUP BY
+       d.id,
+       d.user_id,
+       d.parent_dealer_id,
+       d.dealer_no,
+       d.name,
+       d.contact_person,
+       d.mobile,
+       d.address,
+       d.city,
+       d.state,
+       d.status,
+       d.created_at,
+       parent.id,
+       parent.dealer_no,
+       parent.name,
+       parent.mobile,
+       u.email,
+       u.status
+     ORDER BY d.created_at DESC
+     LIMIT 800`
+  );
+  const subDealers = result.rows.map((row) => ({
+    ...row,
+    stats: {
+      productsSold: Number(row.products_sold || 0),
+      productsDispatched: Number(row.products_dispatched || 0),
+      assignedProducts: Number(row.products_in_stock || 0),
+      customers: Number(row.customers || 0),
+      rewardPoints: Number(row.reward_points || 0),
+    },
+  }));
+  res.json({ subDealers });
 }));
 
 app.post("/dealers", asyncRoute(async (req, res) => {
