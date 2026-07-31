@@ -10388,6 +10388,7 @@ app.get("/dispatch/batches", asyncRoute(async (_req, res) => {
        s.dealer_id,
        d.dealer_no,
        d.name AS dealer_name,
+       d.parent_dealer_id,
        s.dispatched_customer_id,
        c.name AS customer_name,
        c.mobile AS customer_mobile,
@@ -10405,7 +10406,7 @@ app.get("/dispatch/batches", asyncRoute(async (_req, res) => {
      WHERE s.dispatch_status = 'Dispatched'
        AND s.batch_no IS NOT NULL
        AND TRIM(s.batch_no) <> ''
-     GROUP BY s.batch_no, s.dealer_id, d.dealer_no, d.name, s.dispatched_customer_id, c.name, c.mobile
+     GROUP BY s.batch_no, s.dealer_id, d.dealer_no, d.name, d.parent_dealer_id, s.dispatched_customer_id, c.name, c.mobile
      ORDER BY MAX(s.dispatched_at) DESC, s.batch_no DESC
      LIMIT 200`
   );
@@ -10444,6 +10445,8 @@ app.get("/dispatch/batches", asyncRoute(async (_req, res) => {
       dealerId: row.dealer_id,
       dealerNo: row.dealer_no,
       dealerName: row.dealer_name,
+      dealerType: row.parent_dealer_id ? "subDealer" : (row.dealer_id ? "dealer" : ""),
+      parentDealerId: row.parent_dealer_id || null,
       customerId: row.dispatched_customer_id,
       customerName: row.customer_name,
       customerMobile: row.customer_mobile,
