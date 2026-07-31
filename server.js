@@ -2921,6 +2921,28 @@ async function getNextDealerNo(runQuery = query) {
   return `DLR${String(lastNumber + 1).padStart(6, "0")}`;
 }
 
+function subDealerNoPrefix(parentDealer) {
+  const firstWord = cleanString(parentDealer?.name).split(/\s+/).filter(Boolean)[0] || "S";
+  const firstLetter = (firstWord.match(/[A-Za-z0-9]/)?.[0] || "S").toUpperCase();
+  return `${firstLetter}DLR`;
+}
+
+async function getNextSubDealerNo(parentDealer, runQuery = query) {
+  const prefix = subDealerNoPrefix(parentDealer);
+  const result = await runQuery(
+    `SELECT dealer_no
+     FROM dealers
+     WHERE parent_dealer_id = ?
+       AND dealer_no REGEXP ?
+     ORDER BY CAST(SUBSTRING(dealer_no, ?) AS UNSIGNED) DESC
+     LIMIT 1`,
+    [parentDealer.id, `^${prefix}[0-9]+$`, prefix.length + 1]
+  );
+  const lastNo = result.rows?.[0]?.dealer_no || "";
+  const lastNumber = Number(String(lastNo).replace(new RegExp(`^${prefix}`, "i"), "")) || 0;
+  return `${prefix}${String(lastNumber + 1).padStart(5, "0")}`;
+}
+
 /** Express 4: async route errors must be passed to next() or the process can crash (no DB = dead server). */
 function asyncRoute(handler) {
   return (req, res, next) => {
@@ -3437,6 +3459,11 @@ async function prepareOtpAccountPayload(body) {
       creatorDealerId = dealerProfile.id;
     }
     if (linkToParentDealerRole) {
+      if (dealerProfile.parent_dealer_id) {
+        const err = new Error("Sub dealers cannot create another sub dealer account.");
+        err.statusCode = 403;
+        throw err;
+      }
       parentDealerId = dealerProfile.id;
     }
   } else if (cleanCreatedByRole === "Admin" && linkToDealerRole) {
@@ -3530,7 +3557,12 @@ async function createOtpAccount(payload) {
 
     if (payload.role === "Dealer") {
       await ensureDealersUserIdSchema();
-      const finalDealerNo = payload.dealerNo || await getNextDealerNo();
+      const parentDealer = payload.parentDealerId
+        ? (await run("SELECT * FROM dealers WHERE id = ? LIMIT 1", [payload.parentDealerId])).rows[0]
+        : null;
+      const finalDealerNo = parentDealer
+        ? await getNextSubDealerNo(parentDealer, run)
+        : payload.dealerNo || await getNextDealerNo(run);
       await run(
         "INSERT INTO dealers (user_id, parent_dealer_id, dealer_no, name, contact_person, mobile, address, city, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [userId, payload.parentDealerId || null, finalDealerNo, payload.name, payload.contactPerson, payload.mobile, payload.address, payload.city, payload.state]
@@ -3995,6 +4027,9 @@ app.post("/accounts", asyncRoute(async (req, res) => {
       creatorDealerId = dealerProfile.id;
     }
     if (linkToParentDealerRole) {
+      if (dealerProfile.parent_dealer_id) {
+        return res.status(403).json({ error: "Sub dealers cannot create another sub dealer account." });
+      }
       parentDealerId = dealerProfile.id;
     }
   } else if (cleanCreatedByRole === "Admin" && linkToDealerRole) {
@@ -4068,7 +4103,12 @@ app.post("/accounts", asyncRoute(async (req, res) => {
 
   if (cleanRole === "Dealer") {
     await ensureDealersUserIdSchema();
-    const finalDealerNo = cleanString(dealerNo) || await getNextDealerNo();
+    const parentDealer = parentDealerId
+      ? (await query("SELECT * FROM dealers WHERE id = ? LIMIT 1", [parentDealerId])).rows[0]
+      : null;
+    const finalDealerNo = parentDealer
+      ? await getNextSubDealerNo(parentDealer)
+      : cleanString(dealerNo) || await getNextDealerNo();
     const storedMobile = normalizeLoginMobile(cleanMobile) || cleanMobile;
     await query(
       "INSERT INTO dealers (user_id, parent_dealer_id, dealer_no, name, contact_person, mobile, address, city, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -4751,6 +4791,9 @@ app.get("/dealers", asyncRoute(async (req, res) => {
     if (!dealer?.id) {
       continue;
     }
+    if (dealer.parent_dealer_id) {
+      continue;
+    }
     seenDealerIds.add(String(dealer.id));
     const entry = {
       id: dealer.id,
@@ -4781,6 +4824,7 @@ app.get("/dealers", asyncRoute(async (req, res) => {
      FROM dealers d
      LEFT JOIN users u ON u.id = d.user_id AND u.role = 'Dealer'
      WHERE u.id IS NULL
+       AND d.parent_dealer_id IS NULL
        AND NOT EXISTS (
          SELECT 1
          FROM users u2
