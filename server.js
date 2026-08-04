@@ -24,7 +24,7 @@ const APP_QR_URL = process.env.HITAISHI_APP_QR_URL || "https://play.google.com/s
 const SHOW_APP_INSTALL_QR = String(process.env.SHOW_APP_INSTALL_QR || "").toLowerCase() === "true";
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "12mb" }));
 
 app.get(["/admin", "/admin/"], (_req, res) => {
   if (!fs.existsSync(adminIndexPath)) {
@@ -2203,7 +2203,7 @@ async function resolveCategorySequenceNext(category, tx) {
   const startModel = Number(category.model_start_number ?? category.next_model_number ?? 1);
   const startSerial = Number(category.serial_start_number ?? category.next_serial_number ?? 1);
   const rows = await run(
-    `SELECT p.model_no, s.serial_no
+    `SELECT p.id, p.model_no, s.serial_no
      FROM products p
      LEFT JOIN serial_numbers s ON s.product_id = p.id
      WHERE p.category_id = ?`,
@@ -2218,7 +2218,11 @@ async function resolveCategorySequenceNext(category, tx) {
   }
   let maxModel = startModel - 1;
   let maxSerial = startSerial - 1;
+  const productIds = new Set();
   rows.rows.forEach((row) => {
+    if (row.id) {
+      productIds.add(row.id);
+    }
     const modelNum = parseSequenceSuffix(row.model_no, category.model_prefix, category.model_number_width);
     const serialNum = parseSequenceSuffix(row.serial_no, category.serial_prefix, category.serial_number_width);
     if (modelNum !== null) {
@@ -2231,15 +2235,53 @@ async function resolveCategorySequenceNext(category, tx) {
   return {
     modelNext: Math.max(startModel, maxModel + 1),
     serialNext: Math.max(startSerial, maxSerial + 1),
-    productCount: rows.rowCount,
+    productCount: productIds.size || rows.rowCount,
   };
+}
+
+async function categoryDisplayRow(category, runQuery = query) {
+  const sequence = await resolveCategorySequenceNext(category, runQuery);
+  const modelName = formatCategoryModelName(category);
+  const startSerial = Number(category.serial_start_number ?? category.next_serial_number ?? 1);
+  return {
+    ...category,
+    next_model_number: sequence.modelNext,
+    next_serial_number: sequence.serialNext,
+    starting_model_no: modelName,
+    starting_serial_no: formatSequenceNumber(category.serial_prefix, category.serial_number_width, startSerial),
+    next_model_no: modelName,
+    next_serial_no: formatSequenceNumber(category.serial_prefix, category.serial_number_width, sequence.serialNext),
+    product_count: sequence.productCount,
+  };
+}
+
+async function ensureUniqueCategoryModelName(modelName, excludeId = "") {
+  const normalizedModel = cleanString(modelName).toLowerCase();
+  if (!normalizedModel) {
+    return;
+  }
+  const result = await query(
+    `SELECT id, model_prefix, model_number_width, model_start_number, next_model_number
+     FROM product_categories`
+  );
+  const conflict = result.rows.find((row) => {
+    if (excludeId && String(row.id) === String(excludeId)) {
+      return false;
+    }
+    return formatCategoryModelName(row).toLowerCase() === normalizedModel;
+  });
+  if (conflict) {
+    const err = new Error("This model name already exists. Use a different model name.");
+    err.statusCode = 409;
+    throw err;
+  }
 }
 
 async function ensureProductCategoriesSchema() {
   await query(
     `CREATE TABLE IF NOT EXISTS product_categories (
        id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
-       name VARCHAR(120) NOT NULL UNIQUE,
+       name VARCHAR(120) NOT NULL,
        model_prefix VARCHAR(100) NOT NULL DEFAULT '',
        model_number_width INT NOT NULL DEFAULT 1,
        model_start_number BIGINT NOT NULL DEFAULT 1,
@@ -2251,6 +2293,21 @@ async function ensureProductCategoriesSchema() {
        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
   );
+  const uniqueNameIndexes = await query(
+    `SELECT INDEX_NAME
+     FROM INFORMATION_SCHEMA.STATISTICS
+     WHERE TABLE_SCHEMA = DATABASE()
+       AND TABLE_NAME = 'product_categories'
+       AND COLUMN_NAME = 'name'
+       AND NON_UNIQUE = 0
+       AND INDEX_NAME <> 'PRIMARY'`
+  );
+  for (const row of uniqueNameIndexes.rows) {
+    const indexName = cleanString(row.INDEX_NAME || row.index_name).replace(/`/g, "``");
+    if (indexName) {
+      await query(`ALTER TABLE product_categories DROP INDEX \`${indexName}\``);
+    }
+  }
   const categoryColumns = [
     ["model_start_number", "ALTER TABLE product_categories ADD COLUMN model_start_number BIGINT NOT NULL DEFAULT 1 AFTER model_number_width"],
     ["serial_start_number", "ALTER TABLE product_categories ADD COLUMN serial_start_number BIGINT NOT NULL DEFAULT 1 AFTER serial_number_width"],
@@ -2503,6 +2560,8 @@ async function ensureTasksSchema() {
     ["assigned_by_role", "ALTER TABLE tasks ADD COLUMN assigned_by_role VARCHAR(80) NULL AFTER payable_amount"],
     ["assigned_by_id", "ALTER TABLE tasks ADD COLUMN assigned_by_id CHAR(36) NULL AFTER assigned_by_role"],
     ["completion_happy_code", "ALTER TABLE tasks ADD COLUMN completion_happy_code VARCHAR(12) NULL AFTER resolution_notes"],
+    ["completion_product_photo", "ALTER TABLE tasks ADD COLUMN completion_product_photo LONGTEXT NULL AFTER completion_happy_code"],
+    ["completion_selfie_photo", "ALTER TABLE tasks ADD COLUMN completion_selfie_photo LONGTEXT NULL AFTER completion_product_photo"],
     ["completion_code_sent_at", "ALTER TABLE tasks ADD COLUMN completion_code_sent_at TIMESTAMP NULL AFTER completion_happy_code"],
     ["completion_verified_at", "ALTER TABLE tasks ADD COLUMN completion_verified_at TIMESTAMP NULL AFTER completion_code_sent_at"]
   ];
@@ -6347,25 +6406,12 @@ app.delete("/dealers/:id", asyncRoute(async (req, res) => {
 
 app.get("/product-categories", asyncRoute(async (_req, res) => {
   const result = await query(
-    `SELECT
-       c.*,
-       CASE
-         WHEN c.model_number_width <= 0 OR (TRIM(COALESCE(c.model_prefix, '')) <> '' AND c.model_number_width = 1 AND COALESCE(c.model_start_number, c.next_model_number) = 1) THEN c.model_prefix
-         ELSE CONCAT(c.model_prefix, LPAD(COALESCE(c.model_start_number, c.next_model_number), c.model_number_width, '0'))
-       END AS starting_model_no,
-       CONCAT(c.serial_prefix, LPAD(COALESCE(c.serial_start_number, c.next_serial_number), c.serial_number_width, '0')) AS starting_serial_no,
-       CASE
-         WHEN c.model_number_width <= 0 OR (TRIM(COALESCE(c.model_prefix, '')) <> '' AND c.model_number_width = 1 AND COALESCE(c.model_start_number, c.next_model_number) = 1) THEN c.model_prefix
-         ELSE CONCAT(c.model_prefix, LPAD(c.next_model_number, c.model_number_width, '0'))
-       END AS next_model_no,
-       CONCAT(c.serial_prefix, LPAD(c.next_serial_number, c.serial_number_width, '0')) AS next_serial_no,
-       COUNT(p.id) AS product_count
+    `SELECT c.*
      FROM product_categories c
-     LEFT JOIN products p ON p.category_id = c.id
-     GROUP BY c.id
      ORDER BY c.name`
   );
-  res.json({ categories: result.rows });
+  const categories = await Promise.all(result.rows.map((row) => categoryDisplayRow(row)));
+  res.json({ categories });
 }));
 
 app.post("/product-categories", asyncRoute(async (req, res) => {
@@ -6378,6 +6424,7 @@ app.post("/product-categories", asyncRoute(async (req, res) => {
   const model = parseFixedModelName(modelSeed, "Model name");
   const serial = parseSequenceSeed(serialSeed, "Serial number", { defaultValue: "1" });
   const sequences = applyCategorySequencePrefixes(name, model, serial);
+  await ensureUniqueCategoryModelName(formatSequenceNumber(sequences.model.prefix, sequences.model.width, sequences.model.nextNumber));
   const id = crypto.randomUUID();
   await query(
     `INSERT INTO product_categories
@@ -6416,14 +6463,6 @@ app.patch("/product-categories/:id", asyncRoute(async (req, res) => {
   }
   const category = existing.rows[0];
 
-  const nameConflict = await query(
-    "SELECT id FROM product_categories WHERE LOWER(TRIM(name)) = LOWER(?) AND id <> ? LIMIT 1",
-    [name, id]
-  );
-  if (nameConflict.rowCount) {
-    return res.status(409).json({ error: "Category name already exists." });
-  }
-
   const productCountResult = await query("SELECT COUNT(*) AS total FROM products WHERE category_id = ?", [id]);
   const hasProducts = Number(productCountResult.rows?.[0]?.total || 0) > 0;
 
@@ -6436,6 +6475,10 @@ app.patch("/product-categories/:id", asyncRoute(async (req, res) => {
     const model = parseFixedModelName(modelSeed, "Model name");
     const serial = parseSequenceSeed(serialSeed, "Serial number", { defaultValue: "1" });
     const sequences = applyCategorySequencePrefixes(name, model, serial);
+    await ensureUniqueCategoryModelName(
+      formatSequenceNumber(sequences.model.prefix, sequences.model.width, sequences.model.nextNumber),
+      id
+    );
     await query(
       `UPDATE product_categories
        SET name = ?, model_prefix = ?, model_number_width = ?, model_start_number = ?, next_model_number = ?,
@@ -6456,29 +6499,9 @@ app.patch("/product-categories/:id", asyncRoute(async (req, res) => {
     );
   }
 
-  const result = await query(
-    `SELECT
-       c.*,
-       CASE
-         WHEN c.model_number_width <= 0 OR (TRIM(COALESCE(c.model_prefix, '')) <> '' AND c.model_number_width = 1 AND COALESCE(c.model_start_number, c.next_model_number) = 1) THEN c.model_prefix
-         ELSE CONCAT(c.model_prefix, LPAD(COALESCE(c.model_start_number, c.next_model_number), c.model_number_width, '0'))
-       END AS starting_model_no,
-       CONCAT(c.serial_prefix, LPAD(COALESCE(c.serial_start_number, c.next_serial_number), c.serial_number_width, '0')) AS starting_serial_no,
-       CASE
-         WHEN c.model_number_width <= 0 OR (TRIM(COALESCE(c.model_prefix, '')) <> '' AND c.model_number_width = 1 AND COALESCE(c.model_start_number, c.next_model_number) = 1) THEN c.model_prefix
-         ELSE CONCAT(c.model_prefix, LPAD(c.next_model_number, c.model_number_width, '0'))
-       END AS next_model_no,
-       CONCAT(c.serial_prefix, LPAD(c.next_serial_number, c.serial_number_width, '0')) AS next_serial_no,
-       COUNT(p.id) AS product_count
-     FROM product_categories c
-     LEFT JOIN products p ON p.category_id = c.id
-     WHERE c.id = ?
-     GROUP BY c.id
-     LIMIT 1`,
-    [id]
-  );
+  const result = await query("SELECT * FROM product_categories WHERE id = ? LIMIT 1", [id]);
   res.json({
-    category: result.rows[0],
+    category: await categoryDisplayRow(result.rows[0]),
     message: hasProducts
       ? "Category name updated. Model/serial codes are locked because products already exist."
       : "Category updated.",
@@ -6858,11 +6881,33 @@ app.delete("/products/:id", asyncRoute(async (req, res) => {
   if (activeWarranty.rowCount) {
     return res.status(409).json({ error: "Product is linked with warranties and cannot be deleted." });
   }
-  await query("DELETE FROM serial_numbers WHERE product_id = ?", [id]);
-  const result = await query("DELETE FROM products WHERE id = ?", [id]);
-  if (!result.affectedRows) {
-    return res.status(404).json({ error: "Product not found." });
-  }
+
+  await withTransaction(async (run) => {
+    const productResult = await run("SELECT id, category_id FROM products WHERE id = ? LIMIT 1 FOR UPDATE", [id]);
+    if (!productResult.rowCount) {
+      const err = new Error("Product not found.");
+      err.statusCode = 404;
+      throw err;
+    }
+    const categoryId = cleanString(productResult.rows[0]?.category_id);
+    const categoryResult = categoryId
+      ? await run("SELECT * FROM product_categories WHERE id = ? LIMIT 1 FOR UPDATE", [categoryId])
+      : { rows: [], rowCount: 0 };
+
+    await run("DELETE FROM serial_numbers WHERE product_id = ?", [id]);
+    await run("DELETE FROM products WHERE id = ?", [id]);
+
+    if (categoryResult.rowCount) {
+      const category = categoryResult.rows[0];
+      const sequence = await resolveCategorySequenceNext(category, run);
+      await run(
+        `UPDATE product_categories
+         SET next_model_number = ?, next_serial_number = ?
+         WHERE id = ?`,
+        [sequence.modelNext, sequence.serialNext, category.id]
+      );
+    }
+  });
   res.json({ ok: true });
 }));
 
@@ -9118,6 +9163,8 @@ const TASK_DETAIL_SELECT = `
        t.status,
        t.completed_at,
        t.resolution_notes,
+       t.completion_product_photo,
+       t.completion_selfie_photo,
        t.completion_code_sent_at,
        t.completion_verified_at,
        t.payable_amount,
@@ -9222,6 +9269,8 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
   const dueAt = cleanString(req.body?.dueAt || req.body?.due_at) || null;
   const technicianId = cleanString(req.body?.technicianId || req.body?.technician_id);
   const resolutionNotes = cleanString(req.body?.resolutionNotes || req.body?.resolution_notes) || null;
+  const completionProductPhoto = cleanString(req.body?.completionProductPhoto || req.body?.completion_product_photo) || null;
+  const completionSelfiePhoto = cleanString(req.body?.completionSelfiePhoto || req.body?.completion_selfie_photo) || null;
   if (!taskId || !rawStatus) {
     return res.status(400).json({ error: "Task id and status are required." });
   }
@@ -9272,6 +9321,9 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
   if ((status === "Completed" || status === "Closed") && technicianId && !resolutionNotes) {
     return res.status(400).json({ error: "Completion remark required hai." });
   }
+  if ((status === "Completed" || status === "Closed") && technicianId && !completionSelfiePhoto) {
+    return res.status(400).json({ error: "Product ke saath selfie photo required hai." });
+  }
 
   const complaintId = row.complaint_id;
   const complaintBefore = complaintId
@@ -9297,9 +9349,11 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
          SET status = 'Pending Happy Code',
              resolution_notes = COALESCE(?, resolution_notes),
              completion_happy_code = ?,
+             completion_product_photo = COALESCE(?, completion_product_photo),
+             completion_selfie_photo = COALESCE(?, completion_selfie_photo),
              completion_code_sent_at = CURRENT_TIMESTAMP
          WHERE id = ?`,
-        [resolutionNotes, happyCode, id]
+        [resolutionNotes, happyCode, completionProductPhoto || completionSelfiePhoto, completionSelfiePhoto, id]
       );
     } else if (status === "Completed" || status === "Closed") {
       await tx(
@@ -10912,6 +10966,67 @@ app.patch("/complaints/:id", asyncRoute(handleComplaintUpdate));
 app.post("/complaints/:id/update", asyncRoute(handleComplaintUpdate));
 app.delete("/complaints/:id", asyncRoute(handleComplaintDelete));
 app.post("/complaints/:id/delete", asyncRoute(handleComplaintDelete));
+
+app.get("/complaints/:id/completion-profile", asyncRoute(async (req, res) => {
+  await ensureComplaintsSchema();
+  await ensureTasksSchema();
+  const complaintId = await resolveComplaintId(req.params.id);
+  if (!complaintId) {
+    return res.status(404).json({ error: "Complaint not found." });
+  }
+
+  const result = await query(
+    `SELECT ${TASK_DETAIL_SELECT}
+     ${TASK_DETAIL_JOINS}
+     WHERE c.id = ?
+     ORDER BY t.created_at DESC
+     LIMIT 1`,
+    [complaintId]
+  );
+  if (result.rowCount) {
+    return res.json({ profile: result.rows[0] });
+  }
+
+  const complaint = await query(
+    `SELECT
+       c.id AS complaint_db_id,
+       c.complaint_no,
+       c.problem_type,
+       c.description,
+       c.priority,
+       c.status AS complaint_status,
+       cust.name AS customer_name,
+       cust.mobile AS customer_mobile,
+       cust.address AS customer_address,
+       cust.city AS customer_city,
+       cust.state AS customer_state,
+       cust.pincode AS customer_pincode,
+       COALESCE(c.product_name, p.name) AS product_name,
+       COALESCE(c.model_no, p.model_no) AS model_no,
+       p.category AS product_category,
+       s.serial_no,
+       w.warranty_no,
+       COALESCE(c.warranty_start_date, w.start_date) AS warranty_start,
+       COALESCE(c.warranty_end_date, w.expiry_date) AS warranty_expiry,
+       COALESCE(c.warranty_status, w.status) AS warranty_status,
+       w.installation_status,
+       d.dealer_no,
+       d.name AS dealer_name
+     FROM complaints c
+     LEFT JOIN warranties w ON w.id = c.warranty_id
+     LEFT JOIN customers cust ON cust.id = COALESCE(c.customer_id, w.customer_id)
+     LEFT JOIN serial_numbers s ON s.id = w.serial_id
+     LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN dealers d ON d.id = COALESCE(c.dealer_id, w.dealer_id, s.dealer_id)
+     WHERE c.id = ?
+     LIMIT 1`,
+    [complaintId]
+  );
+  if (!complaint.rowCount) {
+    return res.status(404).json({ error: "Complaint not found." });
+  }
+  res.json({ profile: complaint.rows[0] });
+}));
 
 app.post("/complaints/:id/assign-technician", asyncRoute(async (req, res) => {
   await ensureWorkflowAuditSchema();
