@@ -645,6 +645,7 @@ async function lookupPincodeLocation(pincode) {
       city: cleanString(local.city),
       state: cleanString(local.state),
       area: cleanString(local.area),
+      district: cleanString(local.city),
       source: "service_areas",
     };
     pincodeLookupCache.set(pin, { data, at: Date.now() });
@@ -679,6 +680,7 @@ async function lookupPincodeLocation(pincode) {
       city: cleanString(address.city || address.town || address.village || address.county || address.state_district),
       state: cleanString(address.state),
       area: cleanString(address.suburb || address.neighbourhood || address.state_district),
+      district: cleanString(address.state_district || address.county),
       source: "openstreetmap",
     };
     pincodeLookupCache.set(pin, { data, at: Date.now() });
@@ -3544,7 +3546,7 @@ async function prepareOtpAccountPayload(body) {
   }
 
   if (cleanRole === "Technician" && !cleanString(body.pincode)) {
-    const err = new Error("Technician account ke liye pin code required hai.");
+    const err = new Error("A pin code is required for technician accounts.");
     err.statusCode = 400;
     throw err;
   }
@@ -4127,7 +4129,7 @@ app.post("/accounts", asyncRoute(async (req, res) => {
     return res.status(400).json({ error: "Password must be at least 8 characters." });
   }
   if (cleanRole === "Technician" && !cleanString(pincode)) {
-    return res.status(400).json({ error: "Technician account ke liye pin code required hai." });
+    return res.status(400).json({ error: "A pin code is required for technician accounts." });
   }
 
   try {
@@ -9319,10 +9321,10 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
     return res.status(400).json({ error: "Only new assignments can be rejected." });
   }
   if ((status === "Completed" || status === "Closed") && technicianId && !resolutionNotes) {
-    return res.status(400).json({ error: "Completion remark required hai." });
+    return res.status(400).json({ error: "A completion remark is required." });
   }
   if ((status === "Completed" || status === "Closed") && technicianId && !completionSelfiePhoto) {
-    return res.status(400).json({ error: "Product ke saath selfie photo required hai." });
+    return res.status(400).json({ error: "A selfie photo with the product is required." });
   }
 
   const complaintId = row.complaint_id;
@@ -9503,7 +9505,7 @@ app.post("/tasks/:id/verify-happy-code", asyncRoute(async (req, res) => {
     return res.status(400).json({ error: "This task is not waiting for Happy Code verification." });
   }
   if (String(row.completion_happy_code || "") !== happyCode) {
-    return res.status(401).json({ error: "Happy Code galat hai. Customer notification se sahi code daalein." });
+    return res.status(401).json({ error: "The Happy Code is incorrect. Enter the code from the customer's notification." });
   }
 
   const isInstallationTask = String(row.work_type || "").trim().toLowerCase() === "installation";
@@ -11084,7 +11086,7 @@ app.post("/complaints/:id/assign-technician", asyncRoute(async (req, res) => {
     const row = existingTask.rows[0];
     const by = row.assigned_by_name || row.assigned_by_role || "Front Desk/Admin";
     return res.status(409).json({
-      error: `Complaint already assigned to ${row.technician_name || "technician"} by ${by}. Reassign tabhi hoga jab technician reject kare.`,
+      error: `Complaint already assigned to ${row.technician_name || "technician"} by ${by}. Reassignment is allowed only after the technician rejects it.`,
       assignedTechnicianName: row.technician_name || null,
       assignedByName: row.assigned_by_name || null,
       assignedByRole: row.assigned_by_role || null,
