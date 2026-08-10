@@ -2555,6 +2555,10 @@ async function ensureCustomersVillageSchema() {
   await ensureTableColumn("customers", "village", "ALTER TABLE customers ADD COLUMN village VARCHAR(120) NULL AFTER city");
 }
 
+async function ensureWarrantiesInstallationSchema() {
+  await ensureTableColumn("warranties", "installation_due_at", "ALTER TABLE warranties ADD COLUMN installation_due_at DATETIME NULL AFTER installation_status");
+}
+
 async function ensureTasksSchema() {
   const columns = [
     ["completed_at", "ALTER TABLE tasks ADD COLUMN completed_at TIMESTAMP NULL AFTER status"],
@@ -2643,8 +2647,12 @@ async function ensureWorkTypeCostsSchema() {
   );
 }
 
-function resolveWorkTypeCostRule(rows, { productCategory, modelNo, city }) {
+function resolveWorkTypeCostRule(rows, { productCategory, modelNo, city, technicianId }) {
   const scoreRule = (row) => {
+    const ruleTechnicianId = cleanString(row.technician_id);
+    if (ruleTechnicianId && (!technicianId || ruleTechnicianId !== String(technicianId))) {
+      return -1;
+    }
     const ruleCategory = cleanString(row.product_category);
     const ruleModel = cleanString(row.model_no);
     const ruleCity = cleanString(row.city);
@@ -2658,6 +2666,7 @@ function resolveWorkTypeCostRule(rows, { productCategory, modelNo, city }) {
       return -1;
     }
     let score = 0;
+    if (ruleTechnicianId) score += 8;
     if (ruleCategory) score += 4;
     if (ruleModel) score += 2;
     if (ruleCity) score += 1;
@@ -2675,8 +2684,14 @@ function resolveWorkTypeCostRule(rows, { productCategory, modelNo, city }) {
   }
   if (!best && rows.length) {
     best =
-      rows.find((row) => !cleanString(row.product_category) && !cleanString(row.model_no) && !cleanString(row.city)) ||
-      rows[0];
+      rows.find((row) =>
+        (!cleanString(row.technician_id) || (technicianId && cleanString(row.technician_id) === String(technicianId))) &&
+        !cleanString(row.product_category) &&
+        !cleanString(row.model_no) &&
+        !cleanString(row.city)
+      ) ||
+      rows.find((row) => !cleanString(row.technician_id) || (technicianId && cleanString(row.technician_id) === String(technicianId))) ||
+      null;
   }
   return best;
 }
@@ -2941,7 +2956,7 @@ async function resolveTaskId(identifier, runQuery = query) {
   return byComplaint.rowCount ? byComplaint.rows[0].id : null;
 }
 
-async function resolveInstallationPayable({ productCategory, modelNo, city }) {
+async function resolveInstallationPayable({ productCategory, modelNo, city, technicianId }) {
   await ensureWorkTypeCostsSchema();
   const result = await query(
     `SELECT *
@@ -2949,7 +2964,7 @@ async function resolveInstallationPayable({ productCategory, modelNo, city }) {
      WHERE LOWER(TRIM(work_type)) = 'installation'
        AND LOWER(TRIM(COALESCE(status, 'Active'))) = 'active'`
   );
-  const best = resolveWorkTypeCostRule(result.rows, { productCategory, modelNo, city });
+  const best = resolveWorkTypeCostRule(result.rows, { productCategory, modelNo, city, technicianId });
   return Number(best?.payable_amount || 0);
 }
 
@@ -4352,6 +4367,143 @@ app.get("/customers/by-mobile/:mobile", asyncRoute(async (req, res) => {
     accountSource,
     warranties: Number(warrantyCount.rows[0]?.total || 0),
     complaints: Number(complaintCount.rows[0]?.total || 0)
+  });
+}));
+
+app.get("/customers/:id/profile", asyncRoute(async (req, res) => {
+  await ensureDealerCreatedBySchema();
+  let hasVillageColumn = true;
+  try {
+    await ensureCustomersVillageSchema();
+  } catch (err) {
+    console.warn("customers.village migration skipped:", err?.message || err);
+    hasVillageColumn = false;
+  }
+
+  await syncCustomerProfilesFromUsers();
+
+  const customerId = cleanString(req.params.id);
+  const villageSelect = hasVillageColumn ? "c.village" : "NULL AS village";
+  const customerResult = await query(
+    `SELECT
+       c.id,
+       c.user_id,
+       c.name,
+       c.mobile,
+       c.address,
+       c.city,
+       ${villageSelect},
+       c.state,
+       c.pincode,
+       c.created_by_dealer_id,
+       c.created_at,
+       u.email,
+       COALESCE(u.status, 'Active') AS user_status,
+       d.dealer_no AS created_by_dealer_no,
+       d.name AS created_by_dealer_name,
+       d.mobile AS created_by_dealer_mobile,
+       d.city AS created_by_dealer_city
+     FROM customers c
+     LEFT JOIN users u ON u.id = c.user_id
+     LEFT JOIN dealers d ON d.id = c.created_by_dealer_id
+     WHERE c.id = ?
+     LIMIT 1`,
+    [customerId]
+  );
+
+  if (!customerResult.rowCount) {
+    return res.status(404).json({ error: "Customer not found." });
+  }
+
+  const customer = customerResult.rows[0];
+  const productsResult = await query(
+    `SELECT
+       w.id AS warranty_id,
+       w.warranty_no,
+       w.status AS warranty_status,
+       w.installation_status,
+       w.start_date,
+       w.expiry_date,
+       w.created_at AS warranty_created_at,
+       s.id AS serial_id,
+       s.serial_no,
+       s.batch_no,
+       s.dispatch_date,
+       s.dispatched_at,
+       p.id AS product_id,
+       p.name AS product_name,
+       p.model_no,
+       p.category AS product_category,
+       d.id AS dealer_id,
+       d.dealer_no,
+       d.name AS dealer_name
+     FROM warranties w
+     LEFT JOIN serial_numbers s ON s.id = w.serial_id
+     LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN dealers d ON d.id = w.dealer_id
+     WHERE w.customer_id = ?
+     ORDER BY w.created_at DESC
+     LIMIT 500`,
+    [customer.id]
+  );
+
+  const complaintsResult = await query(
+    `SELECT
+       c.id,
+       c.complaint_no,
+       c.problem_type,
+       c.description,
+       c.priority,
+       c.status,
+       c.created_at,
+       COALESCE(c.product_name, p.name) AS product_name,
+       COALESCE(c.model_no, p.model_no) AS model_no,
+       s.serial_no,
+       w.warranty_no,
+       tech.name AS technician_name
+     FROM complaints c
+     LEFT JOIN warranties w ON w.id = c.warranty_id
+     LEFT JOIN serial_numbers s ON s.id = w.serial_id
+     LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN tasks t_latest ON t_latest.id = (
+       SELECT t.id
+       FROM tasks t
+       WHERE t.complaint_id = c.id
+       ORDER BY t.created_at DESC
+       LIMIT 1
+     )
+     LEFT JOIN technicians tech ON tech.id = t_latest.technician_id
+     WHERE c.customer_id = ?
+     ORDER BY c.created_at DESC
+     LIMIT 500`,
+    [customer.id]
+  );
+
+  const products = productsResult.rows;
+  const activeWarranties = products.filter((row) => {
+    const status = String(row.warranty_status || "").toLowerCase();
+    const expiry = row.expiry_date ? new Date(row.expiry_date) : null;
+    const notExpiredByDate = !expiry || Number.isNaN(expiry.getTime()) || expiry >= new Date();
+    return !status.includes("expired") && notExpiredByDate;
+  }).length;
+
+  res.json({
+    customer,
+    createdByDealer: customer.created_by_dealer_id ? {
+      id: customer.created_by_dealer_id,
+      dealer_no: customer.created_by_dealer_no,
+      name: customer.created_by_dealer_name,
+      mobile: customer.created_by_dealer_mobile,
+      city: customer.created_by_dealer_city,
+    } : null,
+    summary: {
+      productsBought: products.length,
+      warranties: products.length,
+      activeWarranties,
+      complaints: complaintsResult.rows.length,
+    },
+    products,
+    complaints: complaintsResult.rows,
   });
 }));
 
@@ -6995,6 +7147,7 @@ app.get("/work-type-costs/resolve", asyncRoute(async (req, res) => {
   const productCategory = cleanString(req.query.productCategory || req.query.product_category) || null;
   const modelNo = cleanString(req.query.modelNo || req.query.model_no) || null;
   const city = cleanString(req.query.city) || null;
+  const technicianId = cleanString(req.query.technicianId || req.query.technician_id) || null;
   const result = await query(
     `SELECT *
      FROM work_type_costs
@@ -7003,13 +7156,14 @@ app.get("/work-type-costs/resolve", asyncRoute(async (req, res) => {
      LIMIT 200`,
     [workType]
   );
-  const best = resolveWorkTypeCostRule(result.rows, { productCategory, modelNo, city });
+  const best = resolveWorkTypeCostRule(result.rows, { productCategory, modelNo, city, technicianId });
   const charges = mapWorkTypeCostCharges(best);
   res.json({
     workType,
     productCategory,
     modelNo,
     city,
+    technicianId,
     ...charges,
     matched: Boolean(best),
   });
@@ -7018,10 +7172,11 @@ app.get("/work-type-costs/resolve", asyncRoute(async (req, res) => {
 app.post("/work-type-costs", asyncRoute(async (req, res) => {
   await ensureWorkTypeCostsSchema();
   const workType = cleanString(req.body.workType || req.body.work_type);
+  const technicianId = cleanString(req.body.technicianId || req.body.technician_id) || null;
   const productCategory = cleanString(req.body.productCategory || req.body.product_category) || null;
   const modelNo = cleanString(req.body.modelNo || req.body.model_no) || null;
   const city = cleanString(req.body.city) || null;
-  const payableAmount = Number(req.body.payableAmount || req.body.payable_amount || 0);
+  const payableAmount = Number(req.body.payableAmount ?? req.body.payable_amount ?? req.body.serviceCharge ?? req.body.service_charge ?? 0);
   const serviceCharge = Number(req.body.serviceCharge ?? req.body.service_charge ?? payableAmount ?? 0);
   const visitCharge = Number(req.body.visitCharge ?? req.body.visit_charge ?? 0);
   const taxAmount = Number(req.body.taxAmount ?? req.body.tax_amount ?? 0);
@@ -7036,13 +7191,14 @@ app.post("/work-type-costs", asyncRoute(async (req, res) => {
 
   await query(
     `INSERT INTO work_type_costs
-     (work_type, product_category, model_no, city, payable_amount, service_charge, visit_charge, tax_amount, discount_amount, default_timeframe_hours, effective_date, status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     (work_type, product_category, model_no, city, technician_id, payable_amount, service_charge, visit_charge, tax_amount, discount_amount, default_timeframe_hours, effective_date, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       workType,
       productCategory,
       modelNo,
       city,
+      technicianId,
       Number.isFinite(payableAmount) ? payableAmount : 0,
       Number.isFinite(serviceCharge) ? serviceCharge : 0,
       Number.isFinite(visitCharge) ? visitCharge : 0,
@@ -7061,10 +7217,11 @@ app.patch("/work-type-costs/:id", asyncRoute(async (req, res) => {
   await ensureWorkTypeCostsSchema();
   const id = cleanString(req.params.id);
   const workType = cleanString(req.body.workType || req.body.work_type);
+  const technicianId = cleanString(req.body.technicianId || req.body.technician_id) || null;
   const productCategory = cleanString(req.body.productCategory || req.body.product_category) || null;
   const modelNo = cleanString(req.body.modelNo || req.body.model_no) || null;
   const city = cleanString(req.body.city) || null;
-  const payableAmount = Number(req.body.payableAmount || req.body.payable_amount || 0);
+  const payableAmount = Number(req.body.payableAmount ?? req.body.payable_amount ?? req.body.serviceCharge ?? req.body.service_charge ?? 0);
   const serviceCharge = Number(req.body.serviceCharge ?? req.body.service_charge ?? payableAmount ?? 0);
   const visitCharge = Number(req.body.visitCharge ?? req.body.visit_charge ?? 0);
   const taxAmount = Number(req.body.taxAmount ?? req.body.tax_amount ?? 0);
@@ -7079,13 +7236,14 @@ app.patch("/work-type-costs/:id", asyncRoute(async (req, res) => {
 
   const result = await query(
     `UPDATE work_type_costs
-     SET work_type = ?, product_category = ?, model_no = ?, city = ?, payable_amount = ?, service_charge = ?, visit_charge = ?, tax_amount = ?, discount_amount = ?, default_timeframe_hours = ?, effective_date = ?, status = ?
+     SET work_type = ?, product_category = ?, model_no = ?, city = ?, technician_id = ?, payable_amount = ?, service_charge = ?, visit_charge = ?, tax_amount = ?, discount_amount = ?, default_timeframe_hours = ?, effective_date = ?, status = ?
      WHERE id = ?`,
     [
       workType,
       productCategory,
       modelNo,
       city,
+      technicianId,
       Number.isFinite(payableAmount) ? payableAmount : 0,
       Number.isFinite(serviceCharge) ? serviceCharge : 0,
       Number.isFinite(visitCharge) ? visitCharge : 0,
@@ -7483,12 +7641,15 @@ app.post("/warranties/activate-from-qr", asyncRoute(async (req, res) => {
 
 /** Dealer scans QR and registers customer details to activate warranty. */
 app.post("/warranties/dealer/activate-from-qr", asyncRoute(async (req, res) => {
+  await ensureWarrantiesInstallationSchema();
   const dealerId = cleanString(req.body.dealerId || req.body.dealer_id);
   const serialNo = serialFromPayload(req.body.serialNo || req.body.serial_no);
   const scannedProduct = productFromPayload(req.body.qr || req.body.qrPayload || req.body.productQr);
   const productId = cleanString(req.body.productId || req.body.product_id || scannedProduct.productId);
   const purchaseDate = cleanDate(req.body.purchaseDate || req.body.purchase_date) || new Date().toISOString().slice(0, 10);
   const invoiceNo = cleanString(req.body.invoiceNo || req.body.invoice_no);
+  const installationDueAtRaw = cleanString(req.body.installationDueAt || req.body.installation_due_at) || null;
+  const installationDueAt = installationDueAtRaw ? installationDueAtRaw.replace("T", " ") : null;
   const { name, mobile, email, address, city, village, state, pincode } = req.body;
   const cleanMobile = normalizeMobileValue(mobile);
   const cleanEmail = normalizeEmail(email);
@@ -7504,16 +7665,40 @@ app.post("/warranties/dealer/activate-from-qr", asyncRoute(async (req, res) => {
   if (!serialNo) {
     return res.status(400).json({ error: "Serial number is required after scanning product QR." });
   }
-  if (productId) {
-    const serialCheck = await query(
-      "SELECT product_id FROM serial_numbers WHERE LOWER(TRIM(serial_no)) = LOWER(TRIM(?)) LIMIT 1",
-      [serialNo]
+  const serialCheck = await query(
+    `SELECT
+       s.product_id,
+       s.installation_required AS serial_installation_required,
+       p.installation_required AS product_installation_required
+     FROM serial_numbers s
+     LEFT JOIN products p ON p.id = s.product_id
+     WHERE LOWER(TRIM(s.serial_no)) = LOWER(TRIM(?))
+     LIMIT 1`,
+    [serialNo]
+  );
+  if (!serialCheck.rowCount) {
+    return res.status(404).json({ error: "Serial number not found." });
+  }
+  if (productId && String(serialCheck.rows[0].product_id || "") !== String(productId)) {
+    return res.status(400).json({ error: "This serial number does not belong to the scanned product." });
+  }
+  const installationRequired = parseInstallationRequired(
+    serialCheck.rows[0].serial_installation_required ?? serialCheck.rows[0].product_installation_required,
+    false
+  );
+  if (installationRequired) {
+    const sendAdmin = parseInstallationRequired(
+      req.body.installationDetailSentToAdmin ?? req.body.installation_detail_sent_to_admin,
+      false
     );
-    if (!serialCheck.rowCount) {
-      return res.status(404).json({ error: "Serial number not found." });
+    if (!cleanString(address)) {
+      return res.status(400).json({ error: "Installation address is required for this product." });
     }
-    if (String(serialCheck.rows[0].product_id || "") !== String(productId)) {
-      return res.status(400).json({ error: "This serial number does not belong to the scanned product." });
+    if (!sendAdmin) {
+      return res.status(400).json({ error: "Select Installation detail send admin before activating warranty." });
+    }
+    if (!installationDueAt) {
+      return res.status(400).json({ error: "Select expected installation date before activating warranty." });
     }
   }
 
@@ -7549,23 +7734,99 @@ app.post("/warranties/dealer/activate-from-qr", asyncRoute(async (req, res) => {
     invoiceNo,
     actingDealerId: dealerId,
   });
+  if (installationRequired && warranty?.id) {
+    await query("UPDATE warranties SET installation_due_at = ? WHERE id = ?", [installationDueAt, warranty.id]);
+    warranty.installation_due_at = installationDueAt;
+  }
   res.status(201).json({ customer, warranty });
+}));
+
+app.get("/installations", asyncRoute(async (_req, res) => {
+  await ensureTasksSchema();
+  await ensureCustomersVillageSchema();
+  await ensureWarrantiesInstallationSchema();
+  const result = await query(
+    `SELECT
+       w.id AS warranty_id,
+       w.warranty_no,
+       w.status AS warranty_status,
+       w.installation_status,
+       w.installation_due_at,
+       w.start_date,
+       w.expiry_date,
+       w.created_at AS activated_at,
+       cust.id AS customer_id,
+       cust.name AS customer_name,
+       cust.mobile AS customer_mobile,
+       cust.address AS installation_address,
+       cust.city AS customer_city,
+       cust.village AS customer_village,
+       cust.state AS customer_state,
+       cust.pincode AS customer_pincode,
+       s.serial_no,
+       s.invoice_no,
+       s.dispatch_date,
+       p.name AS product_name,
+       p.model_no,
+       p.category AS product_category,
+       d.id AS dealer_id,
+       d.dealer_no,
+       d.name AS dealer_name,
+       t.id AS task_id,
+       t.task_no,
+       t.status AS task_status,
+       t.due_at,
+       tech.name AS technician_name,
+       tech.mobile AS technician_mobile
+     FROM warranties w
+     LEFT JOIN customers cust ON cust.id = w.customer_id
+     LEFT JOIN serial_numbers s ON s.id = w.serial_id
+     LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN dealers d ON d.id = COALESCE(w.dealer_id, s.dealer_id)
+     LEFT JOIN tasks t ON t.id = (
+       SELECT t2.id
+       FROM tasks t2
+       INNER JOIN complaints c2 ON c2.id = t2.complaint_id
+       WHERE c2.warranty_id = w.id
+         AND LOWER(TRIM(t2.work_type)) = 'installation'
+       ORDER BY t2.created_at DESC
+       LIMIT 1
+     )
+     LEFT JOIN technicians tech ON tech.id = t.technician_id
+     WHERE LOWER(TRIM(COALESCE(w.installation_status, ''))) <> 'not required'
+       AND COALESCE(w.installation_status, '') <> ''
+     ORDER BY
+       CASE LOWER(TRIM(w.installation_status))
+         WHEN 'required' THEN 0
+         WHEN 'assigned' THEN 1
+         WHEN 'in progress' THEN 2
+         WHEN 'completed' THEN 3
+         ELSE 4
+       END,
+       w.created_at DESC
+     LIMIT 800`
+  );
+  res.json({ installations: result.rows });
 }));
 
 app.post("/warranties/:id/assign-installation", asyncRoute(async (req, res) => {
   await ensureWorkflowAuditSchema();
   await ensureComplaintsSchema();
   await ensureTasksSchema();
+  await ensureWarrantiesInstallationSchema();
   const warrantyId = await resolveWarrantyId(req.params.id);
   const dealerId = cleanString(req.body.dealerId || req.body.dealer_id);
   const technicianId = cleanString(req.body.technicianId || req.body.technician_id);
-  const dueAt = cleanString(req.body.dueAt || req.body.due_at) || null;
+  const dueAtRaw = cleanString(req.body.dueAt || req.body.due_at) || null;
+  const dueAt = dueAtRaw ? dueAtRaw.replace("T", " ") : null;
   const assignedById = cleanString(req.body.assignedById || req.body.assigned_by_id || req.body.userId || req.body.user_id) || null;
+  const assignedByRole = cleanString(req.body.assignedByRole || req.body.assigned_by_role || req.body.requesterRole || req.body.requester_role) || "Dealer";
+  const isAdminAssign = ["Admin", "Front Desk"].includes(assignedByRole);
 
   if (!warrantyId) {
     return res.status(404).json({ error: "Warranty not found." });
   }
-  if (!dealerId || !technicianId) {
+  if ((!dealerId && !isAdminAssign) || !technicianId) {
     return res.status(400).json({ error: "Dealer and technician are required." });
   }
   if (!dueAt) {
@@ -7595,7 +7856,8 @@ app.post("/warranties/:id/assign-installation", asyncRoute(async (req, res) => {
   }
   const warranty = warrantyRow.rows[0];
   const warrantyDealerId = String(warranty.dealer_id || "");
-  if (!warrantyDealerId || warrantyDealerId !== String(dealerId)) {
+  const effectiveDealerId = dealerId || warrantyDealerId;
+  if (!isAdminAssign && (!warrantyDealerId || warrantyDealerId !== String(dealerId))) {
     return res.status(403).json({ error: "This warranty does not belong to your dealership." });
   }
   if (!warranty.customer_id) {
@@ -7631,7 +7893,7 @@ app.post("/warranties/:id/assign-installation", asyncRoute(async (req, res) => {
   if (!technician.rowCount) {
     return res.status(404).json({ error: "Approved technician not found." });
   }
-  if (String(technician.rows[0].created_by_dealer_id || "") !== String(dealerId)) {
+  if (!isAdminAssign && String(technician.rows[0].created_by_dealer_id || "") !== String(dealerId)) {
     return res.status(403).json({ error: "Dealer can assign only technicians linked to this dealership." });
   }
 
@@ -7639,6 +7901,7 @@ app.post("/warranties/:id/assign-installation", asyncRoute(async (req, res) => {
     productCategory: warranty.product_category,
     modelNo: warranty.model_no,
     city: warranty.customer_city,
+    technicianId,
   });
 
   let complaintId = null;
@@ -7670,7 +7933,7 @@ app.post("/warranties/:id/assign-installation", asyncRoute(async (req, res) => {
           complaintNo,
           warrantyId,
           warranty.customer_id,
-          dealerId,
+          effectiveDealerId || null,
           "Install product at customer location. No quotation required - technician payout is fixed by Admin.",
           warranty.product_name,
           warranty.model_no,
@@ -7685,7 +7948,7 @@ app.post("/warranties/:id/assign-installation", asyncRoute(async (req, res) => {
         complaintId,
         oldStatus: null,
         newStatus: "Assigned to Technician",
-        changedByRole: "Dealer",
+        changedByRole: assignedByRole,
         changedById: assignedById,
         remarks: "Installation job created",
       }, tx);
@@ -7695,7 +7958,7 @@ app.post("/warranties/:id/assign-installation", asyncRoute(async (req, res) => {
         complaintId,
         oldStatus: existingComplaint.rows[0].status,
         newStatus: "Assigned to Technician",
-        changedByRole: "Dealer",
+        changedByRole: assignedByRole,
         changedById: assignedById,
         remarks: "Installation technician reassigned",
       }, tx);
@@ -7704,14 +7967,14 @@ app.post("/warranties/:id/assign-installation", asyncRoute(async (req, res) => {
     await tx(
       `INSERT INTO complaint_assignments
          (complaint_id, technician_id, assigned_by_role, assigned_by_id, status, remarks)
-       VALUES (?, ?, 'Dealer', ?, 'Assigned', 'Installation assignment')`,
-      [complaintId, technicianId, assignedById]
+       VALUES (?, ?, ?, ?, 'Assigned', 'Installation assignment')`,
+      [complaintId, technicianId, assignedByRole, assignedById]
     );
     await tx(
       `INSERT INTO tasks
        (task_no, complaint_id, technician_id, work_type, due_at, status, payable_amount, assigned_by_role, assigned_by_id)
-       VALUES (?, ?, ?, 'Installation', ?, 'Assigned', ?, 'Dealer', ?)`,
-      [taskNo, complaintId, technicianId, dueAt, payableAmount, assignedById]
+       VALUES (?, ?, ?, 'Installation', ?, 'Assigned', ?, ?, ?)`,
+      [taskNo, complaintId, technicianId, dueAt, payableAmount, assignedByRole, assignedById]
     );
     await tx("UPDATE warranties SET installation_status = 'Assigned' WHERE id = ?", [warrantyId]);
     await createWorkflowMessage({
