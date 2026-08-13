@@ -6940,6 +6940,9 @@ app.delete("/dealers/:id", asyncRoute(async (req, res) => {
     return res.status(404).json({ error: "Dealer not found." });
   }
   const dealer = existing.rows[0];
+  if (dealer.parent_dealer_id) {
+    return res.status(400).json({ error: "Use Sub Dealer List to delete a sub dealer account." });
+  }
   const deleted = await withTransaction(async (tx) => {
     const counts = { rewards: 0, parentLinks: 0, dealers: 0, users: 0 };
     const rewards = await tx("DELETE FROM dealer_reward_transactions WHERE dealer_id = ?", [id]);
