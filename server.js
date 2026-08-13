@@ -5653,11 +5653,16 @@ app.post("/tasks/:id/customer-contact-alert", asyncRoute(async (req, res) => {
   const technicianName = cleanString(task.technician_name) || "Technician";
   const title = "Customer contact update";
   const message = `${technicianName} reported: ${allowedReasons.get(reason)} for complaint ${ctx.complaint_no || task.task_no || ""}.`;
+  const compactMessage = JSON.stringify({
+    technicianName,
+    reason: allowedReasons.get(reason),
+    complaintNo: ctx.complaint_no || task.task_no || "",
+  });
   await createNotification({
     recipientRole: "Admin",
     type: "customer_contact_alert",
     title,
-    message,
+    message: compactMessage,
     entityType: "complaint",
     entityId: ctx.id,
   });
