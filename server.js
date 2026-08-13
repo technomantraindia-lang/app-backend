@@ -5405,6 +5405,10 @@ app.get("/technicians/:id/profile", asyncRoute(async (req, res) => {
     `SELECT
        accepted_by_name AS name,
        COUNT(*) AS accepted_count,
+       SUM(CASE WHEN LOWER(TRIM(COALESCE(work_type, ''))) <> 'installation'
+                 AND LOWER(TRIM(COALESCE(status, ''))) IN ('completed', 'closed') THEN 1 ELSE 0 END) AS solved_count,
+       SUM(CASE WHEN LOWER(TRIM(COALESCE(work_type, ''))) = 'installation'
+                 AND LOWER(TRIM(COALESCE(status, ''))) IN ('completed', 'closed') THEN 1 ELSE 0 END) AS installation_count,
        MAX(created_at) AS last_accepted_at
      FROM tasks
      WHERE technician_id = ?
@@ -5435,6 +5439,8 @@ app.get("/technicians/:id/profile", asyncRoute(async (req, res) => {
     acceptedNames: acceptedNames.rows.map((row) => ({
       name: row.name,
       acceptedCount: Number(row.accepted_count || 0),
+      solvedCount: Number(row.solved_count || 0),
+      installationCount: Number(row.installation_count || 0),
       lastAcceptedAt: row.last_accepted_at,
     })),
   });
@@ -5726,7 +5732,7 @@ app.post("/quotations", asyncRoute(async (req, res) => {
     taxAmount,
     discountAmount
   });
-  if (totalAmount <= 0) {
+  if (totalAmount <= 0 && !technicianRemarks) {
     return res.status(400).json({ error: "Quotation total must be greater than zero." });
   }
 
@@ -5810,6 +5816,106 @@ app.post("/quotations", asyncRoute(async (req, res) => {
     entityId: saved?.id || null,
   });
   res.status(201).json({ quotation: saved });
+}));
+
+app.post("/spare-parts-requests", asyncRoute(async (req, res) => {
+  await ensureQuotationsSchema();
+  await ensureWorkflowAuditSchema();
+  await ensureNotificationsSchema();
+  const complaintId = await resolveComplaintId(req.body.complaintId || req.body.complaint_id);
+  const technicianId = cleanString(req.body.technicianId || req.body.technician_id);
+  const spareParts = cleanString(req.body.spareParts || req.body.spare_parts || req.body.technicianRemarks || req.body.technician_remarks);
+
+  if (!complaintId || !technicianId) {
+    return res.status(400).json({ error: "complaintId and technicianId are required." });
+  }
+  if (!spareParts) {
+    return res.status(400).json({ error: "Spare parts details are required." });
+  }
+
+  const complaint = await loadComplaintForQuotation(complaintId);
+  if (!complaint) {
+    return res.status(404).json({ error: "Complaint not found." });
+  }
+  const task = await query(
+    `SELECT id FROM tasks
+     WHERE complaint_id = ? AND technician_id = ?
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [complaintId, technicianId]
+  );
+  if (!task.rowCount) {
+    return res.status(403).json({ error: "This complaint is not assigned to you." });
+  }
+
+  const pending = await query(
+    `SELECT id FROM quotations
+     WHERE complaint_id = ? AND status IN ('Pending Admin Approval', 'Spare Parts Requested')
+     LIMIT 1`,
+    [complaintId]
+  );
+  if (pending.rowCount) {
+    return res.status(409).json({ error: "A spare parts request is already waiting for admin on this complaint." });
+  }
+
+  const requestNo = await getNextQuotationNo();
+  const hasSentToFdCol = await query(
+    `SELECT COLUMN_NAME
+     FROM INFORMATION_SCHEMA.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE()
+       AND TABLE_NAME = 'quotations'
+       AND COLUMN_NAME = 'sent_to_frontdesk_at'
+     LIMIT 1`
+  );
+  const baseValues = [requestNo, complaintId, technicianId, 0, 0, 0, 0, 0, 0, spareParts];
+  if (hasSentToFdCol.rowCount) {
+    await query(
+      `INSERT INTO quotations
+       (quotation_no, complaint_id, technician_id, spare_part_amount, service_charge, visit_charge, tax_amount, discount_amount, total_amount, technician_remarks, status, sent_to_frontdesk_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending Admin Approval', NULL)`,
+      baseValues
+    );
+  } else {
+    await query(
+      `INSERT INTO quotations
+       (quotation_no, complaint_id, technician_id, spare_part_amount, service_charge, visit_charge, tax_amount, discount_amount, total_amount, technician_remarks, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending Admin Approval')`,
+      baseValues
+    );
+  }
+
+  await withTransaction(async (tx) => {
+    await tx("UPDATE complaints SET status = ? WHERE id = ?", ["Spare Parts Requested", complaintId]);
+    await recordStatusHistory({
+      complaintId,
+      oldStatus: complaint.complaint_status || null,
+      newStatus: "Spare Parts Requested",
+      changedByRole: "Technician",
+      changedById: technicianId,
+      remarks: `Spare parts request ${requestNo} submitted to Admin`,
+    }, tx);
+  });
+
+  const saved = await fetchQuotationById(
+    (await query("SELECT id FROM quotations WHERE quotation_no = ? LIMIT 1", [requestNo])).rows[0]?.id
+  );
+  await createWorkflowMessage({
+    complaintId,
+    quotationId: saved?.id || null,
+    senderRole: "Technician",
+    senderId: technicianId,
+    receiverRole: "Admin",
+    message: `Spare parts request ${requestNo}: ${spareParts}`,
+  });
+  await createNotification({
+    recipientRole: "Admin",
+    type: "spare_parts_request",
+    title: "Spare parts request",
+    message: `Technician requested spare parts for ${complaint.complaint_no || "complaint"}.`,
+    entityType: "quotation",
+    entityId: saved?.id || null,
+  });
+  res.status(201).json({ request: saved });
 }));
 
 app.patch("/quotations/:id/customer-decision", asyncRoute(async (req, res) => {
@@ -6138,6 +6244,48 @@ app.patch("/quotations/:id/admin-decision", asyncRoute(async (req, res) => {
   }
   if (!["Pending Admin Approval", "Pending Front Desk Review"].includes(row.status)) {
     return res.status(400).json({ error: "Quotation is not pending review." });
+  }
+
+  const isSparePartsRequest = Number(row.total_amount || 0) <= 0 && cleanString(row.technician_remarks);
+  if (isSparePartsRequest) {
+    const nextStatus = decision === "Approved" ? "Spare Parts Approved" : "Spare Parts Rejected";
+    await withTransaction(async (tx) => {
+      await tx("UPDATE quotations SET status = ?, technician_remarks = COALESCE(?, technician_remarks) WHERE id = ?", [
+        nextStatus,
+        remarks,
+        quotationId
+      ]);
+      if (row.complaint_id) {
+        await tx("UPDATE complaints SET status = ? WHERE id = ?", [nextStatus, row.complaint_id]);
+        await recordStatusHistory({
+          complaintId: row.complaint_id,
+          oldStatus: row.complaint_status || null,
+          newStatus: nextStatus,
+          changedByRole: "Admin",
+          remarks: remarks || nextStatus,
+        }, tx);
+        await createWorkflowMessage({
+          complaintId: row.complaint_id,
+          quotationId,
+          senderRole: "Admin",
+          receiverRole: "Technician",
+          receiverId: row.technician_id || null,
+          message: remarks || nextStatus,
+        }, tx);
+      }
+    });
+    const ctx = row.complaint_id ? await getComplaintNotifyContext(row.complaint_id) : null;
+    if (ctx) {
+      await notifyTechnicianForComplaint(ctx, {
+        type: "spare_parts_decision",
+        title: nextStatus,
+        message: remarks || nextStatus,
+        entityType: "quotation",
+        entityId: quotationId,
+      });
+    }
+    const updated = await fetchQuotationById(quotationId);
+    return res.json({ quotation: updated });
   }
 
   const expired = isWarrantyExpiredStatus(row.warranty_status, row.warranty_expiry);
