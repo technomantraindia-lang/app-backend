@@ -63,6 +63,7 @@ const loginOtpChallenges = new Map();
 const selfSaleOtpChallenges = new Map();
 const customerAccountOtpChallenges = new Map();
 const accountOtpChallenges = new Map();
+const dealerWarrantyActivationOtpChallenges = new Map();
 const LOGIN_OTP_TTL_MS = 5 * 60 * 1000;
 const NOTIFICATION_TTL_HOURS = 48;
 const pincodeLookupCache = new Map();
@@ -469,7 +470,7 @@ const COMPLAINT_OPEN_WHERE = `
 
 async function getDealerDashboardStats(dealerId) {
   await ensureDealersUserIdSchema();
-  const [serials, warranties, totalComplaints, openComplaints, solvedComplaints, pendingScan, pendingInstallation, rewards, customers, subDealers] =
+  const [serials, warranties, totalComplaints, openComplaints, solvedComplaints, pendingScan, pendingInstallation, installationRequests, rewards, customers, subDealers] =
     await Promise.all([
     query("SELECT COUNT(*) AS total FROM serial_numbers WHERE dealer_id = ?", [dealerId]),
     query("SELECT COUNT(*) AS total FROM warranties WHERE dealer_id = ? AND customer_id IS NOT NULL", [dealerId]),
@@ -508,6 +509,15 @@ async function getDealerDashboardStats(dealerId) {
       [dealerId]
     ),
     query(
+      `SELECT COUNT(*) AS total
+       FROM warranties w
+       WHERE w.dealer_id = ?
+         AND w.customer_id IS NOT NULL
+         AND COALESCE(w.installation_status, '') <> ''
+         AND LOWER(TRIM(COALESCE(w.installation_status, ''))) <> 'not required'`,
+      [dealerId]
+    ),
+    query(
       "SELECT COALESCE(SUM(points), 0) AS total FROM dealer_reward_transactions WHERE dealer_id = ?",
       [dealerId]
     ),
@@ -536,6 +546,7 @@ async function getDealerDashboardStats(dealerId) {
     pendingScan: count(pendingScan),
     assignedProducts: count(pendingScan),
     pendingInstallation: count(pendingInstallation),
+    installationRequests: count(installationRequests),
     rewardPoints: count(rewards),
     customers: count(customers),
     subDealers: count(subDealers),
@@ -2563,6 +2574,7 @@ async function ensureTasksSchema() {
   const columns = [
     ["completed_at", "ALTER TABLE tasks ADD COLUMN completed_at TIMESTAMP NULL AFTER status"],
     ["resolution_notes", "ALTER TABLE tasks ADD COLUMN resolution_notes TEXT NULL AFTER completed_at"],
+    ["accepted_by_name", "ALTER TABLE tasks ADD COLUMN accepted_by_name VARCHAR(160) NULL AFTER resolution_notes"],
     ["assigned_by_role", "ALTER TABLE tasks ADD COLUMN assigned_by_role VARCHAR(80) NULL AFTER payable_amount"],
     ["assigned_by_id", "ALTER TABLE tasks ADD COLUMN assigned_by_id CHAR(36) NULL AFTER assigned_by_role"],
     ["completion_happy_code", "ALTER TABLE tasks ADD COLUMN completion_happy_code VARCHAR(12) NULL AFTER resolution_notes"],
@@ -4686,6 +4698,116 @@ app.patch("/technicians/:id/approval", asyncRoute(async (req, res) => {
   res.json({ technician: result.rows[0] });
 }));
 
+app.patch("/technicians/:id", asyncRoute(async (req, res) => {
+  const technicianId = cleanString(req.params.id);
+  const name = cleanString(req.body.name);
+  const mobile = normalizeStoredMobile(req.body.mobile, req.body.countryDial);
+  const city = cleanString(req.body.city) || null;
+  const pincode = cleanString(req.body.pincode) || null;
+  const serviceAreas = cleanString(req.body.serviceAreas || req.body.service_areas) || null;
+  const approvalStatus = cleanString(req.body.approvalStatus || req.body.approval_status) || "Pending";
+  const accountStatus = cleanString(req.body.status || req.body.user_status) || "Active";
+
+  if (!technicianId || !name || !mobile) {
+    return res.status(400).json({ error: "Technician id, name, and mobile are required." });
+  }
+  if (!["Pending", "Approved", "Rejected"].includes(approvalStatus)) {
+    return res.status(400).json({ error: "Approval status must be Pending, Approved or Rejected." });
+  }
+  if (!["Active", "Inactive", "Rejected"].includes(accountStatus)) {
+    return res.status(400).json({ error: "Account status must be Active, Inactive or Rejected." });
+  }
+  const mobileCheck = requireTenDigitMobile(mobile);
+  if (!mobileCheck.ok) {
+    return res.status(400).json({ error: mobileCheck.error });
+  }
+
+  const existing = await query("SELECT id, user_id, mobile FROM technicians WHERE id = ? LIMIT 1", [technicianId]);
+  if (!existing.rowCount) {
+    return res.status(404).json({ error: "Technician not found." });
+  }
+  let linkedUserId = cleanString(existing.rows[0].user_id);
+  if (!linkedUserId) {
+    const oldMobile = normalizeLoginMobile(existing.rows[0].mobile);
+    if (oldMobile) {
+      const userByOldMobile = await query(
+        `SELECT id FROM users WHERE role = 'Technician' AND RIGHT(${sqlNormalizeMobileColumn("mobile")}, 10) = ? LIMIT 1`,
+        [oldMobile]
+      );
+      linkedUserId = cleanString(userByOldMobile.rows?.[0]?.id);
+    }
+  }
+  try {
+    await ensureUniqueLoginIdentity({ mobile: mobileCheck.national, excludeUserId: linkedUserId || null });
+  } catch (err) {
+    return res.status(err.statusCode || 409).json({ error: err.message || "This mobile number already has a login account." });
+  }
+
+  await withTransaction(async (tx) => {
+    await tx(
+      `UPDATE technicians
+       SET name = ?, mobile = ?, city = ?, pincode = ?, service_areas = ?, approval_status = ?
+       WHERE id = ?`,
+      [name, mobileCheck.national, city, pincode, serviceAreas, approvalStatus, technicianId]
+    );
+    if (linkedUserId) {
+      await tx("UPDATE technicians SET user_id = ? WHERE id = ?", [linkedUserId, technicianId]);
+      await tx(
+        "UPDATE users SET name = ?, mobile = ?, status = ? WHERE id = ? AND role = 'Technician'",
+        [name, mobileCheck.national, accountStatus, linkedUserId]
+      );
+    }
+  });
+
+  const result = await query(
+    `SELECT t.*, u.email, u.status AS user_status, d.name AS dealer_name, d.dealer_no AS dealer_no
+     FROM technicians t
+     LEFT JOIN users u ON u.id = t.user_id
+     LEFT JOIN dealers d ON d.id = t.created_by_dealer_id
+     WHERE t.id = ?
+     LIMIT 1`,
+    [technicianId]
+  );
+  res.json({ technician: result.rows[0] });
+}));
+
+app.delete("/technicians/:id", asyncRoute(async (req, res) => {
+  const requesterRole = cleanString(req.body?.requesterRole);
+  const technicianId = cleanString(req.params.id);
+  if (requesterRole !== "Admin") {
+    return res.status(403).json({ error: "Only Admin can delete technician accounts." });
+  }
+  if (!technicianId) {
+    return res.status(400).json({ error: "Technician id is required." });
+  }
+  const existing = await query("SELECT * FROM technicians WHERE id = ? LIMIT 1", [technicianId]);
+  if (!existing.rowCount) {
+    return res.status(404).json({ error: "Technician not found." });
+  }
+  const technician = existing.rows[0];
+  const deleted = await withTransaction(async (tx) => {
+    const counts = { payments: 0, tasks: 0, quotations: 0, feedback: 0, workCosts: 0, technicians: 0, users: 0 };
+    const payments = await tx("DELETE FROM payments WHERE technician_id = ?", [technicianId]);
+    counts.payments = Number(payments.affectedRows || 0);
+    const tasks = await tx("UPDATE tasks SET technician_id = NULL WHERE technician_id = ?", [technicianId]);
+    counts.tasks = Number(tasks.affectedRows || 0);
+    const quotations = await tx("UPDATE quotations SET technician_id = NULL WHERE technician_id = ?", [technicianId]);
+    counts.quotations = Number(quotations.affectedRows || 0);
+    const feedback = await tx("UPDATE feedback SET technician_id = NULL WHERE technician_id = ?", [technicianId]);
+    counts.feedback = Number(feedback.affectedRows || 0);
+    const workCosts = await tx("UPDATE work_type_costs SET technician_id = NULL WHERE technician_id = ?", [technicianId]);
+    counts.workCosts = Number(workCosts.affectedRows || 0);
+    const technicianDelete = await tx("DELETE FROM technicians WHERE id = ?", [technicianId]);
+    counts.technicians = Number(technicianDelete.affectedRows || 0);
+    if (technician.user_id) {
+      const userDelete = await tx("DELETE FROM users WHERE id = ? AND role = 'Technician'", [technician.user_id]);
+      counts.users = Number(userDelete.affectedRows || 0);
+    }
+    return counts;
+  });
+  res.json({ ok: true, deletedTechnician: technician, deleted });
+}));
+
 app.patch("/technicians/:id/dealer", asyncRoute(async (req, res) => {
   res.status(410).json({
     error: "Technicians are not assigned to dealers anymore. Create/approve them by pin code and service area.",
@@ -5205,6 +5327,116 @@ app.get("/technicians/:id/rating", asyncRoute(async (req, res) => {
     technicianName: existing.rows[0].name,
     ...summary,
     recentReviews: recent.rows
+  });
+}));
+
+app.get("/technicians/:id/profile", asyncRoute(async (req, res) => {
+  await ensureTasksSchema();
+  await ensureFeedbackSchema();
+  const technicianId = cleanString(req.params.id);
+  if (!technicianId) {
+    return res.status(400).json({ error: "Technician id is required." });
+  }
+  const technicianResult = await query(
+    `SELECT
+       t.*,
+       u.email,
+       u.status AS user_status,
+       d.name AS dealer_name,
+       d.dealer_no AS dealer_no
+     FROM technicians t
+     LEFT JOIN users u ON u.id = t.user_id
+     LEFT JOIN dealers d ON d.id = t.created_by_dealer_id
+     WHERE t.id = ?
+     LIMIT 1`,
+    [technicianId]
+  );
+  if (!technicianResult.rowCount) {
+    return res.status(404).json({ error: "Technician not found." });
+  }
+
+  const taskStats = await query(
+    `SELECT
+       COUNT(*) AS total_tasks,
+       SUM(CASE WHEN LOWER(TRIM(COALESCE(status, ''))) = 'rejected' THEN 1 ELSE 0 END) AS rejected_tasks,
+       SUM(CASE WHEN LOWER(TRIM(COALESCE(status, ''))) IN ('accepted', 'in progress', 'pending happy code', 'completed', 'closed') THEN 1 ELSE 0 END) AS accepted_tasks,
+       SUM(CASE WHEN LOWER(TRIM(COALESCE(work_type, ''))) <> 'installation'
+                 AND LOWER(TRIM(COALESCE(status, ''))) IN ('completed', 'closed') THEN 1 ELSE 0 END) AS solved_complaints,
+       COALESCE(SUM(CASE WHEN LOWER(TRIM(COALESCE(status, ''))) IN ('completed', 'closed') THEN payable_amount ELSE 0 END), 0) AS completed_payable
+     FROM tasks
+     WHERE technician_id = ?`,
+    [technicianId]
+  );
+  const installationStats = await query(
+    `SELECT COUNT(DISTINCT w.id) AS completed_installations
+     FROM warranties w
+     INNER JOIN complaints c ON c.warranty_id = w.id
+     INNER JOIN tasks t ON t.complaint_id = c.id
+     WHERE t.technician_id = ?
+       AND LOWER(TRIM(COALESCE(w.installation_status, ''))) = 'completed'`,
+    [technicianId]
+  );
+  const reviewStats = await query(
+    `SELECT
+       COUNT(*) AS review_count,
+       ROUND(AVG(rating), 2) AS avg_rating,
+       COALESCE(SUM(rating), 0) AS review_points
+     FROM feedback
+     WHERE technician_id = ?`,
+    [technicianId]
+  );
+  const recentReviews = await query(
+    `SELECT
+       f.complaint_id AS id,
+       f.rating,
+       f.remarks,
+       f.created_at,
+       c.complaint_no,
+       cust.name AS customer_name
+     FROM feedback f
+     LEFT JOIN complaints c ON c.id = f.complaint_id
+     LEFT JOIN customers cust ON cust.id = f.customer_id
+     WHERE f.technician_id = ?
+     ORDER BY f.created_at DESC
+     LIMIT 8`,
+    [technicianId]
+  );
+  const acceptedNames = await query(
+    `SELECT
+       accepted_by_name AS name,
+       COUNT(*) AS accepted_count,
+       MAX(created_at) AS last_accepted_at
+     FROM tasks
+     WHERE technician_id = ?
+       AND TRIM(COALESCE(accepted_by_name, '')) <> ''
+     GROUP BY accepted_by_name
+     ORDER BY accepted_count DESC, last_accepted_at DESC
+     LIMIT 100`,
+    [technicianId]
+  );
+  const rankMap = await getTechnicianRankMap();
+  const technician = withTechnicianRatingFields(technicianResult.rows[0], rankMap);
+  res.json({
+    technician,
+    stats: {
+      totalTasks: Number(taskStats.rows[0]?.total_tasks || 0),
+      rejectedTasks: Number(taskStats.rows[0]?.rejected_tasks || 0),
+      acceptedTasks: Number(taskStats.rows[0]?.accepted_tasks || 0),
+      solvedComplaints: Number(taskStats.rows[0]?.solved_complaints || 0),
+      completedInstallations: Number(installationStats.rows[0]?.completed_installations || 0),
+      completedPayable: Number(taskStats.rows[0]?.completed_payable || 0),
+      reviewCount: Number(reviewStats.rows[0]?.review_count || 0),
+      avgRating: reviewStats.rows[0]?.avg_rating != null ? Number(reviewStats.rows[0].avg_rating) : null,
+      reviewPoints: Number(reviewStats.rows[0]?.review_points || 0),
+      rank: technician.rank || null,
+      totalRanked: technician.total_ranked || 0,
+    },
+    recentReviews: recentReviews.rows,
+    acceptedNames: acceptedNames.rows.map((row) => ({
+      name: row.name,
+      acceptedCount: Number(row.accepted_count || 0),
+      lastAcceptedAt: row.last_accepted_at,
+    })),
   });
 }));
 
@@ -6551,11 +6783,30 @@ app.delete("/sub-dealers/:id", asyncRoute(async (req, res) => {
 
 app.delete("/dealers/:id", asyncRoute(async (req, res) => {
   const id = cleanString(req.params.id);
-  const result = await query("DELETE FROM dealers WHERE id = ?", [id]);
-  if (!result.affectedRows) {
+  if (!id) {
+    return res.status(400).json({ error: "Dealer id is required." });
+  }
+  await ensureDealersUserIdSchema();
+  const existing = await query("SELECT * FROM dealers WHERE id = ? LIMIT 1", [id]);
+  if (!existing.rowCount) {
     return res.status(404).json({ error: "Dealer not found." });
   }
-  res.json({ ok: true });
+  const dealer = existing.rows[0];
+  const deleted = await withTransaction(async (tx) => {
+    const counts = { rewards: 0, parentLinks: 0, dealers: 0, users: 0 };
+    const rewards = await tx("DELETE FROM dealer_reward_transactions WHERE dealer_id = ?", [id]);
+    counts.rewards = Number(rewards.affectedRows || 0);
+    const parentLinks = await tx("UPDATE dealers SET parent_dealer_id = NULL WHERE parent_dealer_id = ?", [id]);
+    counts.parentLinks = Number(parentLinks.affectedRows || 0);
+    const dealerDelete = await tx("DELETE FROM dealers WHERE id = ?", [id]);
+    counts.dealers = Number(dealerDelete.affectedRows || 0);
+    if (dealer.user_id) {
+      const userDelete = await tx("DELETE FROM users WHERE id = ? AND role = 'Dealer'", [dealer.user_id]);
+      counts.users = Number(userDelete.affectedRows || 0);
+    }
+    return counts;
+  });
+  res.json({ ok: true, deletedDealer: dealer, deleted });
 }));
 
 app.get("/product-categories", asyncRoute(async (_req, res) => {
@@ -7637,6 +7888,158 @@ app.post("/warranties/activate-from-qr", asyncRoute(async (req, res) => {
     actingDealerId: null,
   });
   res.json({ warranty });
+}));
+
+function otpRouteError(message, statusCode = 400) {
+  const err = new Error(message);
+  err.statusCode = statusCode;
+  return err;
+}
+
+async function activateDealerWarrantyFromPayload(payload) {
+  await ensureWarrantiesInstallationSchema();
+  const dealerId = cleanString(payload.dealerId || payload.dealer_id);
+  const serialNo = serialFromPayload(payload.serialNo || payload.serial_no);
+  const scannedProduct = productFromPayload(payload.qr || payload.qrPayload || payload.productQr);
+  const productId = cleanString(payload.productId || payload.product_id || scannedProduct.productId);
+  const purchaseDate = cleanDate(payload.purchaseDate || payload.purchase_date) || new Date().toISOString().slice(0, 10);
+  const invoiceNo = cleanString(payload.invoiceNo || payload.invoice_no);
+  const installationDueAtRaw = cleanString(payload.installationDueAt || payload.installation_due_at) || null;
+  const installationDueAt = installationDueAtRaw ? installationDueAtRaw.replace("T", " ") : null;
+  const { name, mobile, email, address, city, village, state, pincode } = payload;
+  const cleanMobile = normalizeMobileValue(mobile);
+  const cleanEmail = normalizeEmail(email);
+
+  if (!dealerId) throw otpRouteError("Dealer id is required.");
+  const dealer = await query("SELECT id FROM dealers WHERE id = ? LIMIT 1", [dealerId]);
+  if (!dealer.rowCount) throw otpRouteError("Dealer not found.", 404);
+  if (!serialNo) throw otpRouteError("Serial number is required after scanning product QR.");
+
+  const serialCheck = await query(
+    `SELECT
+       s.product_id,
+       s.installation_required AS serial_installation_required,
+       p.installation_required AS product_installation_required
+     FROM serial_numbers s
+     LEFT JOIN products p ON p.id = s.product_id
+     WHERE LOWER(TRIM(s.serial_no)) = LOWER(TRIM(?))
+     LIMIT 1`,
+    [serialNo]
+  );
+  if (!serialCheck.rowCount) throw otpRouteError("Serial number not found.", 404);
+  if (productId && String(serialCheck.rows[0].product_id || "") !== String(productId)) {
+    throw otpRouteError("This serial number does not belong to the scanned product.");
+  }
+
+  const installationRequired = parseInstallationRequired(
+    serialCheck.rows[0].serial_installation_required ?? serialCheck.rows[0].product_installation_required,
+    false
+  );
+  if (installationRequired) {
+    const sendAdmin = parseInstallationRequired(
+      payload.installationDetailSentToAdmin ?? payload.installation_detail_sent_to_admin,
+      false
+    );
+    if (!cleanString(address)) throw otpRouteError("Installation address is required for this product.");
+    if (!sendAdmin) throw otpRouteError("Select Installation detail send admin before activating warranty.");
+    if (!installationDueAt) throw otpRouteError("Select expected installation date before activating warranty.");
+  }
+
+  const customer = await findOrCreateCustomer({
+    name,
+    mobile,
+    email: cleanEmail || null,
+    address,
+    city,
+    village,
+    state,
+    pincode,
+    password: "",
+    createdByDealerId: dealerId,
+  });
+  const warranty = await activateWarrantyFromSerial({
+    customerId: customer.id,
+    serialNo,
+    purchaseDate,
+    invoiceNo,
+    actingDealerId: dealerId,
+  });
+  if (installationRequired && warranty?.id) {
+    await query("UPDATE warranties SET installation_due_at = ? WHERE id = ?", [installationDueAt, warranty.id]);
+    warranty.installation_due_at = installationDueAt;
+  }
+  return { customer, warranty };
+}
+
+app.post("/warranties/dealer/request-activation-otp", asyncRoute(async (req, res) => {
+  const mobile = normalizeMobileValue(req.body.mobile);
+  const mobileCheck = requireTenDigitMobile(mobile);
+  if (!mobileCheck.ok) {
+    return res.status(400).json({ error: mobileCheck.error });
+  }
+  const dealerId = cleanString(req.body.dealerId || req.body.dealer_id);
+  const serialNo = serialFromPayload(req.body.serialNo || req.body.serial_no);
+  const name = cleanString(req.body.name);
+  const city = cleanString(req.body.city);
+  if (!dealerId || !serialNo || !name || !city) {
+    return res.status(400).json({ error: "Dealer, serial, customer name, mobile number, and city are required." });
+  }
+
+  const otp = String(crypto.randomInt(100000, 1000000));
+  const token = crypto.randomUUID();
+  purgeExpiredOtpChallenges(dealerWarrantyActivationOtpChallenges);
+  dealerWarrantyActivationOtpChallenges.set(token, {
+    payload: {
+      ...req.body,
+      mobile: mobileCheck.national,
+    },
+    otp,
+    attempts: 0,
+    expiresAt: Date.now() + LOGIN_OTP_TTL_MS,
+  });
+
+  let smsResult;
+  try {
+    smsResult = await sendLoginOtpSms(mobileCheck.national, otp);
+  } catch (err) {
+    dealerWarrantyActivationOtpChallenges.delete(token);
+    throw err;
+  }
+
+  res.json({
+    token,
+    expiresInSeconds: Math.floor(LOGIN_OTP_TTL_MS / 1000),
+    message: smsResult.sent
+      ? "OTP sent to customer mobile number."
+      : "SMS gateway is not configured. Use development OTP for testing.",
+    smsSent: Boolean(smsResult.sent),
+    devOtp: smsResult.sent ? undefined : otp,
+  });
+}));
+
+app.post("/warranties/dealer/verify-activation-otp", asyncRoute(async (req, res) => {
+  const token = cleanString(req.body.token);
+  const otp = normalizeMobileValue(req.body.otp);
+  const challenge = dealerWarrantyActivationOtpChallenges.get(token);
+  if (!token || !challenge) {
+    return res.status(400).json({ error: "OTP session expired. Send OTP again." });
+  }
+  if (Date.now() > challenge.expiresAt) {
+    dealerWarrantyActivationOtpChallenges.delete(token);
+    return res.status(400).json({ error: "OTP expired. Send OTP again." });
+  }
+  if (challenge.attempts >= 5) {
+    dealerWarrantyActivationOtpChallenges.delete(token);
+    return res.status(429).json({ error: "Too many wrong OTP attempts. Send OTP again." });
+  }
+  if (otp !== challenge.otp) {
+    challenge.attempts += 1;
+    return res.status(401).json({ error: "Invalid OTP." });
+  }
+
+  const created = await activateDealerWarrantyFromPayload(challenge.payload);
+  dealerWarrantyActivationOtpChallenges.delete(token);
+  res.status(201).json(created);
 }));
 
 /** Dealer scans QR and registers customer details to activate warranty. */
@@ -9432,6 +9835,7 @@ const TASK_DETAIL_SELECT = `
        t.status,
        t.completed_at,
        t.resolution_notes,
+       t.accepted_by_name,
        t.completion_product_photo,
        t.completion_selfie_photo,
        t.completion_code_sent_at,
@@ -9538,6 +9942,7 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
   const dueAt = cleanString(req.body?.dueAt || req.body?.due_at) || null;
   const technicianId = cleanString(req.body?.technicianId || req.body?.technician_id);
   const resolutionNotes = cleanString(req.body?.resolutionNotes || req.body?.resolution_notes) || null;
+  const acceptedByName = cleanString(req.body?.acceptedByName || req.body?.accepted_by_name) || null;
   const completionProductPhoto = cleanString(req.body?.completionProductPhoto || req.body?.completion_product_photo) || null;
   const completionSelfiePhoto = cleanString(req.body?.completionSelfiePhoto || req.body?.completion_selfie_photo) || null;
   if (!taskId || !rawStatus) {
@@ -9583,6 +9988,9 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
   const current = String(row.status || "");
   if (status === "Accepted" && current !== "Assigned") {
     return res.status(400).json({ error: "Only new assignments can be accepted." });
+  }
+  if (status === "Accepted" && !acceptedByName) {
+    return res.status(400).json({ error: "Enter the technician name before accepting this job." });
   }
   if (status === "Rejected" && current !== "Assigned") {
     return res.status(400).json({ error: "Only new assignments can be rejected." });
@@ -9638,6 +10046,8 @@ app.patch("/tasks/:id/status", asyncRoute(async (req, res) => {
       if (isInstallationTask && row.warranty_id) {
         await tx("UPDATE warranties SET installation_status = 'Completed' WHERE id = ?", [row.warranty_id]);
       }
+    } else if (status === "Accepted") {
+      await tx("UPDATE tasks SET status = ?, accepted_by_name = ? WHERE id = ?", [status, acceptedByName, id]);
     } else if (resolutionNotes) {
       await tx("UPDATE tasks SET status = ?, resolution_notes = ? WHERE id = ?", [status, resolutionNotes, id]);
     } else {
