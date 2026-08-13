@@ -223,7 +223,11 @@ async function findDealerForUser(userRow) {
   await ensureDealersUserIdSchema();
   const byUser = await query("SELECT * FROM dealers WHERE user_id = ? LIMIT 1", [userRow.id]);
   if (byUser.rowCount) {
-    return byUser.rows[0];
+    return {
+      ...byUser.rows[0],
+      email: userRow.email || byUser.rows[0].email || null,
+      user_status: userRow.status || byUser.rows[0].user_status || byUser.rows[0].status || null,
+    };
   }
   const dealerMobile = normalizeLoginMobile(userRow.mobile);
   if (dealerMobile.length < 10) {
@@ -241,7 +245,11 @@ async function findDealerForUser(userRow) {
     await query("UPDATE dealers SET user_id = ? WHERE id = ?", [userRow.id, dealer.id]);
     dealer.user_id = userRow.id;
   }
-  return dealer;
+  return {
+    ...dealer,
+    email: userRow.email || dealer.email || null,
+    user_status: userRow.status || dealer.user_status || dealer.status || null,
+  };
 }
 
 function parseDealerNoSequence(dealerNo) {
@@ -5605,6 +5613,68 @@ app.get("/notifications", asyncRoute(async (req, res) => {
   res.json({ notifications: result.rows });
 }));
 
+app.post("/tasks/:id/customer-contact-alert", asyncRoute(async (req, res) => {
+  await ensureNotificationsSchema();
+  await ensureTasksSchema();
+  const taskKey = cleanString(req.params.id);
+  const reason = cleanString(req.body.reason);
+  const technicianId = cleanString(req.body.technicianId || req.body.technician_id);
+  const allowedReasons = new Map([
+    ["Customer not receiving call", "Customer not receiving call"],
+    ["Customer not responding", "Customer not responding"],
+    ["Customer out of network", "Customer out of network"],
+    ["Customer asked to call later", "Customer asked to call later"],
+  ]);
+  if (!taskKey) {
+    return res.status(400).json({ error: "Task id is required." });
+  }
+  if (!allowedReasons.has(reason)) {
+    return res.status(400).json({ error: "Select a valid customer contact reason." });
+  }
+  const taskResult = await query(
+    `SELECT t.id, t.task_no, t.complaint_id, t.technician_id, t.status, tech.name AS technician_name
+     FROM tasks t
+     LEFT JOIN technicians tech ON tech.id = t.technician_id
+     WHERE t.id = ? OR t.task_no = ?
+     LIMIT 1`,
+    [taskKey, taskKey]
+  );
+  if (!taskResult.rowCount) {
+    return res.status(404).json({ error: "Task not found." });
+  }
+  const task = taskResult.rows[0];
+  if (technicianId && String(task.technician_id || "") !== String(technicianId)) {
+    return res.status(403).json({ error: "This task is assigned to another technician." });
+  }
+  const ctx = await getComplaintNotifyContext(task.complaint_id);
+  if (!ctx) {
+    return res.status(404).json({ error: "Complaint context not found." });
+  }
+  const technicianName = cleanString(task.technician_name) || "Technician";
+  const title = "Customer contact update";
+  const message = `${technicianName} reported: ${allowedReasons.get(reason)} for complaint ${ctx.complaint_no || task.task_no || ""}.`;
+  await createNotification({
+    recipientRole: "Admin",
+    type: "customer_contact_alert",
+    title,
+    message,
+    entityType: "complaint",
+    entityId: ctx.id,
+  });
+  if (ctx.customer_id) {
+    await createNotification({
+      customerId: ctx.customer_id,
+      recipientRole: "Customer",
+      type: "customer_contact_alert",
+      title: "Technician tried to contact you",
+      message: `${technicianName} tried to contact you for ${ctx.complaint_no || "your complaint"}. Reason: ${allowedReasons.get(reason)}.`,
+      entityType: "complaint",
+      entityId: ctx.id,
+    });
+  }
+  res.json({ message: "Customer contact update sent to Admin and Customer.", reason });
+}));
+
 app.post("/push-tokens", asyncRoute(async (req, res) => {
   await ensurePushTokensSchema();
   const token = cleanString(req.body.token);
@@ -10022,7 +10092,27 @@ const TASK_DETAIL_SELECT = `
        d.dealer_no,
        d.name AS dealer_name,
        pay.status AS payment_status,
-       pay.amount AS payment_amount`;
+       pay.amount AS payment_amount,
+       (
+         SELECT n.message
+         FROM notifications n
+         WHERE n.type = 'customer_contact_alert'
+           AND n.recipient_role = 'Admin'
+           AND n.entity_type = 'complaint'
+           AND n.entity_id = c.id
+         ORDER BY n.created_at DESC
+         LIMIT 1
+       ) AS customer_contact_alert,
+       (
+         SELECT n.created_at
+         FROM notifications n
+         WHERE n.type = 'customer_contact_alert'
+           AND n.recipient_role = 'Admin'
+           AND n.entity_type = 'complaint'
+           AND n.entity_id = c.id
+         ORDER BY n.created_at DESC
+         LIMIT 1
+       ) AS customer_contact_alert_at`;
 
 const TASK_DETAIL_JOINS = `
      FROM tasks t
@@ -10042,6 +10132,7 @@ const TASK_DETAIL_JOINS = `
 
 app.get("/tasks", asyncRoute(async (req, res) => {
   await ensureTasksSchema();
+  await ensureNotificationsSchema();
   const status = cleanString(req.query.status);
   const technicianId = cleanString(req.query.technicianId || req.query.technician_id);
   const where = [];
@@ -10069,6 +10160,7 @@ app.get("/tasks", asyncRoute(async (req, res) => {
 
 app.get("/tasks/:id", asyncRoute(async (req, res) => {
   await ensureTasksSchema();
+  await ensureNotificationsSchema();
   const taskId = await resolveTaskId(req.params.id);
   if (!taskId) {
     return res.status(404).json({ error: "Task not found." });
