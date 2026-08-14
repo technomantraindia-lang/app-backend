@@ -8699,7 +8699,7 @@ const REPLACE_RETURN_DETAIL_JOINS = `
   LEFT JOIN serial_numbers rs ON rs.id = rr.replacement_serial_id
   LEFT JOIN products rp ON rp.id = rs.product_id`;
 
-const QR_WARRANTY_ACTIONS = new Set(["Replace", "Return", "Product Exchange"]);
+const QR_WARRANTY_ACTIONS = new Set(["Replace", "Return"]);
 
 async function resolveReplaceReturnCase(identifier) {
   const key = cleanString(identifier);
@@ -8787,6 +8787,8 @@ app.post("/replace-return", asyncRoute(async (req, res) => {
   const dealerId = cleanString(req.body.dealerId || req.body.dealer_id);
   const actionType = cleanString(req.body.actionType || req.body.action_type);
   const problemDetails = cleanString(req.body.problemDetails || req.body.problem_details);
+  const exchangeSerialId = cleanString(req.body.exchangeSerialId || req.body.exchange_serial_id);
+  const exchangeSerialNo = cleanSerialNo(req.body.exchangeSerialNo || req.body.exchange_serial_no);
   const createdById = cleanString(req.body.createdById || req.body.userId || req.body.user_id) || null;
 
   if (!complaintId || !dealerId || !actionType || !problemDetails) {
@@ -8819,16 +8821,54 @@ app.post("/replace-return", asyncRoute(async (req, res) => {
   }
   const complaint = complaintRow.rows[0];
   if (String(complaint.status || "") !== "Awaiting Dealer Action") {
-    return res.status(400).json({ error: "This complaint is not awaiting dealer replace/return action." });
+    return res.status(400).json({ error: "This complaint is not awaiting dealer return action." });
   }
   if (isWarrantyExpiredStatus(complaint.warranty_status, complaint.expiry_date)) {
     return res.status(400).json({
-      error: "Product replacement is only available while warranty is active. This warranty has expired.",
+      error: "Product return is only available while warranty is active. This warranty has expired.",
     });
   }
   const owningDealerId = String(complaint.dealer_id || complaint.warranty_dealer_id || "");
   if (owningDealerId && owningDealerId !== String(dealer.id)) {
     return res.status(403).json({ error: "This complaint does not belong to your dealership." });
+  }
+
+  let requestedExchangeSerial = null;
+  if (actionType === "Replace") {
+    if (!exchangeSerialId && !exchangeSerialNo) {
+      return res.status(400).json({ error: "Select replacement product from dealer stock." });
+    }
+    const exchangeResult = exchangeSerialId
+      ? await query(
+          `SELECT s.*, p.name AS product_name, p.model_no
+           FROM serial_numbers s
+           LEFT JOIN products p ON p.id = s.product_id
+           WHERE s.id = ?
+           LIMIT 1`,
+          [exchangeSerialId]
+        )
+      : await query(
+          `SELECT s.*, p.name AS product_name, p.model_no
+           FROM serial_numbers s
+           LEFT JOIN products p ON p.id = s.product_id
+           WHERE LOWER(TRIM(s.serial_no)) = LOWER(TRIM(?))
+           LIMIT 1`,
+          [exchangeSerialNo]
+        );
+    if (!exchangeResult.rowCount) {
+      return res.status(404).json({ error: "Selected replacement product serial not found." });
+    }
+    requestedExchangeSerial = exchangeResult.rows[0];
+    if (String(requestedExchangeSerial.dealer_id || "") !== String(dealer.id)) {
+      return res.status(403).json({ error: "Selected replacement product is not in this dealer stock." });
+    }
+    const exchangeWarranty = await query(
+      "SELECT id FROM warranties WHERE serial_id = ? AND customer_id IS NOT NULL LIMIT 1",
+      [requestedExchangeSerial.id]
+    );
+    if (exchangeWarranty.rowCount) {
+      return res.status(409).json({ error: "Selected replacement product is already sold/activated." });
+    }
   }
 
   const existing = await query("SELECT id FROM replace_return_cases WHERE complaint_id = ? LIMIT 1", [complaintId]);
@@ -8838,6 +8878,13 @@ app.post("/replace-return", asyncRoute(async (req, res) => {
 
   const caseNo = `RR-${Date.now()}`;
   const caseId = crypto.randomUUID();
+  const exchangeDetail = requestedExchangeSerial
+    ? ` Replace with: ${requestedExchangeSerial.product_name || "Product"} - ${requestedExchangeSerial.model_no || "-"} - ${requestedExchangeSerial.serial_no}.`
+    : "";
+  const savedProblemDetails = `${problemDetails}${exchangeDetail}`.trim();
+  const completesImmediately = actionType === "Replace" && requestedExchangeSerial;
+  const nextComplaintStatus = completesImmediately ? "Replacement Completed" : "Return Submitted";
+  const caseStatus = completesImmediately ? "Delivered to Customer" : "Pending Admin Scan";
   const qrPayload = replaceReturnQrPayload({
     caseId,
     caseNo,
@@ -8845,48 +8892,77 @@ app.post("/replace-return", asyncRoute(async (req, res) => {
     actionType,
   });
 
-  await query(
-    `INSERT INTO replace_return_cases
-       (id, case_no, complaint_id, task_id, warranty_id, customer_id, dealer_id, serial_id,
-        action_type, problem_details, technician_remarks, status, qr_status, qr_payload, qr_printed_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending Admin Scan', 'Printed', ?, CURRENT_TIMESTAMP)`,
-    [
-      caseId,
-      caseNo,
+  await withTransaction(async (tx) => {
+    await tx(
+      `INSERT INTO replace_return_cases
+         (id, case_no, complaint_id, task_id, warranty_id, customer_id, dealer_id, serial_id,
+          action_type, problem_details, technician_remarks, requested_exchange_serial_id,
+          replacement_serial_id, replacement_dispatched_at, delivered_to_customer_at,
+          status, qr_status, qr_payload, qr_printed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Printed', ?, CURRENT_TIMESTAMP)`,
+      [
+        caseId,
+        caseNo,
+        complaintId,
+        complaint.task_id || null,
+        complaint.warranty_id || null,
+        complaint.customer_id || null,
+        dealer.id,
+        complaint.serial_id || null,
+        actionType,
+        savedProblemDetails,
+        complaint.resolution_notes || null,
+        requestedExchangeSerial?.id || null,
+        completesImmediately ? requestedExchangeSerial.id : null,
+        completesImmediately ? new Date() : null,
+        completesImmediately ? new Date() : null,
+        caseStatus,
+        qrPayload,
+      ]
+    );
+    await tx("UPDATE complaints SET status = ? WHERE id = ?", [nextComplaintStatus, complaintId]);
+    if (completesImmediately) {
+      await tx("UPDATE warranties SET serial_id = ? WHERE id = ?", [requestedExchangeSerial.id, complaint.warranty_id]);
+      await tx(
+        `UPDATE serial_numbers
+         SET replacement_case_id = ?,
+             replacement_for_customer_id = ?,
+             replacement_label = ?
+         WHERE id = ?`,
+        [
+          caseId,
+          complaint.customer_id || null,
+          `Replacement for ${complaint.customer_name || "Customer"} - ${complaint.complaint_no || caseNo}`,
+          requestedExchangeSerial.id,
+        ]
+      );
+    }
+    await recordStatusHistory({
       complaintId,
-      complaint.task_id || null,
-      complaint.warranty_id || null,
-      complaint.customer_id || null,
-      dealer.id,
-      complaint.serial_id || null,
-      actionType,
-      problemDetails,
-      complaint.resolution_notes || null,
-      qrPayload,
-    ]
-  );
-
-  await recordStatusHistory({
-    complaintId,
-    oldStatus: complaint.status,
-    newStatus: "Replace/Return Submitted",
-    changedByRole: "Dealer",
-    changedById: createdById,
-    remarks: `${actionType} case ${caseNo} created`,
+      oldStatus: complaint.status,
+      newStatus: nextComplaintStatus,
+      changedByRole: "Dealer",
+      changedById: createdById,
+      remarks: completesImmediately
+        ? `Product replaced directly by dealer. New serial ${requestedExchangeSerial.serial_no}`
+        : `${actionType} case ${caseNo} created`,
+    }, tx);
   });
 
   await ensureNotificationsSchema();
-  const adminUsers = await query("SELECT id FROM users WHERE role = 'Admin' LIMIT 5");
-  for (const admin of adminUsers.rows) {
-    await createNotification({
-      userId: admin.id,
-      recipientRole: "Admin",
-      type: "replace_return",
-      title: `New ${actionType} case`,
-      message: `${caseNo}: ${complaint.product_name || "Product"} - scan QR in Replace/Return panel.`,
-      entityType: "replace_return",
-      entityId: caseId,
-    });
+  if (!completesImmediately) {
+    const adminUsers = await query("SELECT id FROM users WHERE role = 'Admin' LIMIT 5");
+    for (const admin of adminUsers.rows) {
+      await createNotification({
+        userId: admin.id,
+        recipientRole: "Admin",
+        type: "replace_return",
+        title: "New Return case",
+        message: `${caseNo}: ${complaint.product_name || "Product"} - scan QR in Return Products panel.`,
+        entityType: "replace_return",
+        entityId: caseId,
+      });
+    }
   }
 
   const detail = await query(
@@ -8900,7 +8976,9 @@ app.post("/replace-return", asyncRoute(async (req, res) => {
   res.status(201).json({
     case: detail.rows[0],
     qrPayload,
-    message: `${actionType} case created. QR is ready - Admin will scan to receive product.`,
+    message: completesImmediately
+      ? `Product replaced successfully with ${requestedExchangeSerial.serial_no}. Admin receive is not needed.`
+      : "Return case created. QR is ready - Admin will scan to receive product.",
   });
 }));
 
@@ -8921,7 +8999,7 @@ app.post("/replace-return/from-warranty-scan", asyncRoute(async (req, res) => {
     return res.status(400).json({ error: "Dealer, active warranty/product, action type, and details are required." });
   }
   if (!QR_WARRANTY_ACTIONS.has(actionType)) {
-    return res.status(400).json({ error: "Action type must be Replace, Return, or Product Exchange." });
+    return res.status(400).json({ error: "Action type must be Replace or Return." });
   }
 
   const dealer = await resolveDealerRecord(dealerId);
@@ -8965,7 +9043,7 @@ app.post("/replace-return/from-warranty-scan", asyncRoute(async (req, res) => {
     return res.status(400).json({ error: "Warranty is not active for a customer yet." });
   }
   if (isWarrantyExpiredStatus(warranty.status, warranty.expiry_date)) {
-    return res.status(400).json({ error: "Warranty has expired. Replace/Return/Exchange is not available." });
+    return res.status(400).json({ error: "Warranty has expired. Replace/Return is not available." });
   }
   const owningDealerId = String(warranty.dealer_id || warranty.serial_dealer_id || warranty.owning_dealer_id || "");
   if (owningDealerId && owningDealerId !== String(dealer.id)) {
@@ -8973,9 +9051,9 @@ app.post("/replace-return/from-warranty-scan", asyncRoute(async (req, res) => {
   }
 
   let requestedExchangeSerial = null;
-  if (actionType === "Product Exchange") {
+  if (actionType === "Replace") {
     if (!exchangeSerialId && !exchangeSerialNo) {
-      return res.status(400).json({ error: "Select new product from dealer stock for Product Exchange." });
+      return res.status(400).json({ error: "Select replacement product from dealer stock." });
     }
     const exchangeResult = exchangeSerialId
       ? await query(
@@ -8995,18 +9073,18 @@ app.post("/replace-return/from-warranty-scan", asyncRoute(async (req, res) => {
           [exchangeSerialNo]
         );
     if (!exchangeResult.rowCount) {
-      return res.status(404).json({ error: "Selected exchange product serial not found." });
+      return res.status(404).json({ error: "Selected replacement product serial not found." });
     }
     requestedExchangeSerial = exchangeResult.rows[0];
     if (String(requestedExchangeSerial.dealer_id || "") !== String(dealer.id)) {
-      return res.status(403).json({ error: "Selected exchange product is not in this dealer stock." });
+      return res.status(403).json({ error: "Selected replacement product is not in this dealer stock." });
     }
     const exchangeWarranty = await query(
       "SELECT id FROM warranties WHERE serial_id = ? AND customer_id IS NOT NULL LIMIT 1",
       [requestedExchangeSerial.id]
     );
     if (exchangeWarranty.rowCount) {
-      return res.status(409).json({ error: "Selected exchange product is already sold/activated." });
+      return res.status(409).json({ error: "Selected replacement product is already sold/activated." });
     }
   }
 
@@ -9032,14 +9110,14 @@ app.post("/replace-return/from-warranty-scan", asyncRoute(async (req, res) => {
   const complaintNo = `CMP-${Date.now()}`;
   const caseId = crypto.randomUUID();
   const caseNo = `RR-${Date.now()}`;
-  const problemType = actionType === "Return" ? "Product Return" : actionType === "Product Exchange" ? "Product Exchange" : "Product Replacement";
+  const problemType = actionType === "Replace" ? "Product Replacement" : "Product Return";
   const exchangeDetail = requestedExchangeSerial
-    ? ` Exchange with: ${requestedExchangeSerial.product_name || "Product"} - ${requestedExchangeSerial.model_no || "-"} - ${requestedExchangeSerial.serial_no}.`
+    ? ` Replace with: ${requestedExchangeSerial.product_name || "Product"} - ${requestedExchangeSerial.model_no || "-"} - ${requestedExchangeSerial.serial_no}.`
     : "";
   const description = `${actionType} requested by dealer from active warranty QR scan. ${problemDetails}${exchangeDetail}`.trim();
   const savedProblemDetails = `${problemDetails}${exchangeDetail}`.trim();
-  const completesImmediately = actionType === "Product Exchange" && requestedExchangeSerial;
-  const complaintStatus = completesImmediately ? "Product Exchange Completed" : "Awaiting Dealer Action";
+  const completesImmediately = actionType === "Replace" && requestedExchangeSerial;
+  const complaintStatus = completesImmediately ? "Replacement Completed" : "Awaiting Dealer Action";
   const caseStatus = completesImmediately ? "Delivered to Customer" : "Pending Admin Scan";
   const qrPayload = replaceReturnQrPayload({
     caseId,
@@ -9106,7 +9184,7 @@ app.post("/replace-return/from-warranty-scan", asyncRoute(async (req, res) => {
         [
           caseId,
           warranty.customer_id,
-          `Exchange for ${warranty.customer_name || "Customer"} - ${complaintNo}`,
+          `Replacement for ${warranty.customer_name || "Customer"} - ${complaintNo}`,
           requestedExchangeSerial.id,
         ]
       );
@@ -9118,7 +9196,7 @@ app.post("/replace-return/from-warranty-scan", asyncRoute(async (req, res) => {
       changedByRole: "Dealer",
       changedById: createdById,
       remarks: completesImmediately
-        ? `Product exchanged directly by dealer. New serial ${requestedExchangeSerial.serial_no}`
+        ? `Product replaced directly by dealer. New serial ${requestedExchangeSerial.serial_no}`
         : `${actionType} case ${caseNo} created from warranty QR scan`,
     }, tx);
   });
@@ -9130,7 +9208,7 @@ app.post("/replace-return/from-warranty-scan", asyncRoute(async (req, res) => {
         userId: admin.id,
         recipientRole: "Admin",
         type: "replace_return",
-        title: `New ${actionType} case from QR`,
+        title: "New Return case from QR",
         message: `${caseNo}: ${warranty.product_name || "Product"} - ${warranty.serial_no || ""}.`,
         entityType: "replace_return",
         entityId: caseId,
@@ -9151,8 +9229,8 @@ app.post("/replace-return/from-warranty-scan", asyncRoute(async (req, res) => {
     complaintNo,
     qrPayload,
     message: completesImmediately
-      ? `Product exchanged successfully with ${requestedExchangeSerial.serial_no}. Warranty remaining period will continue.`
-      : `${actionType} case created. Admin will scan/receive this product. Warranty remaining period will continue.`,
+      ? `Product replaced successfully with ${requestedExchangeSerial.serial_no}. Admin receive is not needed.`
+      : "Return case created. Admin will scan/receive this product.",
   });
 }));
 
@@ -9200,6 +9278,9 @@ app.post("/replace-return/:id/admin-scan", asyncRoute(async (req, res) => {
     return res.status(404).json({ error: "Replace/Return case not found." });
   }
   const row = existing.rows[0];
+  if (String(row.action_type || "") !== "Return") {
+    return res.status(400).json({ error: "Admin can receive only Return cases here." });
+  }
   if (
     row.replacement_serial_id ||
     row.replacement_dispatched_at ||
@@ -9214,20 +9295,29 @@ app.post("/replace-return/:id/admin-scan", asyncRoute(async (req, res) => {
     return res.status(409).json({ error: `This case cannot be received while status is ${row.status || "unknown"}.` });
   }
 
-  await query(
-    `UPDATE replace_return_cases
-     SET status = 'Admin Received', admin_scanned_at = CURRENT_TIMESTAMP, admin_scanned_by = ?
-     WHERE id = ?`,
-    [adminUserId, caseId]
-  );
-
-  await recordStatusHistory({
-    complaintId: row.complaint_id,
-    oldStatus: row.status,
-    newStatus: "Admin Received",
-    changedByRole: scannedByRole,
-    changedById: adminUserId,
-    remarks: `${scannedByRole} scanned ${row.case_no}`,
+  await withTransaction(async (tx) => {
+    await tx(
+      `UPDATE replace_return_cases
+       SET status = 'Admin Received', admin_scanned_at = CURRENT_TIMESTAMP, admin_scanned_by = ?
+       WHERE id = ?`,
+      [adminUserId, caseId]
+    );
+    if (row.serial_id) {
+      await tx(
+        `UPDATE serial_numbers
+         SET dispatch_status = 'Return'
+         WHERE id = ?`,
+        [row.serial_id]
+      );
+    }
+    await recordStatusHistory({
+      complaintId: row.complaint_id,
+      oldStatus: row.status,
+      newStatus: "Admin Received",
+      changedByRole: scannedByRole,
+      changedById: adminUserId,
+      remarks: `${scannedByRole} scanned ${row.case_no}`,
+    }, tx);
   });
 
   const detail = await query(
@@ -9240,7 +9330,7 @@ app.post("/replace-return/:id/admin-scan", asyncRoute(async (req, res) => {
 
   res.json({
     case: detail.rows[0],
-    message: `Case received in ${scannedByRole} Replace/Return panel.`,
+    message: `Return case received in ${scannedByRole} panel.`,
   });
 }));
 
@@ -10569,7 +10659,7 @@ app.post("/tasks/:id/mark-unrepairable", asyncRoute(async (req, res) => {
       senderRole: "Technician",
       senderId: technicianId || row.technician_id || null,
       receiverRole: "Dealer",
-      message: `Product cannot be repaired. Send to dealer for Replace/Return. ${resolutionNotes}`,
+      message: `Product cannot be repaired. Send to dealer for Return. ${resolutionNotes}`,
     }, tx);
   });
 
@@ -10590,7 +10680,7 @@ app.post("/tasks/:id/mark-unrepairable", asyncRoute(async (req, res) => {
         recipientRole: "Dealer",
         type: "task_unrepairable",
         title: "Product cannot be repaired",
-        message: `${ctx.complaint_no || "Complaint"} - technician could not repair. Open Replace/Return.`,
+        message: `${ctx.complaint_no || "Complaint"} - technician could not repair. Open Return Products.`,
         entityType: "complaint",
         entityId: complaintId,
       });
@@ -10599,7 +10689,7 @@ app.post("/tasks/:id/mark-unrepairable", asyncRoute(async (req, res) => {
 
   res.json({
     task: taskResult.rowCount ? taskResult.rows[0] : null,
-    message: "Marked as cannot repair. Dealer will process Replace/Return.",
+    message: "Marked as cannot repair. Dealer will process Return.",
   });
 }));
 
@@ -11383,6 +11473,7 @@ app.get("/dispatch/batches", asyncRoute(async (_req, res) => {
        d.name AS dealer_name,
        d.parent_dealer_id,
        s.dispatched_customer_id,
+       MAX(CASE WHEN s.dispatch_status = 'Return' OR rrret.id IS NOT NULL THEN 1 ELSE 0 END) AS is_return,
        c.name AS customer_name,
        c.mobile AS customer_mobile,
        MIN(s.dispatch_date) AS dispatch_date,
@@ -11396,7 +11487,10 @@ app.get("/dispatch/batches", asyncRoute(async (_req, res) => {
      LEFT JOIN dealers d ON d.id = s.dealer_id
      LEFT JOIN customers c ON c.id = s.dispatched_customer_id
      LEFT JOIN products p ON p.id = s.product_id
-     WHERE s.dispatch_status = 'Dispatched'
+     LEFT JOIN replace_return_cases rrret ON rrret.serial_id = s.id
+       AND rrret.action_type = 'Return'
+       AND rrret.status = 'Admin Received'
+     WHERE (s.dispatch_status IN ('Dispatched', 'Return') OR rrret.id IS NOT NULL)
        AND s.batch_no IS NOT NULL
        AND TRIM(s.batch_no) <> ''
      GROUP BY s.batch_no, s.dealer_id, d.dealer_no, d.name, d.parent_dealer_id, s.dispatched_customer_id, c.name, c.mobile
@@ -11434,7 +11528,7 @@ app.get("/dispatch/batches", asyncRoute(async (_req, res) => {
   res.json({
     batches: result.rows.map((row) => ({
       batchNo: row.batch_no,
-      dispatchType: row.dispatched_customer_id ? "selfSale" : (row.dealer_id ? "dealer" : "openDealer"),
+      dispatchType: Number(row.is_return || 0) > 0 ? "return" : row.dispatched_customer_id ? "selfSale" : (row.dealer_id ? "dealer" : "openDealer"),
       dealerId: row.dealer_id,
       dealerNo: row.dealer_no,
       dealerName: row.dealer_name,
