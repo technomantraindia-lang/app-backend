@@ -11456,6 +11456,65 @@ app.get("/dispatch/batches", asyncRoute(async (_req, res) => {
   });
 }));
 
+app.delete("/dispatch/batches/:batchNo", asyncRoute(async (req, res) => {
+  await ensureSerialNumbersSchema();
+  const batchNo = cleanString(req.params.batchNo);
+  const requesterRole = cleanString(req.body?.requesterRole || req.body?.role);
+  if (requesterRole && requesterRole !== "Admin") {
+    return res.status(403).json({ error: "Only Admin can delete dispatch batches." });
+  }
+  if (!batchNo) {
+    return res.status(400).json({ error: "Batch number is required." });
+  }
+  const batch = await query(
+    `SELECT id, serial_no
+     FROM serial_numbers
+     WHERE batch_no = ?
+       AND dispatch_status = 'Dispatched'`,
+    [batchNo]
+  );
+  if (!batch.rowCount) {
+    return res.status(404).json({ error: "Dispatch batch not found." });
+  }
+  const serialIds = batch.rows.map((row) => row.id).filter(Boolean);
+  const placeholders = serialIds.map(() => "?").join(",");
+  const linkedWarranty = await query(
+    `SELECT COUNT(*) AS total
+     FROM warranties
+     WHERE serial_id IN (${placeholders})`,
+    serialIds
+  );
+  if (Number(linkedWarranty.rows[0]?.total || 0) > 0) {
+    return res.status(409).json({
+      error: "This batch has activated warranty/customer records. It cannot be deleted.",
+    });
+  }
+  const linkedReplacement = await query(
+    `SELECT COUNT(*) AS total
+     FROM replace_return_cases
+     WHERE serial_id IN (${placeholders})
+        OR replacement_serial_id IN (${placeholders})
+        OR requested_exchange_serial_id IN (${placeholders})`,
+    [...serialIds, ...serialIds, ...serialIds]
+  ).catch(() => ({ rows: [{ total: 0 }] }));
+  if (Number(linkedReplacement.rows[0]?.total || 0) > 0) {
+    return res.status(409).json({
+      error: "This batch is linked with replace/return records. It cannot be deleted.",
+    });
+  }
+  const result = await query(
+    `DELETE FROM serial_numbers
+     WHERE batch_no = ?
+       AND dispatch_status = 'Dispatched'`,
+    [batchNo]
+  );
+  res.json({
+    ok: true,
+    deleted: result.affectedRows || 0,
+    message: `Dispatch batch ${batchNo} deleted (${result.affectedRows || 0} unit(s)).`,
+  });
+}));
+
 app.get("/dispatch/qr-print-data", asyncRoute(async (req, res) => {
   const batchNo = cleanString(req.query.batchNo || req.query.batch_no);
   const copies = parseQrLabelCopies(req.query.copies || req.query.quantity || req.query.qty);
