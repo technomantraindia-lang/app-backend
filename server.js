@@ -7756,11 +7756,19 @@ app.get("/warranties/customer/:customerId", asyncRoute(async (req, res) => {
        p.name AS product_name,
        p.model_no,
        p.warranty_months,
+       s.replacement_label,
+       rr_repl.action_type AS replacement_action_type,
+       old_p.name AS old_product_name,
+       old_p.model_no AS old_model_no,
+       old_s.serial_no AS old_serial_no,
        d.dealer_no,
        d.name AS dealer_name
      FROM warranties w
      LEFT JOIN serial_numbers s ON s.id = w.serial_id
      LEFT JOIN products p ON p.id = s.product_id
+     LEFT JOIN replace_return_cases rr_repl ON rr_repl.id = s.replacement_case_id
+     LEFT JOIN serial_numbers old_s ON old_s.id = rr_repl.serial_id
+     LEFT JOIN products old_p ON old_p.id = old_s.product_id
      LEFT JOIN dealers d ON d.id = COALESCE(w.dealer_id, s.dealer_id)
      WHERE w.customer_id = ?
      ORDER BY w.created_at DESC`,
@@ -8925,6 +8933,12 @@ app.post("/replace-return", asyncRoute(async (req, res) => {
       await tx("UPDATE warranties SET serial_id = ? WHERE id = ?", [requestedExchangeSerial.id, complaint.warranty_id]);
       await tx(
         `UPDATE serial_numbers
+         SET dispatch_status = 'Replaced'
+         WHERE id = ?`,
+        [complaint.serial_id]
+      );
+      await tx(
+        `UPDATE serial_numbers
          SET replacement_case_id = ?,
              replacement_for_customer_id = ?,
              replacement_label = ?
@@ -8932,7 +8946,7 @@ app.post("/replace-return", asyncRoute(async (req, res) => {
         [
           caseId,
           complaint.customer_id || null,
-          `Replacement for ${complaint.customer_name || "Customer"} - ${complaint.complaint_no || caseNo}`,
+          `Replacement product - old product: ${complaint.product_name || "Product"}`,
           requestedExchangeSerial.id,
         ]
       );
@@ -9177,6 +9191,12 @@ app.post("/replace-return/from-warranty-scan", asyncRoute(async (req, res) => {
       await tx("UPDATE warranties SET serial_id = ? WHERE id = ?", [requestedExchangeSerial.id, warranty.id]);
       await tx(
         `UPDATE serial_numbers
+         SET dispatch_status = 'Replaced'
+         WHERE id = ?`,
+        [warranty.serial_id]
+      );
+      await tx(
+        `UPDATE serial_numbers
          SET replacement_case_id = ?,
              replacement_for_customer_id = ?,
              replacement_label = ?
@@ -9184,7 +9204,7 @@ app.post("/replace-return/from-warranty-scan", asyncRoute(async (req, res) => {
         [
           caseId,
           warranty.customer_id,
-          `Replacement for ${warranty.customer_name || "Customer"} - ${complaintNo}`,
+          `Replacement product - old product: ${warranty.product_name || "Product"}`,
           requestedExchangeSerial.id,
         ]
       );
