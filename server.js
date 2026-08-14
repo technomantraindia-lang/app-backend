@@ -8933,7 +8933,9 @@ app.post("/replace-return", asyncRoute(async (req, res) => {
       await tx("UPDATE warranties SET serial_id = ? WHERE id = ?", [requestedExchangeSerial.id, complaint.warranty_id]);
       await tx(
         `UPDATE serial_numbers
-         SET dispatch_status = 'Replaced'
+         SET dealer_id = NULL,
+             dispatched_customer_id = NULL,
+             dispatch_status = 'Pending'
          WHERE id = ?`,
         [complaint.serial_id]
       );
@@ -9191,7 +9193,9 @@ app.post("/replace-return/from-warranty-scan", asyncRoute(async (req, res) => {
       await tx("UPDATE warranties SET serial_id = ? WHERE id = ?", [requestedExchangeSerial.id, warranty.id]);
       await tx(
         `UPDATE serial_numbers
-         SET dispatch_status = 'Replaced'
+         SET dealer_id = NULL,
+             dispatched_customer_id = NULL,
+             dispatch_status = 'Pending'
          WHERE id = ?`,
         [warranty.serial_id]
       );
@@ -11439,7 +11443,7 @@ app.get("/dispatch/stock", asyncRoute(async (_req, res) => {
        c.id,
        c.name,
        COUNT(CASE WHEN s.dealer_id IS NULL AND s.dispatch_status = 'Pending' THEN 1 END) AS in_stock,
-       COUNT(CASE WHEN s.dispatch_status = 'Dispatched' THEN 1 END) AS dispatched,
+       COUNT(CASE WHEN s.dispatch_status IN ('Dispatched', 'Replaced') THEN 1 END) AS dispatched,
        COUNT(CASE WHEN s.qr_status = 'Printed' THEN 1 END) AS qr_printed
      FROM product_categories c
      LEFT JOIN products p ON p.category_id = c.id
@@ -11454,7 +11458,7 @@ app.get("/dispatch/stock", asyncRoute(async (_req, res) => {
        p.model_no,
        c.name AS category_name,
        COUNT(CASE WHEN s.dealer_id IS NULL AND s.dispatch_status = 'Pending' THEN 1 END) AS in_stock,
-       COUNT(CASE WHEN s.dispatch_status = 'Dispatched' THEN 1 END) AS dispatched,
+       COUNT(CASE WHEN s.dispatch_status IN ('Dispatched', 'Replaced') THEN 1 END) AS dispatched,
        COUNT(CASE WHEN s.qr_status = 'Printed' THEN 1 END) AS qr_printed
      FROM products p
      LEFT JOIN product_categories c ON c.id = p.category_id
@@ -11510,7 +11514,7 @@ app.get("/dispatch/batches", asyncRoute(async (_req, res) => {
      LEFT JOIN replace_return_cases rrret ON rrret.serial_id = s.id
        AND rrret.action_type = 'Return'
        AND rrret.status = 'Admin Received'
-     WHERE (s.dispatch_status IN ('Dispatched', 'Return') OR rrret.id IS NOT NULL)
+     WHERE (s.dispatch_status IN ('Dispatched', 'Return', 'Replaced') OR rrret.id IS NOT NULL)
        AND s.batch_no IS NOT NULL
        AND TRIM(s.batch_no) <> ''
      GROUP BY s.batch_no, s.dealer_id, d.dealer_no, d.name, d.parent_dealer_id, s.dispatched_customer_id, c.name, c.mobile
@@ -11584,7 +11588,7 @@ app.delete("/dispatch/batches/:batchNo", asyncRoute(async (req, res) => {
     `SELECT id, serial_no
      FROM serial_numbers
      WHERE batch_no = ?
-       AND dispatch_status = 'Dispatched'`,
+       AND dispatch_status IN ('Dispatched', 'Return', 'Replaced')`,
     [batchNo]
   );
   if (!batch.rowCount) {
@@ -11603,25 +11607,21 @@ app.delete("/dispatch/batches/:batchNo", asyncRoute(async (req, res) => {
       error: "This batch has activated warranty/customer records. It cannot be deleted.",
     });
   }
-  const linkedReplacement = await query(
-    `SELECT COUNT(*) AS total
-     FROM replace_return_cases
-     WHERE serial_id IN (${placeholders})
-        OR replacement_serial_id IN (${placeholders})
-        OR requested_exchange_serial_id IN (${placeholders})`,
-    [...serialIds, ...serialIds, ...serialIds]
-  ).catch(() => ({ rows: [{ total: 0 }] }));
-  if (Number(linkedReplacement.rows[0]?.total || 0) > 0) {
-    return res.status(409).json({
-      error: "This batch is linked with replace/return records. It cannot be deleted.",
-    });
-  }
-  const result = await query(
-    `DELETE FROM serial_numbers
-     WHERE batch_no = ?
-       AND dispatch_status = 'Dispatched'`,
-    [batchNo]
-  );
+  const result = await withTransaction(async (tx) => {
+    await tx(
+      `DELETE FROM replace_return_cases
+       WHERE serial_id IN (${placeholders})
+          OR replacement_serial_id IN (${placeholders})
+          OR requested_exchange_serial_id IN (${placeholders})`,
+      [...serialIds, ...serialIds, ...serialIds]
+    ).catch(() => null);
+    return tx(
+      `DELETE FROM serial_numbers
+       WHERE batch_no = ?
+         AND dispatch_status IN ('Dispatched', 'Return', 'Replaced')`,
+      [batchNo]
+    );
+  });
   res.json({
     ok: true,
     deleted: result.affectedRows || 0,
