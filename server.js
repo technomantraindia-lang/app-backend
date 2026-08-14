@@ -10974,6 +10974,9 @@ app.delete("/serial-numbers/:serialNo", asyncRoute(async (req, res) => {
 }));
 
 async function fetchAvailableSerialUnits({ categoryId, productName, productId, limit, tx }) {
+  if (!tx) {
+    await restoreUnlinkedReplacedSerialsToAdminStock();
+  }
   const run = tx || query;
   const clauses = ["s.dealer_id IS NULL", "s.dispatch_status = 'Pending'"];
   const params = [];
@@ -11002,8 +11005,22 @@ async function fetchAvailableSerialUnits({ categoryId, productName, productId, l
   return result.rows;
 }
 
+async function restoreUnlinkedReplacedSerialsToAdminStock() {
+  await ensureProductsQrSchema();
+  await query(
+    `UPDATE serial_numbers s
+     LEFT JOIN warranties w ON w.serial_id = s.id
+     SET s.dealer_id = NULL,
+         s.dispatched_customer_id = NULL,
+         s.dispatch_status = 'Pending'
+     WHERE s.dispatch_status = 'Replaced'
+       AND w.id IS NULL`
+  );
+}
+
 app.get("/dispatch/availability", asyncRoute(async (req, res) => {
   await ensureProductsQrSchema();
+  await restoreUnlinkedReplacedSerialsToAdminStock();
   const categoryId = cleanString(req.query.categoryId || req.query.category_id);
   const categoriesResult = await query(
     `SELECT
@@ -11397,6 +11414,7 @@ app.post("/dispatch/to-self-sale-customer", asyncRoute(async (req, res) => {
 
 app.get("/dispatch/dashboard", asyncRoute(async (_req, res) => {
   await ensureReplaceReturnSchema();
+  await restoreUnlinkedReplacedSerialsToAdminStock();
   const [
     totalDealers,
     stockAvailable,
@@ -11438,6 +11456,7 @@ app.get("/dispatch/dashboard", asyncRoute(async (_req, res) => {
 
 app.get("/dispatch/stock", asyncRoute(async (_req, res) => {
   await ensureProductsQrSchema();
+  await restoreUnlinkedReplacedSerialsToAdminStock();
   const categoriesResult = await query(
     `SELECT
        c.id,
