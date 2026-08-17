@@ -12645,7 +12645,9 @@ app.get("/space-issues", asyncRoute(async (req, res) => {
   }
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
   const result = await query(
-    `SELECT s.*, t.name AS technician_name
+    `SELECT s.id, s.product_name, s.quantity, s.technician_id, s.technician_name,
+       DATE_FORMAT(s.issue_date, '%Y-%m-%d') AS issue_date,
+       s.status, s.created_at
      FROM space_issues s
      LEFT JOIN technicians t ON t.id = s.technician_id
      ${where}
@@ -12694,7 +12696,9 @@ app.get("/space-returns", asyncRoute(async (req, res) => {
   }
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
   const result = await query(
-    `SELECT s.*, t.name AS technician_name
+    `SELECT s.id, s.product_name, s.quantity, s.technician_id, s.technician_name,
+       DATE_FORMAT(s.return_date, '%Y-%m-%d') AS return_date,
+       s.status, s.created_at
      FROM space_returns s
      LEFT JOIN technicians t ON t.id = s.technician_id
      ${where}
