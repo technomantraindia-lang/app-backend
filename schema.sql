@@ -67,6 +67,18 @@ CREATE TABLE IF NOT EXISTS space_issues (
   CONSTRAINT fk_space_issues_technician FOREIGN KEY (technician_id) REFERENCES technicians(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS space_returns (
+  id CHAR(36) PRIMARY KEY,
+  product_name VARCHAR(255) NOT NULL,
+  quantity INT NOT NULL DEFAULT 1,
+  technician_id CHAR(36),
+  technician_name VARCHAR(160),
+  return_date DATE,
+  status VARCHAR(40) NOT NULL DEFAULT 'Returned',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_space_returns_technician FOREIGN KEY (technician_id) REFERENCES technicians(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS product_categories (
   id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
   name VARCHAR(120) NOT NULL UNIQUE,

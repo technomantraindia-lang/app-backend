@@ -94,6 +94,21 @@ async function ensureSpaceIssuesSchema() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
   );
 }
+async function ensureSpaceReturnsSchema() {
+  await query(
+    `CREATE TABLE IF NOT EXISTS space_returns (
+      id CHAR(36) PRIMARY KEY,
+      product_name VARCHAR(255) NOT NULL,
+      quantity INT NOT NULL DEFAULT 1,
+      technician_id CHAR(36),
+      technician_name VARCHAR(160),
+      return_date DATE,
+      status VARCHAR(40) NOT NULL DEFAULT 'Returned',
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT fk_space_returns_technician FOREIGN KEY (technician_id) REFERENCES technicians(id) ON DELETE SET NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
+  );
+}
 async function getAppSetting(key) {
   await ensureAppSettingsSchema();
   const result = await query("SELECT setting_value FROM app_settings WHERE setting_key = ? LIMIT 1", [key]);
@@ -12668,6 +12683,55 @@ app.delete("/space-issues/:id", asyncRoute(async (req, res) => {
   res.json({ ok: true });
 }));
 
+app.get("/space-returns", asyncRoute(async (req, res) => {
+  await ensureSpaceReturnsSchema();
+  const technicianId = cleanString(req.query.technicianId || req.query.technician_id);
+  const clauses = [];
+  const params = [];
+  if (technicianId) {
+    clauses.push("s.technician_id = ?");
+    params.push(technicianId);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+  const result = await query(
+    `SELECT s.*, t.name AS technician_name
+     FROM space_returns s
+     LEFT JOIN technicians t ON t.id = s.technician_id
+     ${where}
+     ORDER BY s.created_at DESC
+     LIMIT 500`,
+    params
+  );
+  res.json({ spaceReturns: result.rows });
+}));
+
+app.post("/space-returns", asyncRoute(async (req, res) => {
+  await ensureSpaceReturnsSchema();
+  const productName = cleanString(req.body.productName || req.body.product_name);
+  const quantity = Number(req.body.quantity ?? req.body.qty ?? 1) || 1;
+  const technicianId = cleanString(req.body.technicianId || req.body.technician_id || req.body.serviceCenter);
+  const technicianName = cleanString(req.body.technicianName || req.body.technician_name || req.body.serviceCenterName);
+  const returnDate = cleanString(req.body.returnDate || req.body.date) || null;
+  if (!productName) {
+    return res.status(400).json({ error: "Product name is required." });
+  }
+  const id = crypto.randomUUID();
+  await query(
+    `INSERT INTO space_returns (id, product_name, quantity, technician_id, technician_name, return_date, status)
+     VALUES (?, ?, ?, ?, ?, ?, 'Returned')`,
+    [id, productName, quantity, technicianId || null, technicianName || null, returnDate || null]
+  );
+  const created = await query("SELECT * FROM space_returns WHERE id = ? LIMIT 1", [id]);
+  res.status(201).json({ spaceReturn: created.rows[0] || null });
+}));
+
+app.delete("/space-returns/:id", asyncRoute(async (req, res) => {
+  await ensureSpaceReturnsSchema();
+  const id = cleanString(req.params.id);
+  await query("DELETE FROM space_returns WHERE id = ?", [id]);
+  res.json({ ok: true });
+}));
+
 app.use((error, _req, res, _next) => {
   console.error(error);
   const code = error?.code;
@@ -12705,6 +12769,7 @@ async function runRuntimeSchemaChecks() {
     await ensurePushTokensSchema();
     await ensureWorkflowAuditSchema();
     await ensureSpaceIssuesSchema();
+    await ensureSpaceReturnsSchema();
   } catch (error) {
     console.warn("Runtime schema check skipped:", error?.message || error);
   }
