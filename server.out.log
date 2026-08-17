@@ -1,4 +1,0 @@
-Hitaishi CRM API listening on http://localhost:4000 
-Admin website: http://localhost:4000 /admin/
-Health check: http://localhost:4000 /health
-Stop with Ctrl+C. Changes need server restart.
