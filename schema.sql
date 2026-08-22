@@ -159,6 +159,22 @@ CREATE TABLE IF NOT EXISTS warranties (
   CONSTRAINT fk_warranties_serial FOREIGN KEY (serial_id) REFERENCES serial_numbers(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS dealer_stock_transfers (
+  id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
+  serial_id CHAR(36) NOT NULL,
+  from_dealer_id CHAR(36) NOT NULL,
+  to_dealer_id CHAR(36) NOT NULL,
+  scanned_by_user_id CHAR(36),
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_dealer_stock_transfers_serial (serial_id),
+  INDEX idx_dealer_stock_transfers_from_dealer (from_dealer_id),
+  INDEX idx_dealer_stock_transfers_to_dealer (to_dealer_id),
+  CONSTRAINT fk_dst_serial FOREIGN KEY (serial_id) REFERENCES serial_numbers(id) ON DELETE CASCADE,
+  CONSTRAINT fk_dst_from_dealer FOREIGN KEY (from_dealer_id) REFERENCES dealers(id) ON DELETE CASCADE,
+  CONSTRAINT fk_dst_to_dealer FOREIGN KEY (to_dealer_id) REFERENCES dealers(id) ON DELETE CASCADE,
+  CONSTRAINT fk_dst_scanned_user FOREIGN KEY (scanned_by_user_id) REFERENCES users(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS dealer_reward_transactions (
   id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
   dealer_id CHAR(36) NOT NULL,

@@ -478,7 +478,8 @@ const COMPLAINT_OPEN_WHERE = `
 
 async function getDealerDashboardStats(dealerId) {
   await ensureDealersUserIdSchema();
-  const [serials, warranties, totalComplaints, openComplaints, solvedComplaints, pendingScan, pendingInstallation, installationRequests, rewards, customers, subDealers] =
+  await ensureDealerStockTransfersSchema();
+  const [serials, warranties, totalComplaints, openComplaints, solvedComplaints, pendingScan, pendingInstallation, installationRequests, rewards, customers, subDealers, transferredToSubDealers] =
     await Promise.all([
     query("SELECT COUNT(*) AS total FROM serial_numbers WHERE dealer_id = ?", [dealerId]),
     query("SELECT COUNT(*) AS total FROM warranties WHERE dealer_id = ? AND customer_id IS NOT NULL", [dealerId]),
@@ -537,6 +538,7 @@ async function getDealerDashboardStats(dealerId) {
       [dealerId, dealerId]
     ),
     query("SELECT COUNT(*) AS total FROM dealers WHERE parent_dealer_id = ?", [dealerId]),
+    query("SELECT COUNT(*) AS total FROM dealer_stock_transfers WHERE from_dealer_id = ?", [dealerId]),
   ]);
   const count = (result) => Number(result.rows[0]?.total || 0);
   const productsSold = count(warranties);
@@ -558,6 +560,7 @@ async function getDealerDashboardStats(dealerId) {
     rewardPoints: count(rewards),
     customers: count(customers),
     subDealers: count(subDealers),
+    transferredToSubDealers: count(transferredToSubDealers),
     productsSold,
   };
 }
@@ -2548,6 +2551,26 @@ async function ensureSerialNumbersSchema() {
 async function ensureDealersUserIdSchema() {
   await ensureTableColumn("dealers", "user_id", "ALTER TABLE dealers ADD COLUMN user_id CHAR(36) NULL AFTER id");
   await ensureTableColumn("dealers", "parent_dealer_id", "ALTER TABLE dealers ADD COLUMN parent_dealer_id CHAR(36) NULL AFTER user_id");
+}
+
+async function ensureDealerStockTransfersSchema() {
+  await query(
+    `CREATE TABLE IF NOT EXISTS dealer_stock_transfers (
+      id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
+      serial_id CHAR(36) NOT NULL,
+      from_dealer_id CHAR(36) NOT NULL,
+      to_dealer_id CHAR(36) NOT NULL,
+      scanned_by_user_id CHAR(36),
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_dealer_stock_transfers_serial (serial_id),
+      INDEX idx_dealer_stock_transfers_from_dealer (from_dealer_id),
+      INDEX idx_dealer_stock_transfers_to_dealer (to_dealer_id),
+      CONSTRAINT fk_dst_serial FOREIGN KEY (serial_id) REFERENCES serial_numbers(id) ON DELETE CASCADE,
+      CONSTRAINT fk_dst_from_dealer FOREIGN KEY (from_dealer_id) REFERENCES dealers(id) ON DELETE CASCADE,
+      CONSTRAINT fk_dst_to_dealer FOREIGN KEY (to_dealer_id) REFERENCES dealers(id) ON DELETE CASCADE,
+      CONSTRAINT fk_dst_scanned_user FOREIGN KEY (scanned_by_user_id) REFERENCES users(id) ON DELETE SET NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
+  );
 }
 
 async function ensureDealerCreatedBySchema() {
@@ -11786,8 +11809,11 @@ app.post("/dispatch-mapping", asyncRoute(async (req, res) => {
 }));
 
 app.post("/dealer-stock/claim-scan", asyncRoute(async (req, res) => {
+  await ensureDealersUserIdSchema();
+  await ensureDealerStockTransfersSchema();
   const dealerId = cleanString(req.body.dealerId || req.body.dealer_id);
   const serialNo = cleanSerialNo(req.body.serialNo || req.body.serial_no);
+  const scannedByUserId = cleanString(req.body.userId || req.body.user_id) || null;
   if (!dealerId || !serialNo) {
     return res.status(400).json({ error: "Dealer and serial number are required." });
   }
@@ -11816,20 +11842,49 @@ app.post("/dealer-stock/claim-scan", asyncRoute(async (req, res) => {
     return res.status(404).json({ error: "Serial number not found." });
   }
   const serial = serialResult.rows[0];
-  if (serial.dealer_id && String(serial.dealer_id) !== String(dealer.id)) {
+  if (serial.warranty_customer_id) {
+    return res.status(409).json({ error: "Warranty is already active for this product." });
+  }
+  const currentDealerId = serial.dealer_id ? String(serial.dealer_id) : "";
+  const targetDealerId = String(dealer.id);
+  const parentDealerId = dealer.parent_dealer_id ? String(dealer.parent_dealer_id) : "";
+  const currentOwnerDealer = currentDealerId ? await resolveDealerRecord(currentDealerId) : null;
+  const currentOwnerDealerId = currentOwnerDealer?.id ? String(currentOwnerDealer.id) : currentDealerId;
+  const parentLink = currentOwnerDealerId
+    ? await query(
+        "SELECT id FROM dealers WHERE id = ? AND parent_dealer_id = ? LIMIT 1",
+        [targetDealerId, currentOwnerDealerId]
+      )
+    : { rowCount: 0 };
+  const isParentToSubDealerTransfer = Boolean(
+    currentOwnerDealerId &&
+    currentOwnerDealerId !== targetDealerId &&
+    (currentOwnerDealerId === parentDealerId || parentLink.rowCount)
+  );
+  if (currentOwnerDealerId && currentOwnerDealerId !== targetDealerId && !isParentToSubDealerTransfer) {
     return res.status(403).json({ error: "This product is already assigned to another dealer." });
   }
-  const alreadyAssigned = serial.dealer_id && String(serial.dealer_id) === String(dealer.id);
+  const alreadyAssigned = currentOwnerDealerId && currentOwnerDealerId === targetDealerId;
   if (!alreadyAssigned) {
-    await query(
-      `UPDATE serial_numbers
-       SET dealer_id = ?,
-           dispatch_status = 'Dispatched',
-           dispatched_at = COALESCE(dispatched_at, NOW()),
-           dispatch_date = COALESCE(dispatch_date, CURDATE())
-       WHERE id = ?`,
-      [dealer.id, serial.id]
-    );
+    await withTransaction(async (tx) => {
+      await tx(
+        `UPDATE serial_numbers
+         SET dealer_id = ?,
+             dispatch_status = 'Dispatched',
+             dispatched_at = COALESCE(dispatched_at, NOW()),
+             dispatch_date = COALESCE(dispatch_date, CURDATE())
+         WHERE id = ?`,
+        [dealer.id, serial.id]
+      );
+      if (isParentToSubDealerTransfer) {
+        await tx(
+          `INSERT INTO dealer_stock_transfers
+           (serial_id, from_dealer_id, to_dealer_id, scanned_by_user_id)
+           VALUES (?, ?, ?, ?)`,
+          [serial.id, currentOwnerDealerId, dealer.id, scannedByUserId]
+        );
+      }
+    });
   }
   const updated = await query(
     `SELECT
@@ -11846,9 +11901,12 @@ app.post("/dealer-stock/claim-scan", asyncRoute(async (req, res) => {
   res.json({
     ok: true,
     claimed: !alreadyAssigned,
+    transferred: !alreadyAssigned && isParentToSubDealerTransfer,
     serial: updated.rows[0] || serial,
     message: alreadyAssigned
       ? "Product is already saved in your stock. Scan again to activate warranty."
+      : isParentToSubDealerTransfer
+        ? "Product transferred from your main dealer to your stock. Scan this QR again to activate warranty."
       : "Product saved in your dealer stock. Scan this QR again to activate warranty.",
   });
 }));
