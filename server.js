@@ -6835,6 +6835,78 @@ app.get("/dealers/:id/sub-dealers", asyncRoute(async (req, res) => {
   });
 }));
 
+app.get("/dealers/:dealerId/sub-dealers/:subDealerId/profile", asyncRoute(async (req, res) => {
+  await ensureDealersUserIdSchema();
+  await ensureDealerStockTransfersSchema();
+  const dealer = await resolveDealerRecord(req.params.dealerId);
+  const subDealer = await resolveDealerRecord(req.params.subDealerId);
+  if (!dealer) {
+    return res.status(404).json({ error: "Dealer not found." });
+  }
+  if (!subDealer || String(subDealer.parent_dealer_id || "") !== String(dealer.id)) {
+    return res.status(404).json({ error: "Sub dealer not found for this dealer." });
+  }
+
+  const [stats, products] = await Promise.all([
+    getDealerDashboardStats(subDealer.id),
+    query(
+      `SELECT
+         dst.created_at AS transferred_at,
+         s.id AS serial_id,
+         s.serial_no,
+         s.dispatch_status,
+         p.name AS product_name,
+         p.model_no,
+         p.category,
+         w.id AS warranty_id,
+         w.warranty_no,
+         w.status AS warranty_status,
+         w.customer_id AS warranty_customer_id,
+         w.start_date,
+         w.expiry_date,
+         c.name AS customer_name,
+         c.mobile AS customer_mobile
+       FROM dealer_stock_transfers dst
+       INNER JOIN serial_numbers s ON s.id = dst.serial_id
+       LEFT JOIN products p ON p.id = s.product_id
+       LEFT JOIN warranties w ON w.serial_id = s.id AND w.customer_id IS NOT NULL
+       LEFT JOIN customers c ON c.id = w.customer_id
+       WHERE dst.from_dealer_id = ?
+         AND dst.to_dealer_id = ?
+       ORDER BY dst.created_at DESC
+       LIMIT 500`,
+      [dealer.id, subDealer.id]
+    ),
+  ]);
+
+  const transferredProducts = products.rows.map((row) => ({
+    ...row,
+    sold: Boolean(row.warranty_customer_id),
+  }));
+
+  res.json({
+    dealer: { id: dealer.id, name: dealer.name, dealer_no: dealer.dealer_no },
+    subDealer: {
+      id: subDealer.id,
+      user_id: subDealer.user_id || null,
+      parent_dealer_id: subDealer.parent_dealer_id || null,
+      dealer_no: subDealer.dealer_no,
+      name: subDealer.name,
+      contact_person: subDealer.contact_person,
+      mobile: subDealer.mobile,
+      address: subDealer.address,
+      city: subDealer.city,
+      state: subDealer.state,
+      status: subDealer.status || "Active",
+      stats: {
+        ...stats,
+        transferredProducts: transferredProducts.length,
+      },
+    },
+    transferredProducts,
+  });
+}));
+
 app.get("/admin/sub-dealers", asyncRoute(async (_req, res) => {
   await ensureDealersUserIdSchema();
   const result = await query(
